@@ -4,29 +4,18 @@ from contextlib import asynccontextmanager
 from app.database import engine, Base
 from app.routers import router
 from app.services.scheduler import start_scheduler, stop_scheduler
-from app.config import settings
 from app.seed import seed_database
 import logging
 import os
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Démarrage Clinique de la Rebecca API...")
-    Base.metadata.create_all(bind=engine)
-    seed_database()
-    ensure_admin()
-    start_scheduler()
-    yield
-    stop_scheduler()
-
 def ensure_admin():
-    """Garantit qu'un admin existe toujours"""
     from app.database import SessionLocal
-    from app.auth import get_password_hash
     import app.models as models
+    from passlib.context import CryptContext
+    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
     db = SessionLocal()
     try:
         admin = db.query(models.User).filter(models.User.email == "admin@cliniquerebecca.ht").first()
@@ -34,26 +23,33 @@ def ensure_admin():
             db.add(models.User(
                 email="admin@cliniquerebecca.ht",
                 nom="Administrateur",
-                hashed_password=get_password_hash("rebecca2026"),
+                hashed_password=pwd_context.hash("rebecca2026"),
                 role="admin"
             ))
             db.commit()
-            logger.info("Admin créé automatiquement")
+            logger.info("✅ Admin créé")
         else:
-            logger.info("Admin existant trouvé")
+            # Reset le mot de passe admin au cas où
+            admin.hashed_password = pwd_context.hash("rebecca2026")
+            admin.role = "admin"
+            db.commit()
+            logger.info("✅ Admin mot de passe réinitialisé")
     except Exception as e:
         logger.error("Erreur ensure_admin: %s", e)
         db.rollback()
     finally:
         db.close()
 
-app = FastAPI(
-    title="Clinique de la Rebecca — API",
-    version="1.0.0",
-    lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url=None,
-)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    seed_database()
+    ensure_admin()
+    start_scheduler()
+    yield
+    stop_scheduler()
+
+app = FastAPI(title="Clinique de la Rebecca API", version="1.0.0", lifespan=lifespan, docs_url="/docs", redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,7 +63,7 @@ app.include_router(router, prefix="/api")
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "app": "Clinique de la Rebecca API"}
+    return {"status": "ok"}
 
 @app.get("/health")
 async def health():

@@ -1,13 +1,5 @@
-"""
-main.py — Version Render/Production
-Ajouts par rapport au dev local :
- - Gestion du PORT via variable d'environnement Render
- - Headers sécurité pour production
- - Logs structurés
-"""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from contextlib import asynccontextmanager
 from app.database import engine, Base
 from app.routers import router
@@ -17,44 +9,55 @@ from app.seed import seed_database
 import logging
 import os
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Démarrage Clinique de la Rebecca API...")
+    logger.info("Démarrage Clinique de la Rebecca API...")
     Base.metadata.create_all(bind=engine)
     seed_database()
+    ensure_admin()
     start_scheduler()
-    logger.info("✅ API prête — http://0.0.0.0:%s", os.getenv("PORT", "8000"))
     yield
     stop_scheduler()
-    logger.info("👋 Arrêt de l'API")
 
+def ensure_admin():
+    """Garantit qu'un admin existe toujours"""
+    from app.database import SessionLocal
+    from app.auth import get_password_hash
+    import app.models as models
+    db = SessionLocal()
+    try:
+        admin = db.query(models.User).filter(models.User.email == "admin@cliniquerebecca.ht").first()
+        if not admin:
+            db.add(models.User(
+                email="admin@cliniquerebecca.ht",
+                nom="Administrateur",
+                hashed_password=get_password_hash("rebecca2026"),
+                role="admin"
+            ))
+            db.commit()
+            logger.info("Admin créé automatiquement")
+        else:
+            logger.info("Admin existant trouvé")
+    except Exception as e:
+        logger.error("Erreur ensure_admin: %s", e)
+        db.rollback()
+    finally:
+        db.close()
 
 app = FastAPI(
     title="Clinique de la Rebecca — API",
-    description="Backend FastAPI · PostgreSQL · Render",
     version="1.0.0",
     lifespan=lifespan,
-    # Désactiver docs en production si souhaité
-    docs_url="/docs" if os.getenv("ENVIRONMENT") != "production" else None,
+    docs_url="/docs",
     redoc_url=None,
 )
 
-# ─── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://clinique-rebecca-frontend.vercel.app",
-        "https://clinique-rebecca-frontend-gb3ow6tjv-wolf-jerrys-projects.vercel.app",
-        "https://clinique-rebecca.vercel.app",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,18 +65,10 @@ app.add_middleware(
 
 app.include_router(router, prefix="/api")
 
-
-@app.get("/", tags=["Health"])
+@app.get("/")
 async def root():
-    return {
-        "status": "ok",
-        "app": "Clinique de la Rebecca API",
-        "version": "1.0.0",
-        "environment": os.getenv("ENVIRONMENT", "development"),
-    }
+    return {"status": "ok", "app": "Clinique de la Rebecca API"}
 
-
-@app.get("/health", tags=["Health"])
+@app.get("/health")
 async def health():
-    """Endpoint santé pour Render health check"""
     return {"status": "healthy"}

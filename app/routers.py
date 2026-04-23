@@ -428,3 +428,30 @@ async def list_patients(
 async def chat(data: schemas.ChatMessage):
     response = await chat_with_rebecca(data.message, data.historique)
     return {"response": response}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SETUP TEMPORAIRE — À SUPPRIMER APRÈS UTILISATION
+# ══════════════════════════════════════════════════════════════════════════════
+@router.post("/setup-admin-temp-xk92")
+def setup_admin(db: Session = Depends(get_db)):
+    """Endpoint temporaire pour créer l'admin — supprimer après usage"""
+    try:
+        existing = db.query(models.User).filter(models.User.email == "admin@cliniquerebecca.ht").first()
+        if existing:
+            existing.hashed_password = get_password_hash("rebecca2026")
+            existing.role = "admin"
+            db.commit()
+            return {"status": "Admin mis à jour", "email": "admin@cliniquerebecca.ht"}
+        else:
+            admin = models.User(
+                email="admin@cliniquerebecca.ht",
+                nom="Administrateur",
+                hashed_password=get_password_hash("rebecca2026"),
+                role="admin"
+            )
+            db.add(admin)
+            db.commit()
+            return {"status": "Admin créé", "email": "admin@cliniquerebecca.ht", "password": "rebecca2026"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))

@@ -163,3 +163,81 @@ class Patient(Base):
     notes = Column(Text)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+# ─── Paiement exploitant (chèque/virement direct) ────────────────────────────
+class PaiementExploitant(Base):
+    __tablename__ = "paiements_exploitants"
+    id = Column(Integer, primary_key=True)
+    medecin_id = Column(Integer, ForeignKey("profils_medecins.id"))
+    medecin_nom = Column(String(255))
+    patient_nom = Column(String(255))
+    montant = Column(Float)
+    mode_paiement = Column(String(50))  # cheque, virement, especes
+    flux_direct = Column(Boolean, default=False)  # True = reçu directement sans passer par caisse
+    description = Column(String(500))
+    date_paiement = Column(DateTime(timezone=True), server_default=func.now())
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+# ─── Stock pharmacie — mise à jour avec propriétaire ─────────────────────────
+# On ajoute les colonnes via ALTER (géré par alembic ou recréation)
+class StockItemV2(Base):
+    __tablename__ = "stocks_v2"
+    id = Column(Integer, primary_key=True)
+    nom = Column(String(255), nullable=False)
+    categorie = Column(String(100))
+    quantite = Column(Integer, default=0)
+    seuil_min = Column(Integer, default=10)
+    prix_unitaire = Column(Float, default=0)
+    unite = Column(String(50), default="unité")
+    # Propriété investisseur
+    proprietaire = Column(String(255), default="Clinique")  # "Clinique" ou nom investisseur
+    mode_reversement = Column(String(20), default="clinique")  # clinique, pourcentage, forfait
+    valeur_reversement = Column(Float, default=0)  # % ou montant forfait
+    pct_clinique = Column(Float, default=100)  # % qui reste à la clinique
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+# ─── Vente pharmacie avec reversement investisseur ───────────────────────────
+class VentePharmacie(Base):
+    __tablename__ = "ventes_pharmacie"
+    id = Column(Integer, primary_key=True)
+    stock_id = Column(Integer, ForeignKey("stocks_v2.id"), nullable=True)
+    produit_nom = Column(String(255))
+    quantite = Column(Integer)
+    prix_unitaire = Column(Float)
+    montant_total = Column(Float)
+    montant_clinique = Column(Float)
+    montant_investisseur = Column(Float, default=0)
+    proprietaire = Column(String(255), default="Clinique")
+    mode_reversement = Column(String(20), default="clinique")
+    patient_nom = Column(String(255))
+    mode_paiement = Column(String(50), default="especes")
+    date_vente = Column(DateTime(timezone=True), server_default=func.now())
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+# ─── Contrat optométrie ───────────────────────────────────────────────────────
+class ContratOptometrie(Base):
+    __tablename__ = "contrat_optometrie"
+    id = Column(Integer, primary_key=True)
+    pct_consultation = Column(Float, default=35.0)   # % clinique sur consultations
+    pct_montures = Column(Float, default=13.0)        # % clinique sur montures
+    minimum_mensuel_usd = Column(Float, default=300.0) # Minimum en USD
+    taux_usd_htg = Column(Float, default=130.0)       # Taux de change USD→HTG
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+# ─── Calcul mensuel optométrie ────────────────────────────────────────────────
+class BilanOptometrieMensuel(Base):
+    __tablename__ = "bilans_optometrie"
+    id = Column(Integer, primary_key=True)
+    mois = Column(Integer)
+    annee = Column(Integer)
+    total_consultations = Column(Float, default=0)
+    total_montures = Column(Float, default=0)
+    part_clinique_consultations = Column(Float, default=0)
+    part_clinique_montures = Column(Float, default=0)
+    total_part_clinique = Column(Float, default=0)
+    minimum_applicable_htg = Column(Float, default=0)
+    montant_final_clinique = Column(Float, default=0)  # max(total_part, minimum)
+    difference = Column(Float, default=0)  # si négatif = complément à payer
+    statut = Column(String(20), default="en_attente")  # en_attente, regle
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -690,3 +690,177 @@ async def caissier_list_mouvements(db: Session = Depends(get_db), current_user: 
     debut = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     mouvements = db.query(models.Mouvement).filter(models.Mouvement.date_mouvement >= debut).order_by(models.Mouvement.date_mouvement.desc()).all()
     return mouvements
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPLOITANTS — Paiements directs (chèque/virement)
+# ══════════════════════════════════════════════════════════════════════════════
+@router.post("/caissier/paiement-exploitant", status_code=201, tags=["Exploitants"])
+async def enregistrer_paiement_exploitant(data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    paiement = models.PaiementExploitant(
+        medecin_id=data.get("medecin_id"),
+        medecin_nom=data.get("medecin_nom", ""),
+        patient_nom=data.get("patient_nom", ""),
+        montant=float(data.get("montant", 0)),
+        mode_paiement=data.get("mode_paiement", "especes"),
+        flux_direct=data.get("flux_direct", False),
+        description=data.get("description", ""),
+        created_by=current_user.id,
+    )
+    db.add(paiement)
+    # Toujours enregistrer en statistiques même si flux direct
+    mouvement = models.Mouvement(
+        type=models.TypeMouvementEnum.recette,
+        categorie="Exploitant",
+        description=f"{data.get('medecin_nom','')} — {data.get('patient_nom','')} — {data.get('description','')}",
+        montant=float(data.get("montant", 0)),
+        date_mouvement=func.now(),
+        mode_paiement=data.get("mode_paiement", "especes"),
+        notes=f"Flux direct: {data.get('flux_direct', False)} — Reversement total prévu",
+        created_by=current_user.id,
+    )
+    db.add(mouvement)
+    db.commit()
+    db.refresh(paiement)
+    return paiement
+
+@router.get("/admin/paiements-exploitants", tags=["Exploitants"])
+async def list_paiements_exploitants(db: Session = Depends(get_db), current_user: models.User = Depends(require_admin)):
+    return db.query(models.PaiementExploitant).order_by(models.PaiementExploitant.date_paiement.desc()).all()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STOCK V2 — Avec propriétaire investisseur
+# ══════════════════════════════════════════════════════════════════════════════
+@router.get("/pharmacie/stocks-v2", tags=["Pharmacie V2"])
+async def get_stocks_v2(db: Session = Depends(get_db)):
+    return db.query(models.StockItemV2).all()
+
+@router.post("/admin/stocks-v2", status_code=201, tags=["Pharmacie V2"])
+async def create_stock_v2(data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(require_admin)):
+    # Calculer pct_clinique selon mode
+    mode = data.get("mode_reversement", "clinique")
+    valeur = float(data.get("valeur_reversement", 0))
+    if mode == "clinique":
+        pct = 100.0
+    elif mode == "pourcentage":
+        pct = valeur  # valeur = % clinique directement
+    else:  # forfait — pct calculé dynamiquement à la vente
+        pct = 0.0
+    item = models.StockItemV2(
+        nom=data.get("nom"), categorie=data.get("categorie"),
+        quantite=int(data.get("quantite", 0)), seuil_min=int(data.get("seuil_min", 10)),
+        prix_unitaire=float(data.get("prix_unitaire", 0)), unite=data.get("unite", "unité"),
+        proprietaire=data.get("proprietaire", "Clinique"),
+        mode_reversement=mode, valeur_reversement=valeur, pct_clinique=pct,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+@router.post("/pharmacie/vente-v2", status_code=201, tags=["Pharmacie V2"])
+async def vente_pharmacie_v2(data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    stock = db.query(models.StockItemV2).filter(models.StockItemV2.id == data.get("stock_id")).first()
+    qte = int(data.get("quantite", 1))
+    montant_total = float(data.get("montant_total", 0))
+    
+    if stock:
+        if stock.quantite < qte:
+            raise HTTPException(400, "Stock insuffisant")
+        stock.quantite -= qte
+        # Calculer reversement
+        if stock.mode_reversement == "clinique":
+            montant_clinique = montant_total
+            montant_invest = 0
+        elif stock.mode_reversement == "pourcentage":
+            montant_clinique = round(montant_total * stock.pct_clinique / 100, 2)
+            montant_invest = montant_total - montant_clinique
+        else:  # forfait
+            montant_invest = round(stock.valeur_reversement * qte, 2)
+            montant_clinique = montant_total - montant_invest
+        proprietaire = stock.proprietaire
+        mode_rev = stock.mode_reversement
+    else:
+        montant_clinique = montant_total
+        montant_invest = 0
+        proprietaire = "Clinique"
+        mode_rev = "clinique"
+
+    vente = models.VentePharmacie(
+        stock_id=data.get("stock_id"), produit_nom=data.get("produit_nom", ""),
+        quantite=qte, prix_unitaire=float(data.get("prix_unitaire", 0)),
+        montant_total=montant_total, montant_clinique=montant_clinique,
+        montant_investisseur=montant_invest, proprietaire=proprietaire,
+        mode_reversement=mode_rev, patient_nom=data.get("patient_nom", ""),
+        mode_paiement=data.get("mode_paiement", "especes"),
+        created_by=current_user.id,
+    )
+    db.add(vente)
+    # Enregistrer part clinique comme recette
+    mouvement = models.Mouvement(
+        type=models.TypeMouvementEnum.recette, categorie="Pharmacie",
+        description=f"Vente {data.get('produit_nom','')} — {data.get('patient_nom','')}",
+        montant=montant_clinique, date_mouvement=func.now(),
+        mode_paiement=data.get("mode_paiement", "especes"), created_by=current_user.id,
+    )
+    db.add(mouvement)
+    db.commit()
+    return {"vente": vente.id, "montant_clinique": montant_clinique, "montant_investisseur": montant_invest, "proprietaire": proprietaire}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPTOMÉTRIE — Contrat et calcul mensuel
+# ══════════════════════════════════════════════════════════════════════════════
+@router.get("/admin/contrat-optometrie", tags=["Optométrie"])
+async def get_contrat_optomet(db: Session = Depends(get_db), current_user: models.User = Depends(require_admin)):
+    return db.query(models.ContratOptometrie).first()
+
+@router.put("/admin/contrat-optometrie", tags=["Optométrie"])
+async def update_contrat_optomet(data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(require_admin)):
+    contrat = db.query(models.ContratOptometrie).first()
+    if not contrat:
+        contrat = models.ContratOptometrie()
+        db.add(contrat)
+    for k, v in data.items():
+        setattr(contrat, k, v)
+    contrat.updated_by = current_user.id
+    db.commit()
+    return contrat
+
+@router.post("/admin/calculer-optometrie", tags=["Optométrie"])
+async def calculer_optometrie(data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(require_admin)):
+    contrat = db.query(models.ContratOptometrie).first()
+    if not contrat:
+        raise HTTPException(404, "Contrat optométrie non configuré")
+    mois = data.get("mois")
+    annee = data.get("annee")
+    total_consultations = float(data.get("total_consultations", 0))
+    total_montures = float(data.get("total_montures", 0))
+    
+    part_consul = round(total_consultations * contrat.pct_consultation / 100, 2)
+    part_montures = round(total_montures * contrat.pct_montures / 100, 2)
+    total_part = part_consul + part_montures
+    minimum_htg = round(contrat.minimum_mensuel_usd * contrat.taux_usd_htg, 2)
+    montant_final = max(total_part, minimum_htg)
+    difference = total_part - minimum_htg  # négatif = doit payer le minimum
+    
+    bilan = models.BilanOptometrieMensuel(
+        mois=mois, annee=annee,
+        total_consultations=total_consultations, total_montures=total_montures,
+        part_clinique_consultations=part_consul, part_clinique_montures=part_montures,
+        total_part_clinique=total_part, minimum_applicable_htg=minimum_htg,
+        montant_final_clinique=montant_final, difference=difference,
+    )
+    db.add(bilan)
+    db.commit()
+    return {
+        "mois": mois, "annee": annee,
+        "total_consultations": total_consultations,
+        "total_montures": total_montures,
+        "part_clinique_consultations": part_consul,
+        "part_clinique_montures": part_montures,
+        "total_part_clinique": total_part,
+        "minimum_mensuel_usd": contrat.minimum_mensuel_usd,
+        "minimum_htg": minimum_htg,
+        "montant_final_clinique": montant_final,
+        "difference": difference,
+        "verdict": "OK — % supérieur au minimum" if difference >= 0 else f"COMPLÉMENT REQUIS: {abs(difference):,.0f} HTG",
+    }

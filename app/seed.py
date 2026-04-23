@@ -102,3 +102,23 @@ def seed_database():
         db.rollback()
     finally:
         db.close()
+
+def seed_optometrie():
+    from app.database import SessionLocal
+    import app.models as models
+    db = SessionLocal()
+    try:
+        if not db.query(models.ContratOptometrie).first():
+            db.add(models.ContratOptometrie(
+                pct_consultation=35.0,
+                pct_montures=13.0,
+                minimum_mensuel_usd=300.0,
+                taux_usd_htg=130.0,
+            ))
+            db.commit()
+            print("Contrat optométrie initialisé")
+    except Exception as e:
+        print(f"Erreur seed_optometrie: {e}")
+        db.rollback()
+    finally:
+        db.close()

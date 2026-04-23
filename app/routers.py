@@ -506,3 +506,118 @@ def setup_admin_v3(db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REGISTER — Inscription avec rôle (en attente de validation admin)
+# ══════════════════════════════════════════════════════════════════════════════
+@router.post("/auth/register", tags=["Auth"])
+async def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
+    existing = db.query(models.User).filter(models.User.email == data.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email déjà utilisé")
+    # Les patients sont actifs directement, les autres rôles attendent validation
+    is_active = data.role == models.RoleEnum.patient
+    user = models.User(
+        email=data.email,
+        nom=data.nom,
+        hashed_password=get_password_hash(data.password),
+        role=data.role,
+        is_active=is_active,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    if is_active:
+        token = create_access_token({"sub": str(user.id)})
+        return {"access_token": token, "token_type": "bearer", "user": {"id": user.id, "nom": user.nom, "email": user.email, "role": user.role}}
+    return {"message": f"Compte créé — en attente de validation par l'administrateur", "role": data.role}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN — Gestion des utilisateurs (validation, liste, suppression)
+# ══════════════════════════════════════════════════════════════════════════════
+@router.get("/admin/users", tags=["Admin - Users"])
+async def list_users(db: Session = Depends(get_db), current_user: models.User = Depends(require_admin)):
+    users = db.query(models.User).order_by(models.User.created_at.desc()).all()
+    return [{"id": u.id, "nom": u.nom, "email": u.email, "role": u.role, "is_active": u.is_active, "created_at": u.created_at} for u in users]
+
+@router.put("/admin/users/{user_id}/activate", tags=["Admin - Users"])
+async def activate_user(user_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(require_admin)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    user.is_active = True
+    db.commit()
+    return {"message": f"Compte de {user.nom} activé", "user_id": user_id}
+
+@router.put("/admin/users/{user_id}/deactivate", tags=["Admin - Users"])
+async def deactivate_user(user_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(require_admin)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    user.is_active = False
+    db.commit()
+    return {"message": f"Compte de {user.nom} désactivé"}
+
+@router.delete("/admin/users/{user_id}", tags=["Admin - Users"])
+async def delete_user(user_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(require_admin)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    if user.role == "admin":
+        raise HTTPException(status_code=400, detail="Impossible de supprimer un admin")
+    db.delete(user)
+    db.commit()
+    return {"message": f"Compte supprimé"}
+
+@router.put("/admin/users/{user_id}/role", tags=["Admin - Users"])
+async def change_role(user_id: int, role: str, db: Session = Depends(get_db), current_user: models.User = Depends(require_admin)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    user.role = role
+    db.commit()
+    return {"message": f"Rôle changé en {role}"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPTABILITÉ — Rapport financier par période
+# ══════════════════════════════════════════════════════════════════════════════
+@router.get("/admin/rapport-financier", tags=["Admin - Compta"])
+async def rapport_financier(
+    debut: str, fin: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_admin)
+):
+    from datetime import datetime
+    try:
+        date_debut = datetime.fromisoformat(debut)
+        date_fin = datetime.fromisoformat(fin)
+    except:
+        raise HTTPException(status_code=400, detail="Format de date invalide (YYYY-MM-DD)")
+    
+    mouvements = db.query(models.Mouvement).filter(
+        models.Mouvement.date_mouvement >= date_debut,
+        models.Mouvement.date_mouvement <= date_fin
+    ).all()
+    
+    recettes = [m for m in mouvements if m.type == "recette"]
+    depenses = [m for m in mouvements if m.type == "depense"]
+    
+    total_rec = sum(m.montant for m in recettes)
+    total_dep = sum(m.montant for m in depenses)
+    
+    # Grouper par catégorie
+    par_cat_rec = {}
+    for m in recettes:
+        par_cat_rec[m.categorie] = par_cat_rec.get(m.categorie, 0) + m.montant
+    
+    par_cat_dep = {}
+    for m in depenses:
+        par_cat_dep[m.categorie] = par_cat_dep.get(m.categorie, 0) + m.montant
+
+    return {
+        "periode": {"debut": debut, "fin": fin},
+        "recettes": {"total": total_rec, "par_categorie": par_cat_rec, "transactions": len(recettes)},
+        "depenses": {"total": total_dep, "par_categorie": par_cat_dep, "transactions": len(depenses)},
+        "resultat_net": total_rec - total_dep,
+        "mouvements": [{"id": m.id, "date": m.date_mouvement, "type": m.type, "categorie": m.categorie, "description": m.description, "montant": m.montant, "mode_paiement": m.mode_paiement} for m in mouvements]
+    }

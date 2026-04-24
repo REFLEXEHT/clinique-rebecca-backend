@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from datetime import datetime
 from enum import Enum
@@ -6,21 +6,24 @@ from enum import Enum
 
 # ─── Enums ───────────────────────────────────────────────────────────────────
 class RoleEnum(str, Enum):
-    admin = "admin"
-    medecin = "medecin"
-    staff = "staff"
+    admin     = "admin"
+    medecin   = "medecin"
+    patient   = "patient"
+    caissier  = "caissier"
+    labo      = "labo"
+    pharmacie = "pharmacie"
 
 
 class StatutRDVEnum(str, Enum):
     en_attente = "en_attente"
-    confirme = "confirme"
-    annule = "annule"
-    termine = "termine"
+    confirme   = "confirme"
+    annule     = "annule"
+    termine    = "termine"
 
 
 class TypeRDVEnum(str, Enum):
     presentiel = "presentiel"
-    video = "video"
+    video      = "video"
 
 
 class TypeMouvementEnum(str, Enum):
@@ -28,7 +31,14 @@ class TypeMouvementEnum(str, Enum):
     depense = "depense"
 
 
-# ─── Auth ────────────────────────────────────────────────────────────────────
+class TypeMedecinEnum(str, Enum):
+    investisseur            = "investisseur"
+    affilie                 = "affilie"
+    exploitant              = "exploitant"
+    investisseur_exploitant = "investisseur_exploitant"
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
 class UserLogin(BaseModel):
     email: str
     password: str
@@ -44,7 +54,10 @@ class UserCreate(BaseModel):
     email: EmailStr
     nom: str
     password: str
-    role: RoleEnum = RoleEnum.staff
+    telephone: Optional[str] = None
+    role: RoleEnum = RoleEnum.patient
+    specialite: Optional[str] = None
+    type_medecin: Optional[TypeMedecinEnum] = None
 
 
 class UserOut(BaseModel):
@@ -52,6 +65,8 @@ class UserOut(BaseModel):
     email: str
     nom: str
     role: RoleEnum
+    specialite: Optional[str]
+    type_medecin: Optional[TypeMedecinEnum]
     is_active: bool
     created_at: datetime
 
@@ -154,15 +169,23 @@ class PatientCreate(BaseModel):
     telephone: Optional[str] = None
     email: Optional[str] = None
     adresse: Optional[str] = None
+    date_naissance: Optional[str] = None
+    sexe: Optional[str] = None
+    groupe_sanguin: Optional[str] = None
+    allergies: Optional[str] = None
+    antecedents: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class PatientOut(BaseModel):
     id: int
-    numero: str
+    numero: Optional[str]
     nom: str
     prenom: Optional[str]
     telephone: Optional[str]
     email: Optional[str]
+    sexe: Optional[str]
+    date_naissance: Optional[str]
     created_at: datetime
 
     class Config:
@@ -174,10 +197,15 @@ class RendezVousCreate(BaseModel):
     patient_nom: str
     patient_telephone: str
     patient_email: Optional[str] = None
+    code_patient: Optional[str] = None
     specialite: str
     date_rdv: datetime
     type_rdv: TypeRDVEnum = TypeRDVEnum.presentiel
     motif: Optional[str] = None
+    mode_paiement: Optional[str] = None
+    reference_paiement: Optional[str] = None
+    lien_video: Optional[str] = None
+    numero_rdv: Optional[str] = None
 
 
 class RendezVousUpdate(BaseModel):
@@ -198,13 +226,79 @@ class RendezVousOut(BaseModel):
     statut: StatutRDVEnum
     motif: Optional[str]
     notes_admin: Optional[str]
+    mode_paiement: Optional[str]
+    lien_video: Optional[str]
+    numero_rdv: Optional[str]
     created_at: datetime
 
     class Config:
         from_attributes = True
 
 
-# ─── Comptabilité ────────────────────────────────────────────────────────────
+# ─── Profil médecin ───────────────────────────────────────────────────────────
+class ProfilMedecinOut(BaseModel):
+    id: int
+    nom: str
+    specialite: Optional[str]
+    type_medecin: TypeMedecinEnum
+    loyer_mensuel_htg: float
+    actif: bool
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Acte facturable ─────────────────────────────────────────────────────────
+class ActeCreate(BaseModel):
+    medecin_id: Optional[int] = None
+    patient_nom: str
+    type_acte: str
+    specialite: Optional[str] = None
+    description: Optional[str] = None
+    montant_total: float
+    mode_paiement: str = "especes"
+    montant_medecin_manuel: Optional[float] = None
+    montant_clinique_manuel: Optional[float] = None
+
+
+class ActeOut(BaseModel):
+    id: int
+    medecin_nom: Optional[str]
+    patient_nom: str
+    type_acte: str
+    montant_total: float
+    montant_medecin: float
+    montant_clinique: float
+    pct_medecin: float
+    statut_decaissement: str
+    date_acte: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Décaissement ─────────────────────────────────────────────────────────────
+class DecaissementCreate(BaseModel):
+    medecin_id: int
+    medecin_nom: Optional[str] = None
+    montant: float
+    motif: str
+    mode_paiement: str = "especes"
+
+
+class DecaissementOut(BaseModel):
+    id: int
+    medecin_nom: Optional[str]
+    montant: float
+    motif: Optional[str]
+    mode_paiement: str
+    date_decaissement: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Mouvements comptables ───────────────────────────────────────────────────
 class MouvementCreate(BaseModel):
     type: TypeMouvementEnum
     categorie: str
@@ -224,14 +318,70 @@ class MouvementOut(BaseModel):
     montant: float
     date_mouvement: datetime
     mode_paiement: str
-    reference: Optional[str]
+    notes: Optional[str]
     created_at: datetime
 
     class Config:
         from_attributes = True
 
 
-# ─── Stats ───────────────────────────────────────────────────────────────────
+# ─── Règle partage ────────────────────────────────────────────────────────────
+class ReglePartageOut(BaseModel):
+    id: int
+    type_medecin: TypeMedecinEnum
+    type_acte: str
+    pct_medecin: float
+    pct_clinique: float
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Tarif clinic ─────────────────────────────────────────────────────────────
+class TarifOut(BaseModel):
+    id: int
+    code: str
+    libelle: str
+    montant: float
+    unite: str
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Stock ────────────────────────────────────────────────────────────────────
+class StockOut(BaseModel):
+    id: int
+    nom: str
+    categorie: Optional[str]
+    quantite: int
+    seuil_min: int
+    prix_unitaire: float
+    unite: str
+    proprietaire: str
+    mode_reversement: str
+    pct_clinique: float
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Résultat labo ────────────────────────────────────────────────────────────
+class ResultatLaboOut(BaseModel):
+    id: int
+    patient_id: Optional[str]
+    patient_nom: str
+    type_examen: str
+    resultats: Optional[str]
+    notes: Optional[str]
+    date_examen: datetime
+    status: str
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Stats ────────────────────────────────────────────────────────────────────
 class DashboardStats(BaseModel):
     rdv_today: int
     rdv_month: int

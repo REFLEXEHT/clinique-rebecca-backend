@@ -1,3 +1,16 @@
+"""
+routers.py — Clinique de la Rebecca
+Conformité PCN Haïti + IFRS for SMEs
+Corrections appliquées :
+  - Partie double garantie sur toutes les écritures comptables
+  - Décaissements médecins : 651→468 puis 468→511 (deux mouvements)
+  - Numérotation séquentielle des pièces (VTE-AAAA-NNNN)
+  - Multi-devises HTG/USD avec taux obligatoire
+  - Verrouillage des périodes clôturées
+  - Contrepassation au lieu de suppression
+  - Lettrage RDV ↔ mouvement
+  - Immobilisations + amortissements
+"""
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, extract
@@ -8,11 +21,124 @@ import app.schemas as schemas
 from app.database import get_db
 from app.auth import (get_current_user, require_admin,
                       verify_password, get_password_hash, create_access_token)
-from app.services.notifications import notify_rdv_confirmed
-from app.services.ai import chat_with_rebecca
+from app.services.notifications import notify_rdv_confirmed, notify_rdv_video_confirme
 import asyncio
 
 router = APIRouter()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS COMPTABLES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _verif_periode(mois: int, annee: int, db: Session):
+    """Lève une exception si la période est clôturée."""
+    p = db.query(models.PeriodeComptable).filter(
+        models.PeriodeComptable.mois == mois,
+        models.PeriodeComptable.annee == annee,
+        models.PeriodeComptable.statut == models.StatutPeriodeEnum.cloturee,
+    ).first()
+    if p:
+        raise HTTPException(
+            423,
+            f"Période {mois}/{annee} clôturée — écriture impossible. "
+            "Utilisez une contrepassation sur la période courante."
+        )
+
+
+def _verif_balance(montant_total: float, montant_medecin: float, montant_clinique: float):
+    """Vérifie que débit = crédit (partie double)."""
+    diff = abs(montant_total - (montant_medecin + montant_clinique))
+    if diff > 1.0:  # Tolérance arrondi 1 HTG
+        raise HTTPException(
+            422,
+            f"Déséquilibre comptable : {montant_total} ≠ "
+            f"{montant_medecin} + {montant_clinique} "
+            f"(différence : {diff:.2f} HTG)"
+        )
+
+
+def _next_numero_piece(journal: str, annee: int, db: Session) -> str:
+    """Génère le prochain numéro de pièce séquentiel : VTE-2025-0001."""
+    count = db.query(func.count(models.Mouvement.id)).filter(
+        models.Mouvement.journal == journal,
+        models.Mouvement.periode_annee == annee,
+    ).scalar() or 0
+    return f"{journal}-{annee}-{str(count + 1).zfill(4)}"
+
+
+def _creer_mouvement(
+    db: Session,
+    journal: str,
+    type_mouv: models.TypeMouvementEnum,
+    categorie: str,
+    description: str,
+    montant: float,
+    compte_debit: str,
+    compte_credit: str,
+    libelle_debit: str = "",
+    libelle_credit: str = "",
+    mode_paiement: str = "especes",
+    devise: models.DeviseEnum = models.DeviseEnum.HTG,
+    montant_usd: float = None,
+    taux_usd_htg: float = None,
+    reference: str = None,
+    rdv_id: int = None,
+    created_by: int = None,
+    est_contrepassation: bool = False,
+    mouvement_origine_id: int = None,
+    notes: str = None,
+) -> models.Mouvement:
+    """
+    Crée un mouvement comptable avec partie double.
+    Validation : montant > 0, période non clôturée.
+    """
+    if montant <= 0:
+        raise HTTPException(422, "Le montant doit être positif (> 0 HTG)")
+
+    now = datetime.now(timezone.utc)
+    mois, annee = now.month, now.year
+
+    # Vérification période
+    if not est_contrepassation:
+        _verif_periode(mois, annee, db)
+
+    # Numéro de pièce séquentiel
+    numero = _next_numero_piece(journal, annee, db)
+
+    # Conversion USD si nécessaire
+    montant_htg = None
+    if devise == models.DeviseEnum.USD and montant_usd and taux_usd_htg:
+        montant_htg = round(montant_usd * taux_usd_htg, 2)
+
+    m = models.Mouvement(
+        numero_piece    = numero,
+        journal         = journal,
+        type            = type_mouv,
+        categorie       = categorie,
+        description     = description,
+        montant         = round(montant, 2),
+        compte_debit    = compte_debit,
+        compte_credit   = compte_credit,
+        libelle_debit   = libelle_debit,
+        libelle_credit  = libelle_credit,
+        mode_paiement   = mode_paiement,
+        devise          = devise,
+        montant_usd     = montant_usd,
+        taux_usd_htg    = taux_usd_htg,
+        montant_htg     = montant_htg,
+        reference       = reference,
+        rdv_id          = rdv_id,
+        periode_mois    = mois,
+        periode_annee   = annee,
+        est_contrepassation = est_contrepassation,
+        mouvement_origine_id = mouvement_origine_id,
+        created_by      = created_by,
+        notes           = notes,
+    )
+    db.add(m)
+    return m
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTH
@@ -22,17 +148,14 @@ router = APIRouter()
 async def login(data: schemas.UserLogin, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.email == data.email).first()
     if not user or not verify_password(data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Identifiants incorrects")
+        raise HTTPException(401, "Identifiants incorrects")
     if not user.is_active:
-        raise HTTPException(status_code=403, detail="Compte inactif — en attente de validation")
+        raise HTTPException(403, "Compte inactif — en attente de validation")
     token = create_access_token({"sub": str(user.id)})
     return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": {
-            "id": user.id, "nom": user.nom, "email": user.email,
-            "role": user.role, "specialite": user.specialite,
-        },
+        "access_token": token, "token_type": "bearer",
+        "user": {"id": user.id, "nom": user.nom, "email": user.email,
+                 "role": user.role, "specialite": user.specialite},
     }
 
 
@@ -45,24 +168,16 @@ async def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
         email=data.email, nom=data.nom,
         hashed_password=get_password_hash(data.password),
         role=data.role, telephone=data.telephone,
-        specialite=data.specialite,
-        type_medecin=data.type_medecin,
+        specialite=data.specialite, type_medecin=data.type_medecin,
         is_active=is_active,
     )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    # Si médecin → créer automatiquement le profil comptable
+    db.add(user); db.commit(); db.refresh(user)
     if data.role == models.RoleEnum.medecin and data.type_medecin:
         profil = models.ProfilMedecin(
             user_id=user.id, nom=user.nom,
-            specialite=data.specialite,
-            type_medecin=data.type_medecin,
+            specialite=data.specialite, type_medecin=data.type_medecin,
         )
-        db.add(profil)
-        db.commit()
-
+        db.add(profil); db.commit()
     if is_active:
         token = create_access_token({"sub": str(user.id)})
         return {"access_token": token, "token_type": "bearer",
@@ -77,7 +192,7 @@ async def me(current_user: models.User = Depends(get_current_user)):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SERVICES
+# SERVICES / SPÉCIALISTES / HORAIRES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/services", response_model=List[schemas.ServiceOut], tags=["Services"])
@@ -86,29 +201,20 @@ async def list_services(db: Session = Depends(get_db)):
 
 @router.post("/admin/services", response_model=schemas.ServiceOut, tags=["Admin"])
 async def create_service(data: schemas.ServiceCreate, db: Session = Depends(get_db), _=Depends(require_admin)):
-    svc = models.Service(**data.model_dump())
-    db.add(svc); db.commit(); db.refresh(svc)
-    return svc
+    svc = models.Service(**data.model_dump()); db.add(svc); db.commit(); db.refresh(svc); return svc
 
 @router.put("/admin/services/{sid}", response_model=schemas.ServiceOut, tags=["Admin"])
 async def update_service(sid: int, data: schemas.ServiceUpdate, db: Session = Depends(get_db), _=Depends(require_admin)):
     svc = db.query(models.Service).filter(models.Service.id == sid).first()
-    if not svc: raise HTTPException(404, "Service introuvable")
+    if not svc: raise HTTPException(404)
     for k, v in data.model_dump(exclude_none=True).items(): setattr(svc, k, v)
-    db.commit(); db.refresh(svc)
-    return svc
+    db.commit(); db.refresh(svc); return svc
 
 @router.delete("/admin/services/{sid}", tags=["Admin"])
 async def delete_service(sid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
     svc = db.query(models.Service).filter(models.Service.id == sid).first()
-    if not svc: raise HTTPException(404, "Service introuvable")
-    svc.actif = False; db.commit()
-    return {"message": "Supprimé"}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SPECIALISTES
-# ══════════════════════════════════════════════════════════════════════════════
+    if not svc: raise HTTPException(404)
+    svc.actif = False; db.commit(); return {"message": "Supprimé"}
 
 @router.get("/specialistes", response_model=List[schemas.SpecialisteOut], tags=["Spécialistes"])
 async def list_specialistes(categorie: Optional[str] = None, db: Session = Depends(get_db)):
@@ -119,35 +225,25 @@ async def list_specialistes(categorie: Optional[str] = None, db: Session = Depen
 
 @router.get("/specialistes/{spec_id}", response_model=schemas.SpecialisteOut, tags=["Spécialistes"])
 async def get_specialiste(spec_id: int, db: Session = Depends(get_db)):
-    spec = db.query(models.Specialiste).filter(models.Specialiste.id == spec_id).first()
-    if not spec: raise HTTPException(404, "Spécialiste introuvable")
-    return spec
+    s = db.query(models.Specialiste).filter(models.Specialiste.id == spec_id).first()
+    if not s: raise HTTPException(404); return s
 
 @router.post("/admin/specialistes", response_model=schemas.SpecialisteOut, tags=["Admin"])
 async def create_specialiste(data: schemas.SpecialisteCreate, db: Session = Depends(get_db), _=Depends(require_admin)):
-    spec = models.Specialiste(**data.model_dump())
-    db.add(spec); db.commit(); db.refresh(spec)
-    return spec
+    s = models.Specialiste(**data.model_dump()); db.add(s); db.commit(); db.refresh(s); return s
 
-@router.put("/admin/specialistes/{spec_id}", response_model=schemas.SpecialisteOut, tags=["Admin"])
-async def update_specialiste(spec_id: int, data: schemas.SpecialisteUpdate, db: Session = Depends(get_db), _=Depends(require_admin)):
-    spec = db.query(models.Specialiste).filter(models.Specialiste.id == spec_id).first()
-    if not spec: raise HTTPException(404, "Spécialiste introuvable")
-    for k, v in data.model_dump(exclude_none=True).items(): setattr(spec, k, v)
-    db.commit(); db.refresh(spec)
-    return spec
+@router.put("/admin/specialistes/{sid}", response_model=schemas.SpecialisteOut, tags=["Admin"])
+async def update_specialiste(sid: int, data: schemas.SpecialisteUpdate, db: Session = Depends(get_db), _=Depends(require_admin)):
+    s = db.query(models.Specialiste).filter(models.Specialiste.id == sid).first()
+    if not s: raise HTTPException(404)
+    for k, v in data.model_dump(exclude_none=True).items(): setattr(s, k, v)
+    db.commit(); db.refresh(s); return s
 
-@router.delete("/admin/specialistes/{spec_id}", tags=["Admin"])
-async def delete_specialiste(spec_id: int, db: Session = Depends(get_db), _=Depends(require_admin)):
-    spec = db.query(models.Specialiste).filter(models.Specialiste.id == spec_id).first()
-    if not spec: raise HTTPException(404, "Spécialiste introuvable")
-    spec.actif = False; db.commit()
-    return {"message": "Supprimé"}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HORAIRES
-# ══════════════════════════════════════════════════════════════════════════════
+@router.delete("/admin/specialistes/{sid}", tags=["Admin"])
+async def delete_specialiste(sid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
+    s = db.query(models.Specialiste).filter(models.Specialiste.id == sid).first()
+    if not s: raise HTTPException(404)
+    s.actif = False; db.commit(); return {"message": "Supprimé"}
 
 @router.get("/horaires", response_model=List[schemas.HoraireOut], tags=["Horaires"])
 async def get_horaires(db: Session = Depends(get_db)):
@@ -156,10 +252,9 @@ async def get_horaires(db: Session = Depends(get_db)):
 @router.put("/admin/horaires/{jour}", response_model=schemas.HoraireOut, tags=["Admin"])
 async def update_horaire(jour: str, data: schemas.HoraireUpdate, db: Session = Depends(get_db), _=Depends(require_admin)):
     h = db.query(models.Horaire).filter(models.Horaire.jour == jour).first()
-    if not h: raise HTTPException(404, "Jour introuvable")
+    if not h: raise HTTPException(404)
     h.ouvert = data.ouvert; h.heure_ouverture = data.heure_ouverture; h.heure_fermeture = data.heure_fermeture
-    db.commit(); db.refresh(h)
-    return h
+    db.commit(); db.refresh(h); return h
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -170,7 +265,22 @@ async def update_horaire(jour: str, data: schemas.HoraireUpdate, db: Session = D
 async def create_rdv(data: schemas.RendezVousCreate, db: Session = Depends(get_db)):
     rdv = models.RendezVous(**data.model_dump())
     db.add(rdv); db.commit(); db.refresh(rdv)
-    rdv_data = {k: getattr(rdv, k) for k in ["patient_nom","patient_telephone","patient_email","specialite","date_rdv","type_rdv","motif"]}
+    medecins_emails = [rdv.medecin_email] if rdv.medecin_email else [
+        u.email for u in db.query(models.User).filter(
+            models.User.role == models.RoleEnum.medecin,
+            models.User.specialite.ilike(f"%{rdv.specialite}%"),
+            models.User.is_active == True,
+        ).all() if u.email
+    ]
+    rdv_data = {
+        "patient_nom": rdv.patient_nom, "patient_telephone": rdv.patient_telephone,
+        "patient_email": rdv.patient_email, "specialite": rdv.specialite,
+        "date_rdv": rdv.date_rdv, "type_rdv": str(rdv.type_rdv),
+        "motif": rdv.motif, "mode_paiement": rdv.mode_paiement,
+        "reference_paiement": rdv.reference_paiement,
+        "medecin_nom": rdv.medecin_nom or "",
+        "medecins_emails": medecins_emails,
+    }
     asyncio.create_task(notify_rdv_confirmed(rdv_data))
     return rdv
 
@@ -184,19 +294,34 @@ async def admin_list_rdv(statut: Optional[str] = None, db: Session = Depends(get
 async def update_rdv(rdv_id: int, data: schemas.RendezVousUpdate, db: Session = Depends(get_db), _=Depends(get_current_user)):
     rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
     if not rdv: raise HTTPException(404, "RDV introuvable")
-    for k, v in data.model_dump(exclude_none=True).items(): setattr(rdv, k, v)
-    db.commit(); db.refresh(rdv)
+    ancien_statut = str(rdv.statut)
+    for k, v in data.model_dump(exclude_none=True).items():
+        setattr(rdv, k, v)
+    if data.statut and str(data.statut) == "confirme" and ancien_statut != "confirme":
+        if str(rdv.type_rdv) == "video" and not rdv.lien_video:
+            numero = rdv.numero_rdv or f"rdv{rdv.id}"
+            rdv.lien_video = f"https://meet.jit.si/clinique-rebecca-{numero}"
+        db.commit(); db.refresh(rdv)
+        rdv_data = {
+            "patient_nom": rdv.patient_nom, "patient_telephone": rdv.patient_telephone,
+            "patient_email": rdv.patient_email, "specialite": rdv.specialite,
+            "date_rdv": rdv.date_rdv, "type_rdv": str(rdv.type_rdv),
+            "motif": rdv.motif, "lien_video": rdv.lien_video,
+        }
+        asyncio.create_task(notify_rdv_video_confirme(rdv_data))
+    else:
+        db.commit(); db.refresh(rdv)
     return rdv
 
 @router.delete("/admin/rendez-vous/{rdv_id}", tags=["Admin"])
 async def cancel_rdv(rdv_id: int, db: Session = Depends(get_db), _=Depends(get_current_user)):
     rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
-    if not rdv: raise HTTPException(404, "RDV introuvable")
+    if not rdv: raise HTTPException(404)
     rdv.statut = "annule"; db.commit()
     return {"message": "RDV annulé"}
 
 @router.get("/medecin/rendez-vous", response_model=List[schemas.RendezVousOut], tags=["Médecin"])
-async def medecin_rdv(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+async def medecin_rdv(db: Session = Depends(get_db), _=Depends(get_current_user)):
     return db.query(models.RendezVous).order_by(models.RendezVous.date_rdv.desc()).limit(50).all()
 
 @router.get("/patient/rendez-vous", response_model=List[schemas.RendezVousOut], tags=["Patient"])
@@ -213,22 +338,44 @@ async def caissier_rdv(db: Session = Depends(get_db), _=Depends(get_current_user
     ).order_by(models.RendezVous.date_rdv).all()
 
 @router.post("/caissier/encaissement/{rdv_id}", tags=["Caissier"])
-async def encaisser(rdv_id: int, data: dict, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+async def encaisser(rdv_id: int, data: dict, db: Session = Depends(get_db),
+                    current_user=Depends(get_current_user)):
     rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
     if not rdv: raise HTTPException(404, "RDV introuvable")
-    mouvement = models.Mouvement(
-        type=models.TypeMouvementEnum.recette,
-        categorie=data.get("categorie", "Consultations"),
+
+    montant    = float(data.get("montant", 0))
+    mode       = data.get("mode_paiement", "especes")
+    devise_str = data.get("devise", "HTG")
+    taux       = data.get("taux_usd_htg")
+    categorie  = data.get("categorie", "Consultations")
+
+    devise = models.DeviseEnum.USD if devise_str == "USD" else models.DeviseEnum.HTG
+
+    if devise == models.DeviseEnum.USD and not taux:
+        raise HTTPException(422, "Taux USD/HTG obligatoire pour un paiement en USD")
+
+    compte_tresorerie = models.get_compte_tresorerie(mode, devise_str)
+    compte_produit    = models.COMPTE_PCN.get(categorie, "701")
+
+    mouvement = _creer_mouvement(
+        db=db, journal=models.JournalEnum.VTE,
+        type_mouv=models.TypeMouvementEnum.recette,
+        categorie=categorie,
         description=f"Encaissement RDV #{rdv_id} — {rdv.patient_nom} — {rdv.specialite}",
-        montant=float(data.get("montant", 0)),
-        date_mouvement=datetime.now(timezone.utc),
-        mode_paiement=data.get("mode_paiement", "especes"),
-        created_by=current_user.id,
+        montant=montant,
+        compte_debit=compte_tresorerie,
+        compte_credit=compte_produit,
+        libelle_debit=f"Trésorerie {mode}",
+        libelle_credit=f"Produits {categorie}",
+        mode_paiement=mode, devise=devise,
+        montant_usd=montant if devise == models.DeviseEnum.USD else None,
+        taux_usd_htg=taux,
+        rdv_id=rdv_id, created_by=current_user.id,
     )
-    db.add(mouvement)
     rdv.statut = "confirme"
+    rdv.mouvement_id = mouvement.id
     db.commit()
-    return {"message": "Encaissement enregistré", "mouvement_id": mouvement.id}
+    return {"message": "Encaissement enregistré", "numero_piece": mouvement.numero_piece}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -245,13 +392,8 @@ async def list_patients(search: Optional[str] = None, db: Session = Depends(get_
 @router.post("/patients", status_code=201, tags=["Patients"])
 async def create_patient(data: schemas.PatientCreate, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     count = db.query(models.Patient).count()
-    patient = models.Patient(
-        numero=f"#RB-{str(count + 1).zfill(4)}",
-        **data.model_dump(),
-        created_by=current_user.id,
-    )
-    db.add(patient); db.commit(); db.refresh(patient)
-    return patient
+    patient = models.Patient(numero=f"#RB-{str(count+1).zfill(4)}", **data.model_dump(), created_by=current_user.id)
+    db.add(patient); db.commit(); db.refresh(patient); return patient
 
 @router.get("/patients/search", tags=["Patients"])
 async def search_patients(q: str = "", db: Session = Depends(get_db), _=Depends(get_current_user)):
@@ -262,12 +404,11 @@ async def search_patients(q: str = "", db: Session = Depends(get_db), _=Depends(
 @router.get("/patients/{pid}", tags=["Patients"])
 async def get_patient(pid: int, db: Session = Depends(get_db), _=Depends(get_current_user)):
     p = db.query(models.Patient).filter(models.Patient.id == pid).first()
-    if not p: raise HTTPException(404, "Patient non trouvé")
-    return p
+    if not p: raise HTTPException(404); return p
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PROFILS MÉDECINS (comptabilité)
+# PROFILS MÉDECINS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/admin/profils-medecins", response_model=List[schemas.ProfilMedecinOut], tags=["Admin - Compta"])
@@ -277,7 +418,7 @@ async def list_profils(db: Session = Depends(get_db), _=Depends(get_current_user
 @router.put("/admin/profils-medecins/{pid}", tags=["Admin - Compta"])
 async def update_profil(pid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
     p = db.query(models.ProfilMedecin).filter(models.ProfilMedecin.id == pid).first()
-    if not p: raise HTTPException(404, "Profil introuvable")
+    if not p: raise HTTPException(404)
     for k, v in data.items(): setattr(p, k, v)
     db.commit(); return p
 
@@ -293,92 +434,124 @@ async def list_regles(db: Session = Depends(get_db), _=Depends(get_current_user)
 @router.put("/admin/regles-partage/{rid}", tags=["Admin - Compta"])
 async def update_regle(rid: int, pct_medecin: float, db: Session = Depends(get_db), _=Depends(require_admin)):
     r = db.query(models.ReglePartage).filter(models.ReglePartage.id == rid).first()
-    if not r: raise HTTPException(404, "Règle introuvable")
-    r.pct_medecin = pct_medecin; r.pct_clinique = 100 - pct_medecin
+    if not r: raise HTTPException(404)
+    r.pct_medecin = pct_medecin; r.pct_clinique = round(100 - pct_medecin, 2)
     db.commit(); return r
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ACTES FACTURABLES
+# ACTES FACTURABLES — PARTIE DOUBLE COMPLÈTE
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/admin/actes-facturables", response_model=List[schemas.ActeOut], tags=["Admin - Compta"])
-async def list_actes(mois: Optional[int] = None, annee: Optional[int] = None, db: Session = Depends(get_db), _=Depends(get_current_user)):
+async def list_actes(mois: Optional[int] = None, annee: Optional[int] = None,
+                     db: Session = Depends(get_db), _=Depends(get_current_user)):
     q = db.query(models.ActeFacturable)
-    if annee: q = q.filter(extract("year", models.ActeFacturable.date_acte) == annee)
+    if annee: q = q.filter(extract("year",  models.ActeFacturable.date_acte) == annee)
     if mois:  q = q.filter(extract("month", models.ActeFacturable.date_acte) == mois)
     return q.order_by(models.ActeFacturable.date_acte.desc()).all()
 
 @router.post("/actes-facturables", response_model=schemas.ActeOut, status_code=201, tags=["Admin - Compta"])
-async def create_acte(data: schemas.ActeCreate, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+async def create_acte(data: schemas.ActeCreate, db: Session = Depends(get_db),
+                      current_user=Depends(get_current_user)):
+    # Vérification USD
+    devise = models.DeviseEnum.USD if data.devise == "USD" else models.DeviseEnum.HTG
+    if devise == models.DeviseEnum.USD and not data.taux_usd_htg:
+        raise HTTPException(422, "taux_usd_htg obligatoire si devise=USD")
+
     medecin = None
     if data.medecin_id:
         medecin = db.query(models.ProfilMedecin).filter(models.ProfilMedecin.id == data.medecin_id).first()
 
-    # Calcul automatique selon type médecin et type acte
+    # Calcul répartition
     if data.montant_medecin_manuel is not None and data.montant_clinique_manuel is not None:
-        montant_medecin  = data.montant_medecin_manuel
-        montant_clinique = data.montant_clinique_manuel
+        montant_medecin  = round(data.montant_medecin_manuel, 2)
+        montant_clinique = round(data.montant_clinique_manuel, 2)
         pct_medecin      = round(montant_medecin / data.montant_total * 100, 1) if data.montant_total else 0
     elif medecin:
         regle = db.query(models.ReglePartage).filter(
             models.ReglePartage.type_medecin == medecin.type_medecin,
-            models.ReglePartage.type_acte == data.type_acte
+            models.ReglePartage.type_acte == data.type_acte,
         ).first()
-        if regle:
-            pct_medecin      = regle.pct_medecin
-            montant_medecin  = round(data.montant_total * pct_medecin / 100, 2)
-            montant_clinique = data.montant_total - montant_medecin
-        else:
-            # Règles par défaut si aucune règle configurée
-            DEFAUTS = {
-                "investisseur": {"consultation": 70, "geste": 80, "chirurgie": 0},
-                "affilie":      {"consultation": 60, "geste": 70, "chirurgie": 0},
-                "exploitant":   {"consultation": 100, "geste": 100, "chirurgie": 100},
-                "investisseur_exploitant": {"consultation": 100, "geste": 100, "chirurgie": 100},
-            }
-            type_m = str(medecin.type_medecin.value) if medecin.type_medecin else "affilie"
-            type_a = data.type_acte if data.type_acte in ["consultation","geste","chirurgie"] else "consultation"
-            pct_medecin      = DEFAUTS.get(type_m, {}).get(type_a, 60)
-            montant_medecin  = round(data.montant_total * pct_medecin / 100, 2)
-            montant_clinique = data.montant_total - montant_medecin
+        DEFAUTS = {"investisseur":{"consultation":70,"geste":80,"chirurgie":0},
+                   "affilie":{"consultation":60,"geste":70,"chirurgie":0},
+                   "exploitant":{"consultation":100,"geste":100,"chirurgie":100},
+                   "investisseur_exploitant":{"consultation":100,"geste":100,"chirurgie":100}}
+        type_m = str(medecin.type_medecin.value)
+        type_a = data.type_acte if data.type_acte in ["consultation","geste","chirurgie"] else "consultation"
+        pct_medecin = regle.pct_medecin if regle else DEFAUTS.get(type_m, {}).get(type_a, 60)
+        montant_medecin  = round(data.montant_total * pct_medecin / 100, 2)
+        montant_clinique = round(data.montant_total - montant_medecin, 2)
     else:
-        pct_medecin = 0; montant_medecin = 0; montant_clinique = data.montant_total
+        pct_medecin = 0; montant_medecin = 0; montant_clinique = round(data.montant_total, 2)
 
-    acte = models.ActeFacturable(
-        medecin_id=data.medecin_id,
-        medecin_nom=medecin.nom if medecin else None,
-        patient_nom=data.patient_nom,
-        type_acte=data.type_acte,
-        specialite=data.specialite,
-        description=data.description,
-        montant_total=data.montant_total,
-        montant_medecin=montant_medecin,
-        montant_clinique=montant_clinique,
-        pct_medecin=pct_medecin,
-        mode_paiement=data.mode_paiement,
-        created_by=current_user.id,
-    )
-    db.add(acte)
-    # Enregistrer la part clinique en mouvement comptable
-    cat_map = {"consultation": "Consultations", "geste": "Gestes médicaux",
-               "chirurgie": "Chirurgies", "hospit": "Hospitalisations", "observation": "Hospitalisations"}
-    mouvement = models.Mouvement(
-        type=models.TypeMouvementEnum.recette,
-        categorie=cat_map.get(data.type_acte, "Consultations"),
+    # Vérification partie double
+    _verif_balance(data.montant_total, montant_medecin, montant_clinique)
+
+    cat_map = {"consultation":"Consultations","geste":"Gestes médicaux",
+               "chirurgie":"Chirurgies","hospit":"Hospitalisations","observation":"Hospitalisations"}
+    categorie      = cat_map.get(data.type_acte, "Consultations")
+    compte_produit = models.COMPTE_PCN.get(categorie, "701")
+    compte_tresor  = models.get_compte_tresorerie(data.mode_paiement, data.devise or "HTG")
+
+    # ── Écriture 1 : Recette totale (partie clinique) ──────────────────
+    # PCN  : 511/521 Trésorerie (D) / 701..709 Produits (C) = montant_clinique
+    # IFRS 15 : produit reconnu à la réalisation de l'acte
+    mouv_recette = _creer_mouvement(
+        db=db, journal=models.JournalEnum.VTE,
+        type_mouv=models.TypeMouvementEnum.recette,
+        categorie=categorie,
         description=f"{data.type_acte.capitalize()} — {data.patient_nom}" + (f" (Dr {medecin.nom})" if medecin else ""),
         montant=montant_clinique,
-        date_mouvement=datetime.now(timezone.utc),
+        compte_debit=compte_tresor,
+        compte_credit=compte_produit,
+        libelle_debit=f"Trésorerie {data.mode_paiement}",
+        libelle_credit=f"Produits {categorie}",
+        mode_paiement=data.mode_paiement, devise=devise,
+        montant_usd=data.montant_total if devise == models.DeviseEnum.USD else None,
+        taux_usd_htg=data.taux_usd_htg, created_by=current_user.id,
+    )
+
+    mouv_honoraires_id = None
+    # ── Écriture 2 : Honoraires médecin → compte courant 468 ──────────
+    # PCN  : 651 Honoraires (D) / 468 C/C médecin (C) = montant_medecin
+    # IFRS : charge de personnel / partage de revenu selon substance
+    if medecin and montant_medecin > 0:
+        mouv_honoraires = _creer_mouvement(
+            db=db, journal=models.JournalEnum.OD,
+            type_mouv=models.TypeMouvementEnum.depense,
+            categorie="Honoraires médecins",
+            description=f"Honoraires Dr {medecin.nom} — {data.patient_nom} — {data.type_acte}",
+            montant=montant_medecin,
+            compte_debit="651",
+            compte_credit="468",
+            libelle_debit="Honoraires médecins (651)",
+            libelle_credit=f"C/C Dr {medecin.nom} (468)",
+            mode_paiement="virement_interne", created_by=current_user.id,
+        )
+        mouv_honoraires_id = mouv_honoraires.id
+        # Mettre à jour le solde 468 du médecin
+        medecin.solde_compte_468 = round((medecin.solde_compte_468 or 0) + montant_medecin, 2)
+
+    acte = models.ActeFacturable(
+        medecin_id=data.medecin_id, medecin_nom=medecin.nom if medecin else None,
+        patient_nom=data.patient_nom, type_acte=data.type_acte,
+        specialite=data.specialite, description=data.description,
+        montant_total=data.montant_total, montant_medecin=montant_medecin,
+        montant_clinique=montant_clinique, pct_medecin=pct_medecin,
+        devise=devise, taux_usd_htg=data.taux_usd_htg,
         mode_paiement=data.mode_paiement,
+        balance_ok=True,
+        mouvement_recette_id=mouv_recette.id,
+        mouvement_honoraires_id=mouv_honoraires_id,
         created_by=current_user.id,
     )
-    db.add(mouvement)
-    db.commit(); db.refresh(acte)
+    db.add(acte); db.commit(); db.refresh(acte)
     return acte
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DÉCAISSEMENTS
+# DÉCAISSEMENTS — PARTIE DOUBLE CORRECTE (468 → 511)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/admin/decaissements", response_model=List[schemas.DecaissementOut], tags=["Admin - Compta"])
@@ -386,62 +559,208 @@ async def list_decaissements(db: Session = Depends(get_db), _=Depends(get_curren
     return db.query(models.Decaissement).order_by(models.Decaissement.date_decaissement.desc()).all()
 
 @router.post("/admin/decaissements", status_code=201, tags=["Admin - Compta"])
-async def create_decaissement(data: schemas.DecaissementCreate, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    # Récupérer nom médecin si pas fourni
-    if not data.medecin_nom:
-        profil = db.query(models.ProfilMedecin).filter(models.ProfilMedecin.id == data.medecin_id).first()
-        nom = profil.nom if profil else "Inconnu"
-    else:
-        nom = data.medecin_nom
+async def create_decaissement(data: schemas.DecaissementCreate, db: Session = Depends(get_db),
+                               current_user=Depends(get_current_user)):
+    """
+    Décaissement médecin — CONFORME PCN HAÏTI (partie double en 2 étapes) :
+
+    Écriture 1 (si pas encore passée via acte) :
+      Débit  651 Honoraires médecins
+      Crédit 468 C/C Dr [nom]
+      → Constate la dette de la clinique envers le médecin
+
+    Écriture 2 (paiement effectif) :
+      Débit  468 C/C Dr [nom]
+      Crédit 511/521 Caisse / Banque
+      → Solde le compte courant par sortie de trésorerie
+    """
+    devise = models.DeviseEnum.USD if data.devise == "USD" else models.DeviseEnum.HTG
+    if devise == models.DeviseEnum.USD and not data.taux_usd_htg:
+        raise HTTPException(422, "taux_usd_htg obligatoire si devise=USD")
+
+    profil = db.query(models.ProfilMedecin).filter(models.ProfilMedecin.id == data.medecin_id).first()
+    nom    = profil.nom if profil else (data.medecin_nom or "Inconnu")
+
+    compte_tresor = models.get_compte_tresorerie(data.mode_paiement, data.devise or "HTG")
+
+    # ── Écriture 1 : Constatation dette 651 → 468 ─────────────────────
+    mouv_468 = _creer_mouvement(
+        db=db, journal=models.JournalEnum.OD,
+        type_mouv=models.TypeMouvementEnum.depense,
+        categorie="Honoraires médecins",
+        description=f"Constatation honoraires Dr {nom} — {data.motif}",
+        montant=data.montant,
+        compte_debit="651", compte_credit="468",
+        libelle_debit="Honoraires médecins (651)",
+        libelle_credit=f"C/C Dr {nom} (468)",
+        mode_paiement="interne", devise=devise,
+        montant_usd=data.montant if devise == models.DeviseEnum.USD else None,
+        taux_usd_htg=data.taux_usd_htg, created_by=current_user.id,
+        notes=f"Étape 1/2 — Décaissement Dr {nom}",
+    )
+
+    # ── Écriture 2 : Paiement cash 468 → 511/521 ─────────────────────
+    mouv_511 = _creer_mouvement(
+        db=db, journal=models.JournalEnum.DECAIS,
+        type_mouv=models.TypeMouvementEnum.depense,
+        categorie="Honoraires médecins",
+        description=f"Paiement Dr {nom} — {data.motif}",
+        montant=data.montant,
+        compte_debit="468", compte_credit=compte_tresor,
+        libelle_debit=f"C/C Dr {nom} (468)",
+        libelle_credit=f"Trésorerie {data.mode_paiement} ({compte_tresor})",
+        mode_paiement=data.mode_paiement, devise=devise,
+        montant_usd=data.montant if devise == models.DeviseEnum.USD else None,
+        taux_usd_htg=data.taux_usd_htg, created_by=current_user.id,
+        notes=f"Étape 2/2 — Sortie trésorerie Dr {nom}",
+    )
+
+    # Mettre à jour solde 468 médecin
+    if profil:
+        profil.solde_compte_468 = round((profil.solde_compte_468 or 0) - data.montant, 2)
+
+    # Marquer actes comme décaissés
+    db.query(models.ActeFacturable).filter(
+        models.ActeFacturable.medecin_id == data.medecin_id,
+        models.ActeFacturable.statut_decaissement == "en_attente",
+    ).update({"statut_decaissement": "decaisse"})
 
     dec = models.Decaissement(
         medecin_id=data.medecin_id, medecin_nom=nom,
         montant=data.montant, motif=data.motif,
-        mode_paiement=data.mode_paiement, created_by=current_user.id,
+        mode_paiement=data.mode_paiement, devise=devise,
+        taux_usd_htg=data.taux_usd_htg,
+        mouvement_468_id=mouv_468.id,
+        mouvement_511_id=mouv_511.id,
+        created_by=current_user.id,
     )
-    db.add(dec)
-    mouvement = models.Mouvement(
-        type=models.TypeMouvementEnum.depense,
-        categorie="Décaissements médecins",
-        description=f"Décaissement Dr {nom} — {data.motif}",
-        montant=data.montant, date_mouvement=datetime.now(timezone.utc),
-        mode_paiement=data.mode_paiement, created_by=current_user.id,
-    )
-    db.add(mouvement)
-    # Marquer les actes de ce médecin comme décaissés
-    db.query(models.ActeFacturable).filter(
-        models.ActeFacturable.medecin_id == data.medecin_id,
-        models.ActeFacturable.statut_decaissement == "en_attente"
-    ).update({"statut_decaissement": "decaisse"})
-    db.commit(); db.refresh(dec)
+    db.add(dec); db.commit(); db.refresh(dec)
     return dec
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MOUVEMENTS COMPTABLES
+# MOUVEMENTS COMPTABLES — JOURNAL
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/admin/mouvements", response_model=List[schemas.MouvementOut], tags=["Admin - Compta"])
-async def list_mouvements(type: Optional[str] = None, mois: Optional[int] = None,
-    annee: Optional[int] = None, db: Session = Depends(get_db), _=Depends(get_current_user)):
+async def list_mouvements(
+    type: Optional[str] = None, mois: Optional[int] = None,
+    annee: Optional[int] = None, journal: Optional[str] = None,
+    db: Session = Depends(get_db), _=Depends(get_current_user)
+):
     q = db.query(models.Mouvement)
-    if type:  q = q.filter(models.Mouvement.type == type)
-    if annee: q = q.filter(extract("year",  models.Mouvement.date_mouvement) == annee)
-    if mois:  q = q.filter(extract("month", models.Mouvement.date_mouvement) == mois)
-    return q.order_by(models.Mouvement.date_mouvement.desc()).all()
+    if type:    q = q.filter(models.Mouvement.type == type)
+    if annee:   q = q.filter(models.Mouvement.periode_annee == annee)
+    if mois:    q = q.filter(models.Mouvement.periode_mois == mois)
+    if journal: q = q.filter(models.Mouvement.journal == journal)
+    return q.order_by(models.Mouvement.created_at.desc()).all()
 
 @router.post("/admin/mouvements", response_model=schemas.MouvementOut, status_code=201, tags=["Admin - Compta"])
-async def create_mouvement(data: schemas.MouvementCreate, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    m = models.Mouvement(**data.model_dump(), created_by=current_user.id)
-    db.add(m); db.commit(); db.refresh(m)
+async def create_mouvement(data: schemas.MouvementCreate, db: Session = Depends(get_db),
+                            current_user=Depends(get_current_user)):
+    """Saisie manuelle d'un mouvement — PCN partie double exigée."""
+    devise = models.DeviseEnum.USD if data.devise == "USD" else models.DeviseEnum.HTG
+    if devise == models.DeviseEnum.USD and not data.taux_usd_htg:
+        raise HTTPException(422, "taux_usd_htg obligatoire si devise=USD")
+
+    type_mouv = models.TypeMouvementEnum.recette if data.type == "recette" else models.TypeMouvementEnum.depense
+    journal   = models.JournalEnum.VTE if data.type == "recette" else models.JournalEnum.ACH
+
+    compte_tresor  = models.get_compte_tresorerie(data.mode_paiement, data.devise or "HTG")
+    compte_contrep = models.COMPTE_PCN.get(data.categorie, "701" if data.type == "recette" else "628")
+
+    if data.type == "recette":
+        compte_d, compte_c = compte_tresor, compte_contrep
+    else:
+        compte_d, compte_c = compte_contrep, compte_tresor
+
+    m = _creer_mouvement(
+        db=db, journal=journal, type_mouv=type_mouv,
+        categorie=data.categorie, description=data.description,
+        montant=data.montant,
+        compte_debit=compte_d, compte_credit=compte_c,
+        libelle_debit=data.libelle_debit or "",
+        libelle_credit=data.libelle_credit or "",
+        mode_paiement=data.mode_paiement, devise=devise,
+        montant_usd=data.montant_usd, taux_usd_htg=data.taux_usd_htg,
+        reference=data.reference, notes=data.notes,
+        created_by=current_user.id,
+    )
+    db.commit(); db.refresh(m)
     return m
 
-@router.delete("/admin/mouvements/{mid}", tags=["Admin - Compta"])
-async def delete_mouvement(mid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
-    m = db.query(models.Mouvement).filter(models.Mouvement.id == mid).first()
-    if not m: raise HTTPException(404, "Mouvement introuvable")
-    db.delete(m); db.commit()
-    return {"message": "Supprimé"}
+@router.post("/admin/mouvements/{mid}/contrepasser", tags=["Admin - Compta"])
+async def contrepasser_mouvement(mid: int, raison: str, db: Session = Depends(get_db),
+                                  current_user=Depends(require_admin)):
+    """
+    Contrepassation PCN — JAMAIS de suppression d'écriture.
+    Crée un mouvement inverse avec référence à l'original.
+    """
+    orig = db.query(models.Mouvement).filter(models.Mouvement.id == mid).first()
+    if not orig: raise HTTPException(404, "Mouvement introuvable")
+    if orig.est_contrepassation:
+        raise HTTPException(400, "Impossible de contrepasser une contrepassation")
+
+    type_inv = (models.TypeMouvementEnum.depense
+                if orig.type == models.TypeMouvementEnum.recette
+                else models.TypeMouvementEnum.recette)
+
+    journal_inv = models.JournalEnum.OD
+    contrepass = _creer_mouvement(
+        db=db, journal=journal_inv, type_mouv=type_inv,
+        categorie=orig.categorie,
+        description=f"CONTREPASSATION de {orig.numero_piece} — {raison}",
+        montant=orig.montant,
+        compte_debit=orig.compte_credit,    # Inversion débit/crédit
+        compte_credit=orig.compte_debit,
+        libelle_debit=f"Contrepassation {orig.libelle_credit}",
+        libelle_credit=f"Contrepassation {orig.libelle_debit}",
+        mode_paiement=orig.mode_paiement, devise=orig.devise,
+        notes=f"Contrepassation de {orig.numero_piece}. Raison : {raison}",
+        created_by=current_user.id,
+        est_contrepassation=True,
+        mouvement_origine_id=orig.id,
+    )
+    db.commit()
+    return {
+        "message": "Contrepassation créée",
+        "numero_piece_original": orig.numero_piece,
+        "numero_piece_contrepassation": contrepass.numero_piece,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PÉRIODES COMPTABLES — VERROUILLAGE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/admin/periodes", tags=["Admin - Compta"])
+async def list_periodes(db: Session = Depends(get_db), _=Depends(require_admin)):
+    return db.query(models.PeriodeComptable).order_by(
+        models.PeriodeComptable.annee.desc(), models.PeriodeComptable.mois.desc()
+    ).all()
+
+@router.post("/admin/periodes/cloturer", tags=["Admin - Compta"])
+async def cloturer_periode(mois: int, annee: int, db: Session = Depends(get_db),
+                            current_user=Depends(require_admin)):
+    """Clôture une période comptable — irréversible sauf admin DBA."""
+    p = db.query(models.PeriodeComptable).filter(
+        models.PeriodeComptable.mois == mois,
+        models.PeriodeComptable.annee == annee,
+    ).first()
+    if not p:
+        p = models.PeriodeComptable(mois=mois, annee=annee); db.add(p)
+    if p.statut == models.StatutPeriodeEnum.cloturee:
+        raise HTTPException(400, f"Période {mois}/{annee} déjà clôturée")
+    p.statut     = models.StatutPeriodeEnum.cloturee
+    p.cloture_par = current_user.id
+    p.cloture_at = datetime.now(timezone.utc)
+    # Verrouiller tous les mouvements de cette période
+    db.query(models.Mouvement).filter(
+        models.Mouvement.periode_mois == mois,
+        models.Mouvement.periode_annee == annee,
+    ).update({"periode_verrou": True})
+    db.commit()
+    return {"message": f"Période {mois}/{annee} clôturée avec succès"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -450,122 +769,198 @@ async def delete_mouvement(mid: int, db: Session = Depends(get_db), _=Depends(re
 
 @router.get("/admin/bilans", tags=["Admin - Compta"])
 async def list_bilans(db: Session = Depends(get_db), _=Depends(get_current_user)):
-    return db.query(models.BilanMensuel).order_by(models.BilanMensuel.annee.desc(), models.BilanMensuel.mois.desc()).all()
+    return db.query(models.BilanMensuel).order_by(
+        models.BilanMensuel.annee.desc(), models.BilanMensuel.mois.desc()
+    ).all()
 
 @router.post("/admin/generer-bilan", tags=["Admin - Compta"])
 async def generer_bilan(data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
-    mois  = data.get("mois")
-    annee = data.get("annee")
+    mois = data.get("mois"); annee = data.get("annee")
 
-    def sum_cat(cat, type_mouv="recette"):
-        return db.query(func.sum(models.Mouvement.montant)).filter(
+    def sum_compte(comptes: list, type_mouv: str = "recette") -> float:
+        q = db.query(func.sum(models.Mouvement.montant)).filter(
             models.Mouvement.type == type_mouv,
-            models.Mouvement.categorie.ilike(f"%{cat}%"),
-            extract("month", models.Mouvement.date_mouvement) == mois,
-            extract("year",  models.Mouvement.date_mouvement) == annee,
-        ).scalar() or 0.0
+            models.Mouvement.compte_credit.in_(comptes) if type_mouv == "recette"
+            else models.Mouvement.compte_debit.in_(comptes),
+            models.Mouvement.periode_mois == mois,
+            models.Mouvement.periode_annee == annee,
+            models.Mouvement.est_contrepassation == False,
+        )
+        return round(q.scalar() or 0.0, 2)
 
-    def sum_all(type_mouv):
-        return db.query(func.sum(models.Mouvement.montant)).filter(
-            models.Mouvement.type == type_mouv,
-            extract("month", models.Mouvement.date_mouvement) == mois,
-            extract("year",  models.Mouvement.date_mouvement) == annee,
-        ).scalar() or 0.0
+    # Produits par compte PCN
+    tot_cons  = sum_compte(["701"])
+    tot_gest  = sum_compte(["702"])
+    tot_chir  = sum_compte(["703"])
+    tot_hosp  = sum_compte(["704"])
+    tot_labo  = sum_compte(["705"])
+    tot_phar  = sum_compte(["706","707","708","709"])
+    tot_loyer = sum_compte(["711"])
+    tot_autres_prod = sum_compte(["719"])
+    total_prod = tot_cons + tot_gest + tot_chir + tot_hosp + tot_labo + tot_phar + tot_loyer + tot_autres_prod
 
-    tot_cons  = sum_cat("Consultations")
-    tot_gest  = sum_cat("Gestes")
-    tot_chir  = sum_cat("Chirurgie")
-    tot_hosp  = sum_cat("Hospitalisation")
-    tot_labo  = sum_cat("Laboratoire")
-    tot_phar  = sum_cat("Pharmacie")
-    tot_loyer = sum_cat("Loyer") + sum_cat("Exploitant") + sum_cat("Optométrie")
-    tot_autres_prod = sum_all("recette") - tot_cons - tot_gest - tot_chir - tot_hosp - tot_labo - tot_phar - tot_loyer
-    total_produits  = sum_all("recette")
+    # Charges par compte PCN
+    tot_honor = sum_compte(["651"], "depense")
+    tot_sal   = sum_compte(["641"], "depense")
+    tot_cs    = sum_compte(["645"], "depense")
+    tot_achats = sum_compte(["601","607"], "depense")
+    tot_amort = sum_compte(["681"], "depense")
+    tot_infra = sum_compte(["615"], "depense")
+    tot_autres_ch = sum_compte(["626","628"], "depense")
+    total_charges = tot_honor + tot_sal + tot_cs + tot_achats + tot_amort + tot_infra + tot_autres_ch
 
-    tot_dec   = sum_cat("Décaissements", "depense")
-    tot_sal   = sum_cat("Salaires", "depense") + sum_cat("RH", "depense")
-    tot_phar_ach = sum_cat("Pharmacie achats", "depense")
-    tot_infra = sum_cat("Infrastructure", "depense") + sum_cat("Énergie", "depense")
-    tot_autres_ch = sum_all("depense") - tot_dec - tot_sal - tot_phar_ach - tot_infra
-    total_charges  = sum_all("depense")
+    # TCA collectée
+    tot_tca = db.query(func.sum(models.Mouvement.tca_montant)).filter(
+        models.Mouvement.periode_mois == mois,
+        models.Mouvement.periode_annee == annee,
+    ).scalar() or 0.0
 
-    # Upsert bilan
     bilan = db.query(models.BilanMensuel).filter(
         models.BilanMensuel.mois == mois, models.BilanMensuel.annee == annee
     ).first()
     if not bilan:
-        bilan = models.BilanMensuel(mois=mois, annee=annee)
-        db.add(bilan)
+        bilan = models.BilanMensuel(mois=mois, annee=annee); db.add(bilan)
 
-    bilan.total_consultations = tot_cons
-    bilan.total_gestes = tot_gest
-    bilan.total_chirurgies = tot_chir
-    bilan.total_hospitalisations = tot_hosp
-    bilan.total_laboratoire = tot_labo
-    bilan.total_pharmacie = tot_phar
-    bilan.total_loyers_recus = tot_loyer
-    bilan.total_autres_produits = max(tot_autres_prod, 0)
-    bilan.total_produits = total_produits
-    bilan.total_decaissements_medecins = tot_dec
-    bilan.total_salaires = tot_sal
-    bilan.total_pharmacie_achats = tot_phar_ach
-    bilan.total_infrastructure = tot_infra
-    bilan.total_autres_charges = max(tot_autres_ch, 0)
-    bilan.total_charges = total_charges
-    bilan.resultat_net = total_produits - total_charges
-    bilan.statut = "brouillon"
+    bilan.total_consultations       = tot_cons
+    bilan.total_gestes               = tot_gest
+    bilan.total_chirurgies           = tot_chir
+    bilan.total_hospitalisations     = tot_hosp
+    bilan.total_laboratoire          = tot_labo
+    bilan.total_pharmacie            = tot_phar
+    bilan.total_loyers_recus         = tot_loyer
+    bilan.total_autres_produits      = tot_autres_prod
+    bilan.total_produits             = total_prod
+    bilan.total_honoraires_medecins  = tot_honor
+    bilan.total_salaires             = tot_sal
+    bilan.total_charges_sociales     = tot_cs
+    bilan.total_pharmacie_achats     = tot_achats
+    bilan.total_amortissements       = tot_amort
+    bilan.total_infrastructure       = tot_infra
+    bilan.total_autres_charges       = tot_autres_ch
+    bilan.total_charges              = total_charges
+    bilan.resultat_net               = round(total_prod - total_charges, 2)
+    bilan.total_tca_collectee        = round(tot_tca, 2)
     db.commit(); db.refresh(bilan)
     return bilan
 
 @router.put("/admin/bilans/{bid}/valider", tags=["Admin - Compta"])
 async def valider_bilan(bid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
     b = db.query(models.BilanMensuel).filter(models.BilanMensuel.id == bid).first()
-    if not b: raise HTTPException(404, "Bilan introuvable")
-    b.statut = "valide"; db.commit()
-    return b
+    if not b: raise HTTPException(404)
+    b.statut = "valide"; db.commit(); return b
 
 @router.get("/admin/rapport-cumul", tags=["Admin - Compta"])
 async def rapport_cumul(mois_debut: int, annee_debut: int, mois_fin: int, annee_fin: int,
-    db: Session = Depends(get_db), _=Depends(require_admin)):
+                         db: Session = Depends(get_db), _=Depends(require_admin)):
     bilans = db.query(models.BilanMensuel).all()
-    bilans_filtre = []
-    for b in bilans:
-        if (b.annee > annee_debut or (b.annee == annee_debut and b.mois >= mois_debut)) and \
-           (b.annee < annee_fin  or (b.annee == annee_fin  and b.mois <= mois_fin)):
-            bilans_filtre.append(b)
-
-    total_produits = sum(b.total_produits for b in bilans_filtre)
-    total_charges  = sum(b.total_charges  for b in bilans_filtre)
+    filtre = [b for b in bilans if
+              (b.annee > annee_debut or (b.annee == annee_debut and b.mois >= mois_debut)) and
+              (b.annee < annee_fin  or (b.annee == annee_fin  and b.mois <= mois_fin))]
     return {
         "periode": f"{mois_debut}/{annee_debut} — {mois_fin}/{annee_fin}",
-        "nb_mois": len(bilans_filtre),
-        "total_produits": total_produits,
-        "total_charges": total_charges,
-        "resultat_net": total_produits - total_charges,
-        "detail_produits": {
-            "consultations": sum(b.total_consultations for b in bilans_filtre),
-            "gestes": sum(b.total_gestes for b in bilans_filtre),
-            "chirurgies": sum(b.total_chirurgies for b in bilans_filtre),
-            "laboratoire": sum(b.total_laboratoire for b in bilans_filtre),
-            "pharmacie": sum(b.total_pharmacie for b in bilans_filtre),
-            "loyers": sum(b.total_loyers_recus for b in bilans_filtre),
-            "autres": sum(b.total_autres_produits for b in bilans_filtre),
-        },
-        "detail_charges": {
-            "decaissements_medecins": sum(b.total_decaissements_medecins for b in bilans_filtre),
-            "salaires": sum(b.total_salaires for b in bilans_filtre),
-            "pharmacie_achats": sum(b.total_pharmacie_achats for b in bilans_filtre),
-            "infrastructure": sum(b.total_infrastructure for b in bilans_filtre),
-            "autres": sum(b.total_autres_charges for b in bilans_filtre),
-        },
-        "bilans_mensuels": [{"mois": b.mois, "annee": b.annee,
-            "produits": b.total_produits, "charges": b.total_charges,
-            "resultat": b.resultat_net, "statut": b.statut} for b in bilans_filtre],
+        "nb_mois": len(filtre),
+        "total_produits": sum(b.total_produits for b in filtre),
+        "total_charges":  sum(b.total_charges for b in filtre),
+        "resultat_net":   sum(b.resultat_net for b in filtre),
+        "bilans": [{"mois":b.mois,"annee":b.annee,"produits":b.total_produits,
+                    "charges":b.total_charges,"resultat":b.resultat_net,"statut":b.statut} for b in filtre],
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TARIFS CLINIC
+# IMMOBILISATIONS (CLASSE 2 PCN)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/admin/immobilisations", tags=["Admin - Compta"])
+async def list_immobilisations(db: Session = Depends(get_db), _=Depends(get_current_user)):
+    return db.query(models.Immobilisation).filter(models.Immobilisation.actif == True).all()
+
+@router.post("/admin/immobilisations", status_code=201, tags=["Admin - Compta"])
+async def create_immobilisation(data: dict, db: Session = Depends(get_db),
+                                 current_user=Depends(require_admin)):
+    """
+    Acquisition d'une immobilisation — PCN Classe 2.
+    Écriture : 218 Équipements médicaux (D) / 511 Caisse ou 401 Fournisseur (C)
+    """
+    devise_str = data.get("devise", "HTG")
+    taux       = data.get("taux_usd_htg")
+    devise     = models.DeviseEnum.USD if devise_str == "USD" else models.DeviseEnum.HTG
+
+    if devise == models.DeviseEnum.USD and not taux:
+        raise HTTPException(422, "taux_usd_htg obligatoire si devise=USD")
+
+    valeur_acq = float(data.get("valeur_acquisition", 0))
+    valeur_htg = round(valeur_acq * taux, 2) if devise == models.DeviseEnum.USD and taux else valeur_acq
+    duree      = int(data.get("duree_amort_ans", 5))
+    compte_pcn = data.get("compte_pcn", "218")
+
+    immo = models.Immobilisation(
+        libelle=data.get("libelle"), compte_pcn=compte_pcn,
+        valeur_acquisition=valeur_acq, devise_acquisition=devise,
+        taux_usd_achat=taux, valeur_htg=valeur_htg,
+        date_acquisition=datetime.fromisoformat(data.get("date_acquisition", datetime.now().isoformat())),
+        duree_amort_ans=duree, taux_amort=round(100/duree, 2),
+        amort_cumule=0.0, valeur_nette=valeur_htg,
+        created_by=current_user.id,
+    )
+    db.add(immo)
+
+    # Écriture comptable acquisition : 218 (D) / 511 ou 401 (C)
+    mode_financement = data.get("mode_financement", "caisse")
+    compte_credit = "401" if mode_financement == "fournisseur" else models.get_compte_tresorerie(mode_financement)
+    _creer_mouvement(
+        db=db, journal=models.JournalEnum.ACH,
+        type_mouv=models.TypeMouvementEnum.depense,
+        categorie="Équipements",
+        description=f"Acquisition {data.get('libelle')} — immobilisation",
+        montant=valeur_htg,
+        compte_debit=compte_pcn, compte_credit=compte_credit,
+        libelle_debit=f"Immobilisation {data.get('libelle')} ({compte_pcn})",
+        libelle_credit=f"{'Fournisseur (401)' if mode_financement=='fournisseur' else 'Trésorerie'}",
+        mode_paiement=mode_financement, devise=devise,
+        montant_usd=valeur_acq if devise == models.DeviseEnum.USD else None,
+        taux_usd_htg=taux, created_by=current_user.id,
+    )
+    db.commit(); db.refresh(immo)
+    return immo
+
+@router.post("/admin/immobilisations/{iid}/amortir", tags=["Admin - Compta"])
+async def passer_amortissement(iid: int, db: Session = Depends(get_db),
+                                current_user=Depends(require_admin)):
+    """
+    Dotation aux amortissements mensuelle.
+    PCN : 681 Dotations amortissements (D) / 280 Amortissements cumulés (C)
+    """
+    immo = db.query(models.Immobilisation).filter(models.Immobilisation.id == iid).first()
+    if not immo: raise HTTPException(404, "Immobilisation introuvable")
+    if not immo.actif: raise HTTPException(400, "Immobilisation déjà sortie")
+
+    amort_mensuel = round(immo.valeur_htg / (immo.duree_amort_ans * 12), 2)
+    if immo.valeur_nette <= 0:
+        raise HTTPException(400, "Immobilisation totalement amortie")
+    amort_mensuel = min(amort_mensuel, immo.valeur_nette)
+
+    immo.amort_cumule = round(immo.amort_cumule + amort_mensuel, 2)
+    immo.valeur_nette = round(immo.valeur_nette - amort_mensuel, 2)
+
+    _creer_mouvement(
+        db=db, journal=models.JournalEnum.OD,
+        type_mouv=models.TypeMouvementEnum.depense,
+        categorie="Amortissements",
+        description=f"Dotation amortissement — {immo.libelle}",
+        montant=amort_mensuel,
+        compte_debit="681", compte_credit="280",
+        libelle_debit="Dotations amortissements (681)",
+        libelle_credit="Amortissements cumulés (280)",
+        mode_paiement="interne", created_by=current_user.id,
+    )
+    db.commit()
+    return {"message": "Amortissement passé", "montant": amort_mensuel,
+            "valeur_nette_restante": immo.valeur_nette}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TARIFS / STOCKS / LABO / OPTOMÉTRIE / PAIEMENTS EXPLOITANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/admin/tarifs-clinic", tags=["Admin - Compta"])
@@ -575,14 +970,8 @@ async def list_tarifs(db: Session = Depends(get_db), _=Depends(get_current_user)
 @router.put("/admin/tarifs-clinic/{code}", tags=["Admin - Compta"])
 async def update_tarif(code: str, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
     t = db.query(models.TarifClinic).filter(models.TarifClinic.code == code).first()
-    if not t: raise HTTPException(404, "Tarif introuvable")
-    t.montant = data.get("montant", t.montant); db.commit()
-    return t
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STOCKS PHARMACIE
-# ══════════════════════════════════════════════════════════════════════════════
+    if not t: raise HTTPException(404)
+    t.montant = data.get("montant", t.montant); db.commit(); return t
 
 @router.get("/pharmacie/stocks", tags=["Pharmacie"])
 async def get_stocks(db: Session = Depends(get_db)):
@@ -600,13 +989,12 @@ async def create_stock(data: dict, db: Session = Depends(get_db), _=Depends(requ
         proprietaire=data.get("proprietaire", "Clinique"),
         mode_reversement=mode, valeur_reversement=valeur, pct_clinique=pct,
     )
-    db.add(item); db.commit(); db.refresh(item)
-    return item
+    db.add(item); db.commit(); db.refresh(item); return item
 
 @router.put("/admin/stocks/{sid}", tags=["Admin"])
 async def update_stock(sid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
     s = db.query(models.StockItem).filter(models.StockItem.id == sid).first()
-    if not s: raise HTTPException(404, "Stock introuvable")
+    if not s: raise HTTPException(404)
     for k, v in data.items(): setattr(s, k, v)
     db.commit(); return s
 
@@ -614,13 +1002,7 @@ async def update_stock(sid: int, data: dict, db: Session = Depends(get_db), _=De
 async def delete_stock(sid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
     s = db.query(models.StockItem).filter(models.StockItem.id == sid).first()
     if not s: raise HTTPException(404)
-    db.delete(s); db.commit()
-    return {"message": "Supprimé"}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LABORATOIRE
-# ══════════════════════════════════════════════════════════════════════════════
+    db.delete(s); db.commit(); return {"message": "Supprimé"}
 
 @router.get("/labo/analyses", tags=["Labo"])
 async def list_analyses(db: Session = Depends(get_db), _=Depends(get_current_user)):
@@ -633,8 +1015,7 @@ async def create_analyse(data: dict, db: Session = Depends(get_db), current_user
         type_examen=data.get("type_examen", ""), resultats=data.get("resultats", ""),
         notes=data.get("notes", ""), technicien_id=current_user.id,
     )
-    db.add(r); db.commit(); db.refresh(r)
-    return r
+    db.add(r); db.commit(); db.refresh(r); return r
 
 @router.put("/labo/analyses/{aid}", tags=["Labo"])
 async def update_analyse(aid: int, data: dict, db: Session = Depends(get_db), _=Depends(get_current_user)):
@@ -647,38 +1028,6 @@ async def update_analyse(aid: int, data: dict, db: Session = Depends(get_db), _=
 async def patient_resultats(patient_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
     return db.query(models.ResultatLabo).filter(models.ResultatLabo.patient_id == patient_id).all()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAIEMENTS EXPLOITANTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-@router.post("/caissier/paiement-exploitant", status_code=201, tags=["Exploitants"])
-async def paiement_exploitant(data: dict, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    paiement = models.PaiementExploitant(
-        medecin_id=data.get("medecin_id"), medecin_nom=data.get("medecin_nom", ""),
-        patient_nom=data.get("patient_nom", ""), montant=float(data.get("montant", 0)),
-        mode_paiement=data.get("mode_paiement", "especes"),
-        flux_direct=data.get("flux_direct", False),
-        description=data.get("description", ""), created_by=current_user.id,
-    )
-    db.add(paiement)
-    mouvement = models.Mouvement(
-        type=models.TypeMouvementEnum.recette, categorie="Exploitant",
-        description=f"{data.get('medecin_nom','')} — {data.get('patient_nom','')} — {data.get('description','')}",
-        montant=float(data.get("montant", 0)),
-        date_mouvement=datetime.now(timezone.utc),
-        mode_paiement=data.get("mode_paiement", "especes"),
-        notes=f"Flux direct: {data.get('flux_direct', False)}",
-        created_by=current_user.id,
-    )
-    db.add(mouvement); db.commit(); db.refresh(paiement)
-    return paiement
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# OPTOMÉTRIE
-# ══════════════════════════════════════════════════════════════════════════════
-
 @router.get("/admin/contrat-optometrie", tags=["Optométrie"])
 async def get_contrat(db: Session = Depends(get_db), _=Depends(require_admin)):
     return db.query(models.ContratOptometrie).first()
@@ -686,43 +1035,70 @@ async def get_contrat(db: Session = Depends(get_db), _=Depends(require_admin)):
 @router.put("/admin/contrat-optometrie", tags=["Optométrie"])
 async def update_contrat(data: dict, db: Session = Depends(get_db), current_user=Depends(require_admin)):
     c = db.query(models.ContratOptometrie).first()
-    if not c:
-        c = models.ContratOptometrie(); db.add(c)
+    if not c: c = models.ContratOptometrie(); db.add(c)
     for k, v in data.items(): setattr(c, k, v)
-    c.updated_by = current_user.id
-    db.commit(); return c
+    c.updated_by = current_user.id; db.commit(); return c
 
 @router.post("/admin/calculer-optometrie", tags=["Optométrie"])
-async def calculer_optomet(data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+async def calculer_optometrie(data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
     c = db.query(models.ContratOptometrie).first()
     if not c: raise HTTPException(404, "Contrat non configuré")
-    total_consul  = float(data.get("total_consultations", 0))
+    total_consul   = float(data.get("total_consultations", 0))
     total_montures = float(data.get("total_montures", 0))
-    part_consul   = round(total_consul   * c.pct_consultation / 100, 2)
-    part_montures = round(total_montures * c.pct_montures     / 100, 2)
-    total_part    = part_consul + part_montures
-    minimum_htg   = round(c.minimum_mensuel_usd * c.taux_usd_htg, 2)
-    montant_final = max(total_part, minimum_htg)
-    difference    = total_part - minimum_htg
+    part_consul    = round(total_consul   * c.pct_consultation / 100, 2)
+    part_montures  = round(total_montures * c.pct_montures     / 100, 2)
+    total_part     = part_consul + part_montures
+    minimum_htg    = round(c.minimum_mensuel_usd * c.taux_usd_htg, 2)
+    montant_final  = max(total_part, minimum_htg)
     bilan = models.BilanOptometrieMensuel(
         mois=data.get("mois"), annee=data.get("annee"),
         total_consultations=total_consul, total_montures=total_montures,
         part_clinique_consultations=part_consul, part_clinique_montures=part_montures,
         total_part_clinique=total_part, minimum_applicable_htg=minimum_htg,
-        montant_final_clinique=montant_final, difference=difference,
+        montant_final_clinique=montant_final, difference=round(total_part - minimum_htg, 2),
     )
     db.add(bilan); db.commit()
-    return {
-        "mois": data.get("mois"), "annee": data.get("annee"),
-        "part_clinique_consultations": part_consul,
-        "part_clinique_montures": part_montures,
-        "total_part_clinique": total_part,
-        "minimum_mensuel_usd": c.minimum_mensuel_usd,
-        "minimum_htg": minimum_htg,
-        "montant_final_clinique": montant_final,
-        "difference": difference,
-        "verdict": "OK — % supérieur au minimum" if difference >= 0 else f"COMPLÉMENT REQUIS: {abs(difference):,.0f} HTG",
-    }
+    return {"part_clinique_consultations": part_consul, "part_clinique_montures": part_montures,
+            "total_part_clinique": total_part, "minimum_htg": minimum_htg,
+            "montant_final_clinique": montant_final,
+            "verdict": "OK" if total_part >= minimum_htg else f"COMPLÉMENT : {minimum_htg - total_part:,.0f} HTG"}
+
+@router.post("/caissier/paiement-exploitant", status_code=201, tags=["Exploitants"])
+async def paiement_exploitant(data: dict, db: Session = Depends(get_db),
+                               current_user=Depends(get_current_user)):
+    devise_str = data.get("devise", "HTG")
+    taux       = data.get("taux_usd_htg")
+    devise     = models.DeviseEnum.USD if devise_str == "USD" else models.DeviseEnum.HTG
+    if devise == models.DeviseEnum.USD and not taux:
+        raise HTTPException(422, "taux_usd_htg obligatoire si devise=USD")
+
+    montant = float(data.get("montant", 0))
+    compte_tresor = models.get_compte_tresorerie(data.get("mode_paiement", "especes"), devise_str)
+
+    mouvement = _creer_mouvement(
+        db=db, journal=models.JournalEnum.VTE,
+        type_mouv=models.TypeMouvementEnum.recette,
+        categorie="Loyer exploitant",
+        description=f"{data.get('medecin_nom','')} — {data.get('patient_nom','')} — {data.get('description','')}",
+        montant=montant, compte_debit=compte_tresor, compte_credit="711",
+        libelle_debit=f"Trésorerie {data.get('mode_paiement','')}",
+        libelle_credit="Loyers exploitants (711)",
+        mode_paiement=data.get("mode_paiement","especes"), devise=devise,
+        montant_usd=montant if devise == models.DeviseEnum.USD else None,
+        taux_usd_htg=taux,
+        notes=f"Flux direct: {data.get('flux_direct', False)}",
+        created_by=current_user.id,
+    )
+    paiement = models.PaiementExploitant(
+        medecin_id=data.get("medecin_id"), medecin_nom=data.get("medecin_nom",""),
+        patient_nom=data.get("patient_nom",""), montant=montant,
+        devise=devise, taux_usd_htg=taux,
+        mode_paiement=data.get("mode_paiement","especes"),
+        flux_direct=data.get("flux_direct",False), description=data.get("description",""),
+        mouvement_id=mouvement.id, created_by=current_user.id,
+    )
+    db.add(paiement); db.commit(); db.refresh(paiement)
+    return paiement
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -736,7 +1112,7 @@ async def list_users(db: Session = Depends(get_db), _=Depends(require_admin)):
 @router.put("/admin/users/{uid}", tags=["Admin - Users"])
 async def update_user(uid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
     u = db.query(models.User).filter(models.User.id == uid).first()
-    if not u: raise HTTPException(404, "Utilisateur introuvable")
+    if not u: raise HTTPException(404)
     for k, v in data.items(): setattr(u, k, v)
     db.commit(); return {"message": "Mis à jour"}
 
@@ -752,68 +1128,64 @@ async def delete_user(uid: int, db: Session = Depends(get_db), _=Depends(require
     u = db.query(models.User).filter(models.User.id == uid).first()
     if not u: raise HTTPException(404)
     if u.role == "admin": raise HTTPException(400, "Impossible de supprimer un admin")
-    db.delete(u); db.commit()
-    return {"message": "Supprimé"}
+    db.delete(u); db.commit(); return {"message": "Supprimé"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STATS DASHBOARD
+# STATISTIQUES DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/admin/stats/dashboard", response_model=schemas.DashboardStats, tags=["Stats"])
 async def dashboard_stats(db: Session = Depends(get_db), _=Depends(get_current_user)):
-    now = datetime.now(timezone.utc)
+    now         = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     rdv_today    = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.date_rdv >= today_start).scalar()
     rdv_month    = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.date_rdv >= month_start).scalar()
-    recettes_day = db.query(func.sum(models.Mouvement.montant)).filter(models.Mouvement.type == "recette", models.Mouvement.date_mouvement >= today_start).scalar() or 0.0
-    recettes_month = db.query(func.sum(models.Mouvement.montant)).filter(models.Mouvement.type == "recette", models.Mouvement.date_mouvement >= month_start).scalar() or 0.0
-    rdv_en_attente = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.statut == "en_attente").scalar()
-    rdv_total    = db.query(func.count(models.RendezVous.id)).scalar() or 1
-    rdv_ok       = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.statut.in_(["confirme","termine"])).scalar()
+    recettes_day = db.query(func.sum(models.Mouvement.montant)).filter(
+        models.Mouvement.type == "recette", models.Mouvement.created_at >= today_start).scalar() or 0.0
+    recettes_month = db.query(func.sum(models.Mouvement.montant)).filter(
+        models.Mouvement.type == "recette", models.Mouvement.periode_mois == now.month,
+        models.Mouvement.periode_annee == now.year).scalar() or 0.0
+    rdv_attente = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.statut == "en_attente").scalar()
+    rdv_total   = db.query(func.count(models.RendezVous.id)).scalar() or 1
+    rdv_ok      = db.query(func.count(models.RendezVous.id)).filter(
+        models.RendezVous.statut.in_(["confirme","termine"])).scalar()
     return {"rdv_today": rdv_today, "rdv_month": rdv_month, "patients_month": rdv_month,
             "recettes_day": recettes_day, "recettes_month": recettes_month,
-            "rdv_en_attente": rdv_en_attente, "taux_presence": round(rdv_ok/rdv_total*100, 1)}
+            "rdv_en_attente": rdv_attente, "taux_presence": round(rdv_ok/rdv_total*100, 1)}
 
 @router.get("/admin/stats/rdv-par-jour", tags=["Stats"])
 async def rdv_par_jour(jours: int = 7, db: Session = Depends(get_db), _=Depends(get_current_user)):
     now = datetime.now(timezone.utc)
-    result = []
-    for i in range(jours - 1, -1, -1):
-        day = now - timedelta(days=i)
-        ds = day.replace(hour=0, minute=0, second=0); de = day.replace(hour=23, minute=59, second=59)
-        count = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.date_rdv.between(ds, de)).scalar()
-        result.append({"date": day.strftime("%d/%m"), "count": count})
-    return result
+    return [{"date": (now - timedelta(days=i)).strftime("%d/%m"),
+             "count": db.query(func.count(models.RendezVous.id)).filter(
+                models.RendezVous.date_rdv.between(
+                    (now - timedelta(days=i)).replace(hour=0,minute=0,second=0),
+                    (now - timedelta(days=i)).replace(hour=23,minute=59,second=59)
+                )).scalar()} for i in range(jours-1, -1, -1)]
 
 @router.get("/admin/stats/recettes-par-jour", tags=["Stats"])
 async def recettes_par_jour(jours: int = 7, db: Session = Depends(get_db), _=Depends(get_current_user)):
     now = datetime.now(timezone.utc)
-    result = []
-    for i in range(jours - 1, -1, -1):
-        day = now - timedelta(days=i)
-        ds = day.replace(hour=0, minute=0, second=0); de = day.replace(hour=23, minute=59, second=59)
-        total = db.query(func.sum(models.Mouvement.montant)).filter(
-            models.Mouvement.type == "recette", models.Mouvement.date_mouvement.between(ds, de)
-        ).scalar() or 0
-        result.append({"date": day.strftime("%d/%m"), "total": float(total)})
-    return result
+    return [{"date": (now - timedelta(days=i)).strftime("%d/%m"),
+             "total": float(db.query(func.sum(models.Mouvement.montant)).filter(
+                models.Mouvement.type == "recette",
+                models.Mouvement.created_at.between(
+                    (now - timedelta(days=i)).replace(hour=0,minute=0,second=0),
+                    (now - timedelta(days=i)).replace(hour=23,minute=59,second=59)
+                )).scalar() or 0)} for i in range(jours-1, -1, -1)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AI CHAT
+# SETUP INITIAL + AI CHAT
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.post("/chat", tags=["IA"])
 async def chat(data: schemas.ChatMessage):
+    from app.services.ai import chat_with_rebecca
     response = await chat_with_rebecca(data.message, data.historique)
     return {"response": response}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SETUP ADMIN (à supprimer après premier déploiement)
-# ══════════════════════════════════════════════════════════════════════════════
 
 @router.post("/setup-admin-init")
 def setup_admin(db: Session = Depends(get_db)):
@@ -821,13 +1193,11 @@ def setup_admin(db: Session = Depends(get_db)):
         existing = db.query(models.User).filter(models.User.email == "admin@cliniquerebecca.ht").first()
         if existing:
             existing.hashed_password = get_password_hash("rebecca2026")
-            existing.role = "admin"; existing.is_active = True
-            db.commit()
-            return {"status": "Admin mis à jour", "email": "admin@cliniquerebecca.ht"}
-        admin = models.User(email="admin@cliniquerebecca.ht", nom="Administrateur",
+            existing.role = "admin"; existing.is_active = True; db.commit()
+            return {"status": "Admin mis à jour"}
+        admin = models.User(email="admin@cliniquerebecca.ht", nom="Administrateur Rebecca",
             hashed_password=get_password_hash("rebecca2026"), role="admin", is_active=True)
         db.add(admin); db.commit()
-        # Seed règles de partage par défaut
         _seed_regles(db)
         return {"status": "Admin créé", "email": "admin@cliniquerebecca.ht", "password": "rebecca2026"}
     except Exception as e:
@@ -835,30 +1205,16 @@ def setup_admin(db: Session = Depends(get_db)):
 
 
 def _seed_regles(db: Session):
-    """Crée les règles de répartition par défaut si elles n'existent pas."""
-    if db.query(models.ReglePartage).count() > 0:
-        return
+    if db.query(models.ReglePartage).count() > 0: return
     regles = [
-        # Investisseur
-        ("investisseur", "consultation", 70, 30),
-        ("investisseur", "geste",        80, 20),
-        ("investisseur", "chirurgie",     0, 100),  # Manuel
-        ("investisseur", "hospit",        70, 30),
-        # Affilié
-        ("affilie", "consultation", 60, 40),
-        ("affilie", "geste",        70, 30),
-        ("affilie", "chirurgie",     0, 100),
-        ("affilie", "hospit",        60, 40),
-        # Exploitant — 100% médecin
-        ("exploitant", "consultation", 100, 0),
-        ("exploitant", "geste",        100, 0),
-        ("exploitant", "chirurgie",    100, 0),
-        # Investisseur-Exploitant — 100% médecin
-        ("investisseur_exploitant", "consultation", 100, 0),
-        ("investisseur_exploitant", "geste",        100, 0),
-        ("investisseur_exploitant", "chirurgie",    100, 0),
+        ("investisseur","consultation",70,30),("investisseur","geste",80,20),
+        ("investisseur","chirurgie",0,100),("investisseur","hospit",70,30),
+        ("affilie","consultation",60,40),("affilie","geste",70,30),
+        ("affilie","chirurgie",0,100),("affilie","hospit",60,40),
+        ("exploitant","consultation",100,0),("exploitant","geste",100,0),("exploitant","chirurgie",100,0),
+        ("investisseur_exploitant","consultation",100,0),
+        ("investisseur_exploitant","geste",100,0),("investisseur_exploitant","chirurgie",100,0),
     ]
-    for type_m, type_a, pct_med, pct_clin in regles:
-        db.add(models.ReglePartage(type_medecin=type_m, type_acte=type_a,
-                                    pct_medecin=pct_med, pct_clinique=pct_clin))
+    for tm, ta, pm, pc in regles:
+        db.add(models.ReglePartage(type_medecin=tm, type_acte=ta, pct_medecin=pm, pct_clinique=pc))
     db.commit()

@@ -14,10 +14,15 @@ class Settings(BaseSettings):
     SMTP_PORT: int = 587
     SMTP_USER: str = ""
     SMTP_PASSWORD: str = ""
-    ADMIN_EMAIL: str = "admin@cliniquerebecca.ht"
-    MEDECIN_EMAIL: str = "medecin@cliniquerebecca.ht"
 
+    # Emails internes — à configurer dans les variables Render
+    ADMIN_EMAIL: str = "admin@cliniquerebecca.ht"
+    CAISSE_EMAIL: str = "caisse@cliniquerebecca.ht"
+    MEDECIN_EMAIL: str = "medecin@cliniquerebecca.ht"  # fallback si spécialité inconnue
+
+    # Numéro WhatsApp de la clinique (pour notifications entrantes)
     WHATSAPP_PHONE: str = "50938880000"
+    CLINIQUE_TELEPHONE: str = "+509 3888-0000"
 
     CORS_ORIGINS: str = "http://localhost:3000"
 

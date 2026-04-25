@@ -199,6 +199,9 @@ class RendezVousCreate(BaseModel):
     patient_email: Optional[str] = None
     code_patient: Optional[str] = None
     specialite: str
+    specialiste_id: Optional[int] = None   # ID du médecin choisi
+    medecin_nom: Optional[str] = None      # Nom affiché du médecin choisi
+    medecin_email: Optional[str] = None    # Email direct du médecin choisi
     date_rdv: datetime
     type_rdv: TypeRDVEnum = TypeRDVEnum.presentiel
     motif: Optional[str] = None
@@ -257,6 +260,8 @@ class ActeCreate(BaseModel):
     description: Optional[str] = None
     montant_total: float
     mode_paiement: str = "especes"
+    devise: Optional[str] = "HTG"
+    taux_usd_htg: Optional[float] = None
     montant_medecin_manuel: Optional[float] = None
     montant_clinique_manuel: Optional[float] = None
 
@@ -284,6 +289,8 @@ class DecaissementCreate(BaseModel):
     montant: float
     motif: str
     mode_paiement: str = "especes"
+    devise: Optional[str] = "HTG"
+    taux_usd_htg: Optional[float] = None
 
 
 class DecaissementOut(BaseModel):
@@ -300,24 +307,35 @@ class DecaissementOut(BaseModel):
 
 # ─── Mouvements comptables ───────────────────────────────────────────────────
 class MouvementCreate(BaseModel):
-    type: TypeMouvementEnum
+    type: str   # "recette" ou "depense"
     categorie: str
     description: str
     montant: float
-    date_mouvement: datetime
+    date_mouvement: Optional[datetime] = None
     mode_paiement: str = "especes"
+    devise: Optional[str] = "HTG"
+    montant_usd: Optional[float] = None
+    taux_usd_htg: Optional[float] = None
+    libelle_debit: Optional[str] = None
+    libelle_credit: Optional[str] = None
     reference: Optional[str] = None
     notes: Optional[str] = None
 
 
 class MouvementOut(BaseModel):
     id: int
-    type: TypeMouvementEnum
+    numero_piece: Optional[str]
+    journal: Optional[str]
+    type: Optional[str]
     categorie: str
     description: str
     montant: float
-    date_mouvement: datetime
+    compte_debit: Optional[str]
+    compte_credit: Optional[str]
     mode_paiement: str
+    devise: Optional[str]
+    taux_usd_htg: Optional[float]
+    est_contrepassation: bool = False
     notes: Optional[str]
     created_at: datetime
 

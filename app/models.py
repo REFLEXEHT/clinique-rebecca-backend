@@ -1,6 +1,21 @@
+"""
+models.py — Clinique de la Rebecca
+Conformité : PCN Haïti (Plan Comptable National) + IFRS for SMEs
+Corrections appliquées :
+  1. Numéros de comptes PCN sur chaque mouvement
+  2. Décaissements médecins via compte de tiers 468 (partie double)
+  3. Multi-devises HTG/USD avec taux de change obligatoire
+  4. Numérotation séquentielle des pièces comptables
+  5. Immobilisations + amortissements (classe 2 PCN)
+  6. Verrouillage des périodes clôturées
+  7. Audit trail complet (created_by, modified_by, modified_at)
+  8. Contrepassation (pas de suppression comptable)
+  9. Lettrage RDV ↔ paiement
+ 10. TCA/TVA Haïti (exonération médicale tracée)
+"""
 from sqlalchemy import (
     Column, Integer, String, Text, Boolean, DateTime,
-    Float, ForeignKey, Enum
+    Float, ForeignKey, Enum, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -8,7 +23,10 @@ from app.database import Base
 import enum
 
 
-# ─── Enums ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ENUMS
+# ══════════════════════════════════════════════════════════════════════════════
+
 class RoleEnum(str, enum.Enum):
     admin     = "admin"
     medecin   = "medecin"
@@ -31,18 +49,99 @@ class TypeRDVEnum(str, enum.Enum):
 
 
 class TypeMouvementEnum(str, enum.Enum):
-    recette = "recette"
-    depense = "depense"
+    recette      = "recette"       # Classe 7 PCN
+    depense      = "depense"       # Classe 6 PCN
+    contrepassation = "contrepassation"  # Écriture inverse (jamais supprimer)
+
+
+class DeviseEnum(str, enum.Enum):
+    HTG = "HTG"
+    USD = "USD"
 
 
 class TypeMedecinEnum(str, enum.Enum):
-    investisseur          = "investisseur"
-    affilie               = "affilie"
-    exploitant            = "exploitant"
+    investisseur            = "investisseur"
+    affilie                 = "affilie"
+    exploitant              = "exploitant"
     investisseur_exploitant = "investisseur_exploitant"
 
 
-# ─── Users ───────────────────────────────────────────────────────────────────
+class JournalEnum(str, enum.Enum):
+    VTE  = "VTE"   # Ventes / recettes
+    ACH  = "ACH"   # Achats / dépenses
+    BQ   = "BQ"    # Banque
+    CAISSE = "CAISSE"  # Caisse
+    OD   = "OD"    # Opérations diverses (salaires, amortissements)
+    DECAIS = "DECAIS"  # Décaissements médecins
+
+
+class StatutPeriodeEnum(str, enum.Enum):
+    ouverte  = "ouverte"
+    cloturee = "cloturee"   # Verrouillée — aucune écriture possible
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAN DE COMPTES PCN HAÏTI — Référentiel
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Mapping catégorie → numéro de compte PCN
+COMPTE_PCN: dict[str, str] = {
+    # Classe 5 — Trésorerie
+    "especes":        "511",   # Caisse HTG
+    "especes_usd":    "512",   # Caisse USD
+    "banque":         "521",   # Banque HTG
+    "banque_usd":     "522",   # Banque USD
+    "moncash":        "531",   # Mobile Money MonCash
+    "natcash":        "532",   # NatCash
+    "carte":          "521",   # Carte → banque
+    # Classe 7 — Produits
+    "Consultations":  "701",
+    "Gestes médicaux":"702",
+    "Chirurgies":     "703",
+    "Hospitalisations":"704",
+    "Laboratoire":    "705",
+    "Pharmacie":      "706",
+    "Dentisterie":    "707",
+    "Physiothérapie": "708",
+    "Optométrie":     "709",
+    "Loyer exploitant":"711",
+    "Autres produits":"719",
+    # Classe 6 — Charges
+    "RH / Salaires":          "641",
+    "Charges sociales OFATMA":"645",
+    "Honoraires médecins":    "651",   # ← décaissements médecins
+    "Achats médicaments":     "601",
+    "Pharmacie achats":       "607",
+    "Consommables médicaux":  "602",
+    "Infrastructure":         "615",
+    "Équipements":            "218",   # Immobilisation si > seuil
+    "Télécom":                "626",
+    "Amortissements":         "681",
+    "Autres charges":         "628",
+    # Classe 4 — Tiers
+    "compte_medecin":         "468",   # Compte courant médecin
+    "compte_patient":         "411",   # Créances patients
+    "fournisseurs":           "401",
+    "dgi_tca":                "441",   # DGI — TCA à reverser
+}
+
+
+def get_compte_tresorerie(mode_paiement: str, devise: str = "HTG") -> str:
+    """Retourne le numéro de compte de trésorerie selon le mode et la devise."""
+    mode = (mode_paiement or "").lower()
+    if "moncash" in mode:    return "531"
+    if "natcash" in mode:    return "532"
+    if "carte" in mode:      return "521"
+    if "virement" in mode or "banque" in mode:
+        return "522" if devise == "USD" else "521"
+    if "usd" in mode:        return "512"
+    return "512" if devise == "USD" else "511"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILISATEURS
+# ══════════════════════════════════════════════════════════════════════════════
+
 class User(Base):
     __tablename__ = "users"
 
@@ -52,17 +151,18 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     role            = Column(Enum(RoleEnum), default=RoleEnum.patient)
     telephone       = Column(String(50))
-    # Champs médecin
     specialite      = Column(String(255))
     type_medecin    = Column(Enum(TypeMedecinEnum), nullable=True)
     is_active       = Column(Boolean, default=True)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
 
 
-# ─── Services ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SERVICES / SPÉCIALISTES / HORAIRES
+# ══════════════════════════════════════════════════════════════════════════════
+
 class Service(Base):
     __tablename__ = "services"
-
     id          = Column(Integer, primary_key=True, index=True)
     nom         = Column(String(255), nullable=False)
     description = Column(Text)
@@ -73,10 +173,8 @@ class Service(Base):
     created_at  = Column(DateTime(timezone=True), server_default=func.now())
 
 
-# ─── Specialistes ────────────────────────────────────────────────────────────
 class Specialiste(Base):
     __tablename__ = "specialistes"
-
     id          = Column(Integer, primary_key=True, index=True)
     nom         = Column(String(255), nullable=False)
     specialite  = Column(String(255), nullable=False)
@@ -88,238 +186,366 @@ class Specialiste(Base):
     actif       = Column(Boolean, default=True)
     ordre       = Column(Integer, default=0)
     created_at  = Column(DateTime(timezone=True), server_default=func.now())
-
     rendez_vous = relationship("RendezVous", back_populates="specialiste")
 
 
-# ─── Horaires ────────────────────────────────────────────────────────────────
 class Horaire(Base):
     __tablename__ = "horaires"
+    id              = Column(Integer, primary_key=True, index=True)
+    jour            = Column(String(20), nullable=False, unique=True)
+    ouvert          = Column(Boolean, default=True)
+    heure_ouverture = Column(String(5), default="07:00")
+    heure_fermeture = Column(String(5), default="17:00")
+    updated_at      = Column(DateTime(timezone=True), onupdate=func.now())
 
-    id               = Column(Integer, primary_key=True, index=True)
-    jour             = Column(String(20), nullable=False, unique=True)
-    ouvert           = Column(Boolean, default=True)
-    heure_ouverture  = Column(String(5), default="07:00")
-    heure_fermeture  = Column(String(5), default="17:00")
-    updated_at       = Column(DateTime(timezone=True), onupdate=func.now())
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PATIENTS ET RENDEZ-VOUS
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ─── Patients ────────────────────────────────────────────────────────────────
 class Patient(Base):
     __tablename__ = "patients"
-
-    id              = Column(Integer, primary_key=True, index=True)
-    numero          = Column(String(20), unique=True, index=True)   # #RB-001
-    nom             = Column(String(255), nullable=False)
-    prenom          = Column(String(255))
-    date_naissance  = Column(String(20))
-    sexe            = Column(String(10))
-    telephone       = Column(String(50))
-    email           = Column(String(255))
-    adresse         = Column(String(500))
-    groupe_sanguin  = Column(String(10))
-    allergies       = Column(Text)
-    antecedents     = Column(Text)
-    notes           = Column(Text)
-    created_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
-    created_at      = Column(DateTime(timezone=True), server_default=func.now())
-
-    rendez_vous = relationship("RendezVous", back_populates="patient")
-
-
-# ─── Rendez-vous ─────────────────────────────────────────────────────────────
-class RendezVous(Base):
-    __tablename__ = "rendez_vous"
-
-    id                  = Column(Integer, primary_key=True, index=True)
-    patient_id          = Column(Integer, ForeignKey("patients.id"), nullable=True)
-    specialiste_id      = Column(Integer, ForeignKey("specialistes.id"), nullable=True)
-    patient_nom         = Column(String(255), nullable=False)
-    patient_telephone   = Column(String(50), nullable=False)
-    patient_email       = Column(String(255))
-    code_patient        = Column(String(20))
-    specialite          = Column(String(255), nullable=False)
-    date_rdv            = Column(DateTime(timezone=True), nullable=False)
-    type_rdv            = Column(Enum(TypeRDVEnum), default=TypeRDVEnum.presentiel)
-    statut              = Column(Enum(StatutRDVEnum), default=StatutRDVEnum.en_attente)
-    motif               = Column(Text)
-    notes_admin         = Column(Text)
-    mode_paiement       = Column(String(50))
-    reference_paiement  = Column(String(100))
-    lien_video          = Column(String(500))
-    numero_rdv          = Column(String(50))
-    rappel_envoye       = Column(Boolean, default=False)
-    created_at          = Column(DateTime(timezone=True), server_default=func.now())
-
-    patient     = relationship("Patient", back_populates="rendez_vous")
-    specialiste = relationship("Specialiste", back_populates="rendez_vous")
-
-
-# ─── Profil médecin (comptabilité) ───────────────────────────────────────────
-class ProfilMedecin(Base):
-    __tablename__ = "profils_medecins"
-
-    id           = Column(Integer, primary_key=True, index=True)
-    user_id      = Column(Integer, ForeignKey("users.id"), nullable=True)
-    nom          = Column(String(255), nullable=False)
-    specialite   = Column(String(255))
-    type_medecin = Column(Enum(TypeMedecinEnum), nullable=False)
-    # Loyer mensuel (pour exploitants et investisseur_exploitant)
-    loyer_mensuel_htg = Column(Float, default=0.0)
-    actif        = Column(Boolean, default=True)
-    created_at   = Column(DateTime(timezone=True), server_default=func.now())
-
-    actes        = relationship("ActeFacturable", back_populates="medecin")
-    decaissements = relationship("Decaissement", back_populates="medecin")
-
-
-# ─── Règles de répartition ───────────────────────────────────────────────────
-class ReglePartage(Base):
-    __tablename__ = "regles_partage"
-
-    id           = Column(Integer, primary_key=True, index=True)
-    type_medecin = Column(Enum(TypeMedecinEnum), nullable=False)
-    type_acte    = Column(String(50), nullable=False)  # consultation, geste, chirurgie
-    pct_medecin  = Column(Float, nullable=False)       # % pour le médecin
-    pct_clinique = Column(Float, nullable=False)       # % pour la clinique
-    updated_at   = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-
-# ─── Actes facturables ───────────────────────────────────────────────────────
-class ActeFacturable(Base):
-    __tablename__ = "actes_facturables"
-
-    id                    = Column(Integer, primary_key=True, index=True)
-    medecin_id            = Column(Integer, ForeignKey("profils_medecins.id"), nullable=True)
-    medecin_nom           = Column(String(255))
-    patient_nom           = Column(String(255))
-    type_acte             = Column(String(50))  # consultation, geste, chirurgie, hospit, observation
-    specialite            = Column(String(255))
-    description           = Column(String(500))
-    montant_total         = Column(Float, nullable=False)
-    montant_medecin       = Column(Float, default=0)
-    montant_clinique      = Column(Float, default=0)
-    pct_medecin           = Column(Float, default=0)
-    mode_paiement         = Column(String(50), default="especes")
-    statut_decaissement   = Column(String(20), default="en_attente")  # en_attente, decaisse
-    date_acte             = Column(DateTime(timezone=True), server_default=func.now())
-    created_by            = Column(Integer, ForeignKey("users.id"), nullable=True)
-
-    medecin = relationship("ProfilMedecin", back_populates="actes")
-
-
-# ─── Décaissements médecins ──────────────────────────────────────────────────
-class Decaissement(Base):
-    __tablename__ = "decaissements"
-
     id             = Column(Integer, primary_key=True, index=True)
-    medecin_id     = Column(Integer, ForeignKey("profils_medecins.id"), nullable=True)
-    medecin_nom    = Column(String(255))
-    montant        = Column(Float, nullable=False)
-    motif          = Column(String(500))
-    mode_paiement  = Column(String(50), default="especes")
-    date_decaissement = Column(DateTime(timezone=True), server_default=func.now())
-    created_by     = Column(Integer, ForeignKey("users.id"), nullable=True)
-
-    medecin = relationship("ProfilMedecin", back_populates="decaissements")
-
-
-# ─── Bilan mensuel ───────────────────────────────────────────────────────────
-class BilanMensuel(Base):
-    __tablename__ = "bilans_mensuels"
-
-    id                          = Column(Integer, primary_key=True, index=True)
-    mois                        = Column(Integer, nullable=False)
-    annee                       = Column(Integer, nullable=False)
-    # Produits
-    total_consultations         = Column(Float, default=0)
-    total_gestes                = Column(Float, default=0)
-    total_chirurgies            = Column(Float, default=0)
-    total_hospitalisations      = Column(Float, default=0)
-    total_laboratoire           = Column(Float, default=0)
-    total_pharmacie             = Column(Float, default=0)
-    total_loyers_recus          = Column(Float, default=0)
-    total_autres_produits       = Column(Float, default=0)
-    total_produits              = Column(Float, default=0)
-    # Charges
-    total_decaissements_medecins = Column(Float, default=0)
-    total_salaires              = Column(Float, default=0)
-    total_pharmacie_achats      = Column(Float, default=0)
-    total_infrastructure        = Column(Float, default=0)
-    total_autres_charges        = Column(Float, default=0)
-    total_charges               = Column(Float, default=0)
-    # Résultat
-    resultat_net                = Column(Float, default=0)
-    statut                      = Column(String(20), default="brouillon")  # brouillon, valide
-    created_at                  = Column(DateTime(timezone=True), server_default=func.now())
-
-
-# ─── Mouvements comptables ───────────────────────────────────────────────────
-class Mouvement(Base):
-    __tablename__ = "mouvements"
-
-    id             = Column(Integer, primary_key=True, index=True)
-    type           = Column(Enum(TypeMouvementEnum), nullable=False)
-    categorie      = Column(String(100), nullable=False)
-    description    = Column(String(500), nullable=False)
-    montant        = Column(Float, nullable=False)
-    date_mouvement = Column(DateTime(timezone=True), nullable=False)
-    mode_paiement  = Column(String(50), default="especes")
-    reference      = Column(String(100))
+    numero         = Column(String(20), unique=True, index=True)
+    nom            = Column(String(255), nullable=False)
+    prenom         = Column(String(255))
+    date_naissance = Column(String(20))
+    sexe           = Column(String(10))
+    telephone      = Column(String(50))
+    email          = Column(String(255))
+    adresse        = Column(String(500))
+    groupe_sanguin = Column(String(10))
+    allergies      = Column(Text)
+    antecedents    = Column(Text)
     notes          = Column(Text)
     created_by     = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    rendez_vous    = relationship("RendezVous", back_populates="patient")
 
 
-# ─── Tarifs configurables ────────────────────────────────────────────────────
+class RendezVous(Base):
+    __tablename__ = "rendez_vous"
+    id                 = Column(Integer, primary_key=True, index=True)
+    patient_id         = Column(Integer, ForeignKey("patients.id"), nullable=True)
+    specialiste_id     = Column(Integer, ForeignKey("specialistes.id"), nullable=True)
+    patient_nom        = Column(String(255), nullable=False)
+    patient_telephone  = Column(String(50), nullable=False)
+    patient_email      = Column(String(255))
+    code_patient       = Column(String(20))
+    specialite         = Column(String(255), nullable=False)
+    medecin_nom        = Column(String(255))
+    medecin_email      = Column(String(255))
+    date_rdv           = Column(DateTime(timezone=True), nullable=False)
+    type_rdv           = Column(Enum(TypeRDVEnum), default=TypeRDVEnum.presentiel)
+    statut             = Column(Enum(StatutRDVEnum), default=StatutRDVEnum.en_attente)
+    motif              = Column(Text)
+    notes_admin        = Column(Text)
+    mode_paiement      = Column(String(50))
+    devise             = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    reference_paiement = Column(String(100))
+    # Lettrage comptable : lien vers le mouvement de paiement
+    mouvement_id       = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
+    lien_video         = Column(String(500))
+    numero_rdv         = Column(String(50))
+    rappel_envoye      = Column(Boolean, default=False)
+    created_at         = Column(DateTime(timezone=True), server_default=func.now())
+    patient            = relationship("Patient", back_populates="rendez_vous")
+    specialiste        = relationship("Specialiste", back_populates="rendez_vous")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPTABILITÉ — MOUVEMENTS (JOURNAL PCN)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Mouvement(Base):
+    """
+    Journal comptable principal — PCN Haïti.
+    Chaque ligne = une écriture avec compte débit ET crédit.
+    Principe de la partie double garanti par validation backend.
+    JAMAIS supprimé — contrepassation si erreur.
+    """
+    __tablename__ = "mouvements"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    # Numérotation séquentielle PCN : VTE-2025-0001, ACH-2025-0001
+    numero_piece    = Column(String(30), unique=True, index=True)
+    journal         = Column(Enum(JournalEnum), nullable=False, default=JournalEnum.VTE)
+
+    # Comptes PCN (partie double)
+    compte_debit    = Column(String(10), nullable=False)   # ex: "511"
+    compte_credit   = Column(String(10), nullable=False)   # ex: "701"
+    libelle_debit   = Column(String(100))                  # ex: "Caisse HTG"
+    libelle_credit  = Column(String(100))                  # ex: "Produits consultations"
+
+    # Classification
+    type            = Column(Enum(TypeMouvementEnum), nullable=False)
+    categorie       = Column(String(100), nullable=False)
+    description     = Column(String(500), nullable=False)
+
+    # Montants — HTG principal, USD optionnel
+    montant         = Column(Float, nullable=False)         # Toujours > 0
+    devise          = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    montant_usd     = Column(Float, nullable=True)          # Si paiement en USD
+    taux_usd_htg    = Column(Float, nullable=True)          # Taux du jour si USD
+    montant_htg     = Column(Float, nullable=True)          # montant_usd × taux
+
+    # Paiement
+    mode_paiement   = Column(String(50), default="especes")
+    reference       = Column(String(100))                   # Ref MonCash, NatCash...
+
+    # Lettrage et période
+    rdv_id          = Column(Integer, ForeignKey("rendez_vous.id"), nullable=True)
+    periode_mois    = Column(Integer)                       # Mois de rattachement
+    periode_annee   = Column(Integer)                       # Année de rattachement
+    periode_verrou  = Column(Boolean, default=False)        # True = période clôturée
+
+    # Contrepassation
+    est_contrepassation = Column(Boolean, default=False)
+    mouvement_origine_id = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
+
+    # TCA Haïti
+    tca_applicable  = Column(Boolean, default=False)        # Faux pour soins médicaux
+    tca_montant     = Column(Float, default=0.0)            # Montant TCA si applicable
+    tca_compte      = Column(String(10), default="441")     # 441 = DGI TCA
+
+    notes           = Column(Text)
+
+    # Audit trail complet
+    created_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
+    modified_by     = Column(Integer, ForeignKey("users.id"), nullable=True)
+    modified_at     = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPTABILITÉ — PROFILS MÉDECINS ET RÉPARTITION
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ProfilMedecin(Base):
+    __tablename__ = "profils_medecins"
+    id                = Column(Integer, primary_key=True, index=True)
+    user_id           = Column(Integer, ForeignKey("users.id"), nullable=True)
+    nom               = Column(String(255), nullable=False)
+    specialite        = Column(String(255))
+    type_medecin      = Column(Enum(TypeMedecinEnum), nullable=False)
+    loyer_mensuel_htg = Column(Float, default=0.0)
+    # Solde compte courant 468 (créances médecin envers la clinique)
+    solde_compte_468  = Column(Float, default=0.0)
+    actif             = Column(Boolean, default=True)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    actes             = relationship("ActeFacturable", back_populates="medecin")
+    decaissements     = relationship("Decaissement", back_populates="medecin")
+
+
+class ReglePartage(Base):
+    __tablename__ = "regles_partage"
+    id           = Column(Integer, primary_key=True, index=True)
+    type_medecin = Column(Enum(TypeMedecinEnum), nullable=False)
+    type_acte    = Column(String(50), nullable=False)
+    pct_medecin  = Column(Float, nullable=False)
+    pct_clinique = Column(Float, nullable=False)
+    updated_at   = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ActeFacturable(Base):
+    """
+    Acte médical facturé.
+    PCN : génère 2 écritures :
+      (1) 511/521 → 701..709  (recette clinique = montant_clinique)
+      (2) 651 → 468_medecin   (charge honoraires = montant_medecin)
+    IFRS 15 : produit reconnu à la réalisation de l'acte.
+    """
+    __tablename__ = "actes_facturables"
+    id                  = Column(Integer, primary_key=True, index=True)
+    medecin_id          = Column(Integer, ForeignKey("profils_medecins.id"), nullable=True)
+    medecin_nom         = Column(String(255))
+    patient_nom         = Column(String(255))
+    type_acte           = Column(String(50))
+    specialite          = Column(String(255))
+    description         = Column(String(500))
+    # Montants
+    montant_total       = Column(Float, nullable=False)
+    montant_medecin     = Column(Float, default=0)
+    montant_clinique    = Column(Float, default=0)
+    pct_medecin         = Column(Float, default=0)
+    devise              = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    taux_usd_htg        = Column(Float, nullable=True)
+    # Contrôle : montant_medecin + montant_clinique doit = montant_total
+    balance_ok          = Column(Boolean, default=True)
+    mode_paiement       = Column(String(50), default="especes")
+    statut_decaissement = Column(String(20), default="en_attente")
+    # Liens comptables
+    mouvement_recette_id  = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
+    mouvement_honoraires_id = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
+    date_acte           = Column(DateTime(timezone=True), server_default=func.now())
+    created_by          = Column(Integer, ForeignKey("users.id"), nullable=True)
+    medecin             = relationship("ProfilMedecin", back_populates="actes")
+
+
+class Decaissement(Base):
+    """
+    Décaissement médecin — PCN CORRECT :
+      Étape 1 (lors de l'acte) : 651 Honoraires / 468 C/C médecin
+      Étape 2 (cash) :           468 C/C médecin / 511 Caisse
+    Les deux mouvements sont liés par medecin_id + date.
+    """
+    __tablename__ = "decaissements"
+    id                = Column(Integer, primary_key=True, index=True)
+    medecin_id        = Column(Integer, ForeignKey("profils_medecins.id"), nullable=True)
+    medecin_nom       = Column(String(255))
+    montant           = Column(Float, nullable=False)
+    motif             = Column(String(500))
+    mode_paiement     = Column(String(50), default="especes")
+    devise            = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    taux_usd_htg      = Column(Float, nullable=True)
+    # Liens PCN : 2 mouvements générés
+    mouvement_468_id  = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
+    mouvement_511_id  = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
+    date_decaissement = Column(DateTime(timezone=True), server_default=func.now())
+    created_by        = Column(Integer, ForeignKey("users.id"), nullable=True)
+    medecin           = relationship("ProfilMedecin", back_populates="decaissements")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BILAN MENSUEL + VERROUILLAGE PÉRIODE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PeriodeComptable(Base):
+    """
+    Gestion des périodes comptables — verrouillage après clôture.
+    Une période clôturée interdit toute écriture sur ses mouvements.
+    """
+    __tablename__ = "periodes_comptables"
+    __table_args__ = (UniqueConstraint("mois", "annee", name="uq_periode"),)
+
+    id      = Column(Integer, primary_key=True)
+    mois    = Column(Integer, nullable=False)
+    annee   = Column(Integer, nullable=False)
+    statut  = Column(Enum(StatutPeriodeEnum), default=StatutPeriodeEnum.ouverte)
+    cloture_par  = Column(Integer, ForeignKey("users.id"), nullable=True)
+    cloture_at   = Column(DateTime(timezone=True), nullable=True)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class BilanMensuel(Base):
+    __tablename__ = "bilans_mensuels"
+    id                           = Column(Integer, primary_key=True, index=True)
+    mois                         = Column(Integer, nullable=False)
+    annee                        = Column(Integer, nullable=False)
+    # Produits (Classe 7)
+    total_consultations          = Column(Float, default=0)   # 701
+    total_gestes                 = Column(Float, default=0)   # 702
+    total_chirurgies             = Column(Float, default=0)   # 703
+    total_hospitalisations       = Column(Float, default=0)   # 704
+    total_laboratoire            = Column(Float, default=0)   # 705
+    total_pharmacie              = Column(Float, default=0)   # 706
+    total_loyers_recus           = Column(Float, default=0)   # 711
+    total_autres_produits        = Column(Float, default=0)   # 719
+    total_produits               = Column(Float, default=0)
+    # Charges (Classe 6)
+    total_honoraires_medecins    = Column(Float, default=0)   # 651 (renommé)
+    total_salaires               = Column(Float, default=0)   # 641
+    total_charges_sociales       = Column(Float, default=0)   # 645
+    total_pharmacie_achats       = Column(Float, default=0)   # 607
+    total_amortissements         = Column(Float, default=0)   # 681
+    total_infrastructure         = Column(Float, default=0)   # 615
+    total_autres_charges         = Column(Float, default=0)   # 628
+    total_charges                = Column(Float, default=0)
+    # Résultat
+    resultat_net                 = Column(Float, default=0)
+    # TCA Haïti
+    total_tca_collectee          = Column(Float, default=0)   # 441
+    # Devises
+    total_produits_usd           = Column(Float, default=0)   # Produits en USD (converti)
+    taux_usd_moyen               = Column(Float, default=0)   # Taux moyen du mois
+    statut                       = Column(String(20), default="brouillon")
+    created_at                   = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMMOBILISATIONS (Classe 2 PCN — ABSENT AVANT)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Immobilisation(Base):
+    """
+    PCN Haïti Classe 2 — Immobilisations corporelles.
+    IAS 16 : coût historique ou réévaluation.
+    Amortissement linéaire obligatoire (PCN) ou par composants (IAS 16).
+    """
+    __tablename__ = "immobilisations"
+
+    id               = Column(Integer, primary_key=True)
+    libelle          = Column(String(255), nullable=False)  # "Échographe Samsung"
+    compte_pcn       = Column(String(10), default="218")    # 218 = équipements médicaux
+    # Valeurs
+    valeur_acquisition  = Column(Float, nullable=False)
+    devise_acquisition  = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    taux_usd_achat      = Column(Float, nullable=True)
+    valeur_htg          = Column(Float, nullable=False)
+    # Amortissement
+    date_acquisition    = Column(DateTime(timezone=True), nullable=False)
+    duree_amort_ans     = Column(Integer, default=5)        # Durée en années
+    taux_amort          = Column(Float, default=20.0)       # % annuel
+    amort_cumule        = Column(Float, default=0.0)
+    valeur_nette        = Column(Float, nullable=False)     # Valeur nette comptable
+    # Statut
+    actif               = Column(Boolean, default=True)
+    date_sortie         = Column(DateTime(timezone=True), nullable=True)
+    motif_sortie        = Column(String(255), nullable=True)
+    # Audit
+    created_by          = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TARIFS / STOCKS / PHARMACIE / LABO / OPTOMÉTRIE
+# ══════════════════════════════════════════════════════════════════════════════
+
 class TarifClinic(Base):
     __tablename__ = "tarifs_clinic"
-
     id      = Column(Integer, primary_key=True, index=True)
     code    = Column(String(50), unique=True, nullable=False)
     libelle = Column(String(255), nullable=False)
     montant = Column(Float, default=0)
-    unite   = Column(String(20), default="HTG")  # HTG, pct, mois, jour
+    unite   = Column(String(20), default="HTG")
 
 
-# ─── Paiements exploitants (flux direct) ─────────────────────────────────────
 class PaiementExploitant(Base):
     __tablename__ = "paiements_exploitants"
-
     id            = Column(Integer, primary_key=True)
     medecin_id    = Column(Integer, ForeignKey("profils_medecins.id"), nullable=True)
     medecin_nom   = Column(String(255))
     patient_nom   = Column(String(255))
     montant       = Column(Float)
+    devise        = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    taux_usd_htg  = Column(Float, nullable=True)
     mode_paiement = Column(String(50))
     flux_direct   = Column(Boolean, default=False)
     description   = Column(String(500))
+    mouvement_id  = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
     date_paiement = Column(DateTime(timezone=True), server_default=func.now())
     created_by    = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 
-# ─── Stock pharmacie ─────────────────────────────────────────────────────────
 class StockItem(Base):
     __tablename__ = "stocks"
-
     id                 = Column(Integer, primary_key=True)
     nom                = Column(String(255), nullable=False)
     categorie          = Column(String(100))
     quantite           = Column(Integer, default=0)
     seuil_min          = Column(Integer, default=10)
     prix_unitaire      = Column(Float, default=0)
+    devise             = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
     unite              = Column(String(50), default="unité")
     proprietaire       = Column(String(255), default="Clinique")
-    mode_reversement   = Column(String(20), default="clinique")   # clinique, pourcentage, forfait
+    mode_reversement   = Column(String(20), default="clinique")
     valeur_reversement = Column(Float, default=0)
     pct_clinique       = Column(Float, default=100)
     created_at         = Column(DateTime(timezone=True), server_default=func.now())
 
 
-# ─── Ventes pharmacie ────────────────────────────────────────────────────────
 class VentePharmacie(Base):
     __tablename__ = "ventes_pharmacie"
-
     id                   = Column(Integer, primary_key=True)
     stock_id             = Column(Integer, ForeignKey("stocks.id"), nullable=True)
     produit_nom          = Column(String(255))
@@ -332,42 +558,39 @@ class VentePharmacie(Base):
     mode_reversement     = Column(String(20), default="clinique")
     patient_nom          = Column(String(255))
     mode_paiement        = Column(String(50), default="especes")
+    # TCA pharmacie (non exonérée)
+    tca_applicable       = Column(Boolean, default=False)
+    tca_montant          = Column(Float, default=0.0)
     date_vente           = Column(DateTime(timezone=True), server_default=func.now())
     created_by           = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 
-# ─── Résultats laboratoire ───────────────────────────────────────────────────
 class ResultatLabo(Base):
     __tablename__ = "resultats_labo"
-
-    id          = Column(Integer, primary_key=True, index=True)
-    patient_id  = Column(String(50))
-    patient_nom = Column(String(255))
-    type_examen = Column(String(255))
-    resultats   = Column(Text)
-    notes       = Column(Text)
-    date_examen = Column(DateTime(timezone=True), server_default=func.now())
+    id            = Column(Integer, primary_key=True, index=True)
+    patient_id    = Column(String(50))
+    patient_nom   = Column(String(255))
+    type_examen   = Column(String(255))
+    resultats     = Column(Text)
+    notes         = Column(Text)
+    date_examen   = Column(DateTime(timezone=True), server_default=func.now())
     technicien_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    status      = Column(String(20), default="en_attente")  # en_attente, disponible, envoye
+    status        = Column(String(20), default="en_attente")
 
 
-# ─── Contrat optométrie ──────────────────────────────────────────────────────
 class ContratOptometrie(Base):
     __tablename__ = "contrat_optometrie"
+    id                  = Column(Integer, primary_key=True)
+    pct_consultation    = Column(Float, default=35.0)
+    pct_montures        = Column(Float, default=13.0)
+    minimum_mensuel_usd = Column(Float, default=300.0)
+    taux_usd_htg        = Column(Float, default=130.0)
+    updated_at          = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_by          = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-    id                   = Column(Integer, primary_key=True)
-    pct_consultation     = Column(Float, default=35.0)
-    pct_montures         = Column(Float, default=13.0)
-    minimum_mensuel_usd  = Column(Float, default=300.0)
-    taux_usd_htg         = Column(Float, default=130.0)
-    updated_at           = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    updated_by           = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-
-# ─── Bilan optométrie mensuel ────────────────────────────────────────────────
 class BilanOptometrieMensuel(Base):
     __tablename__ = "bilans_optometrie"
-
     id                          = Column(Integer, primary_key=True)
     mois                        = Column(Integer)
     annee                       = Column(Integer)

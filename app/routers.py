@@ -1187,6 +1187,93 @@ async def chat(data: schemas.ChatMessage):
     response = await chat_with_rebecca(data.message, data.historique)
     return {"response": response}
 
+
+@router.post("/migrate-db")
+def migrate_db(db: Session = Depends(get_db)):
+    """Migration automatique — ajoute les colonnes manquantes sans supprimer les données."""
+    from sqlalchemy import text
+    migrations = [
+        # Table users
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS specialite VARCHAR(255)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS type_medecin VARCHAR(50)",
+        # Table rendez_vous
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS code_patient VARCHAR(20)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS medecin_nom VARCHAR(255)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS medecin_email VARCHAR(255)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS devise VARCHAR(10) DEFAULT 'HTG'",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS mouvement_id INTEGER",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS numero_rdv VARCHAR(50)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS rappel_envoye BOOLEAN DEFAULT FALSE",
+        # Table mouvements — nouvelles colonnes PCN
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS numero_piece VARCHAR(30)",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS journal VARCHAR(20) DEFAULT 'VTE'",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS compte_debit VARCHAR(10) DEFAULT '511'",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS compte_credit VARCHAR(10) DEFAULT '701'",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS libelle_debit VARCHAR(100)",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS libelle_credit VARCHAR(100)",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS devise VARCHAR(10) DEFAULT 'HTG'",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS montant_usd FLOAT",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS taux_usd_htg FLOAT",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS montant_htg FLOAT",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS rdv_id INTEGER",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS periode_mois INTEGER",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS periode_annee INTEGER",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS periode_verrou BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS est_contrepassation BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS mouvement_origine_id INTEGER",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tca_applicable BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tca_montant FLOAT DEFAULT 0",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tca_compte VARCHAR(10) DEFAULT '441'",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS modified_by INTEGER",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS modified_at TIMESTAMP WITH TIME ZONE",
+        # Table profils_medecins
+        "ALTER TABLE profils_medecins ADD COLUMN IF NOT EXISTS solde_compte_468 FLOAT DEFAULT 0",
+        # Table actes_facturables
+        "ALTER TABLE actes_facturables ADD COLUMN IF NOT EXISTS devise VARCHAR(10) DEFAULT 'HTG'",
+        "ALTER TABLE actes_facturables ADD COLUMN IF NOT EXISTS taux_usd_htg FLOAT",
+        "ALTER TABLE actes_facturables ADD COLUMN IF NOT EXISTS balance_ok BOOLEAN DEFAULT TRUE",
+        "ALTER TABLE actes_facturables ADD COLUMN IF NOT EXISTS mouvement_recette_id INTEGER",
+        "ALTER TABLE actes_facturables ADD COLUMN IF NOT EXISTS mouvement_honoraires_id INTEGER",
+        # Table decaissements
+        "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS devise VARCHAR(10) DEFAULT 'HTG'",
+        "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS taux_usd_htg FLOAT",
+        "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS mouvement_468_id INTEGER",
+        "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS mouvement_511_id INTEGER",
+        # Activer tous les admins existants
+        "UPDATE users SET is_active = TRUE WHERE role = 'admin'",
+        "UPDATE users SET is_active = TRUE WHERE email = 'admin@cliniquerebecca.ht'",
+    ]
+    results = []
+    errors = []
+    for sql in migrations:
+        try:
+            db.execute(text(sql))
+            results.append(f"OK: {sql[:60]}...")
+        except Exception as e:
+            errors.append(f"ERR: {sql[:60]} — {str(e)[:80]}")
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        errors.append(f"COMMIT ERR: {e}")
+    
+    # Créer les nouvelles tables si manquantes
+    try:
+        from app.database import engine, Base
+        import app.models as models
+        Base.metadata.create_all(bind=engine)
+        results.append("OK: Nouvelles tables créées")
+    except Exception as e:
+        errors.append(f"CREATE TABLES ERR: {e}")
+
+    return {
+        "message": f"{len(results)} migrations OK, {len(errors)} erreurs",
+        "ok": results,
+        "errors": errors
+    }
+
+
 @router.post("/setup-admin-init")
 def setup_admin(db: Session = Depends(get_db)):
     try:

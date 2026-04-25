@@ -1243,6 +1243,9 @@ def migrate_db(db: Session = Depends(get_db)):
         # Activer tous les admins existants
         "UPDATE users SET is_active = TRUE WHERE role = 'admin'",
         "UPDATE users SET is_active = TRUE WHERE email = 'admin@cliniquerebecca.ht'",
+        # Colonnes manquantes table users
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS telephone VARCHAR(50)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()",
     ]
     results = []
     errors = []

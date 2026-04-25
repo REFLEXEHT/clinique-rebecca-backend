@@ -23,6 +23,7 @@ from app.auth import (get_current_user, require_admin,
                       verify_password, get_password_hash, create_access_token)
 from app.services.notifications import notify_rdv_confirmed, notify_rdv_video_confirme
 import asyncio
+import os
 
 router = APIRouter()
 
@@ -1246,6 +1247,12 @@ def migrate_db(db: Session = Depends(get_db)):
         # Colonnes manquantes table users
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS telephone VARCHAR(50)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()",
+        # Patient - double ID
+        "ALTER TABLE patients ADD COLUMN IF NOT EXISTS id_papier VARCHAR(50)",
+        "ALTER TABLE patients ADD COLUMN IF NOT EXISTS service VARCHAR(50) DEFAULT \'clinique\'",
+        "ALTER TABLE patients ADD COLUMN IF NOT EXISTS date_premiere_visite TIMESTAMP WITH TIME ZONE",
+        # Nouvelles tables (créées via create_all)
+
     ]
     results = []
     errors = []
@@ -1292,6 +1299,212 @@ def setup_admin(db: Session = Depends(get_db)):
         return {"status": "Admin créé", "email": "admin@cliniquerebecca.ht", "password": "rebecca2026"}
     except Exception as e:
         db.rollback(); raise HTTPException(500, str(e))
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TARIFS LABORATOIRE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/labo/tarifs", tags=["Labo"])
+async def list_tarifs_labo(search: Optional[str] = None, db: Session = Depends(get_db)):
+    q = db.query(models.TarifLabo).filter(models.TarifLabo.actif == True)
+    if search:
+        q = q.filter(models.TarifLabo.libelle.ilike(f"%{search}%"))
+    return q.order_by(models.TarifLabo.libelle).all()
+
+@router.put("/admin/labo/tarifs/{code}", tags=["Admin"])
+async def update_tarif_labo(code: str, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+    t = db.query(models.TarifLabo).filter(models.TarifLabo.code == code).first()
+    if not t: raise HTTPException(404)
+    t.montant = float(data.get("montant", t.montant))
+    db.commit(); return t
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TARIFS DENTISTERIE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/dentiste/tarifs", tags=["Dentiste"])
+async def list_tarifs_dentiste(db: Session = Depends(get_db)):
+    return db.query(models.TarifDentiste).filter(models.TarifDentiste.actif == True).order_by(models.TarifDentiste.libelle).all()
+
+@router.put("/admin/dentiste/tarifs/{code}", tags=["Admin"])
+async def update_tarif_dentiste(code: str, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+    t = db.query(models.TarifDentiste).filter(models.TarifDentiste.code == code).first()
+    if not t: raise HTTPException(404)
+    t.montant = float(data.get("montant", t.montant))
+    t.devise  = data.get("devise", t.devise)
+    db.commit(); return t
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TARIFS MÉDECINS (prix par médecin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/tarifs-medecins", tags=["Tarifs"])
+async def list_tarifs_medecins(db: Session = Depends(get_db)):
+    """Liste tous les médecins avec leurs prix de consultation."""
+    return db.query(models.TarifMedecin).filter(models.TarifMedecin.actif == True).all()
+
+@router.put("/admin/tarifs-medecins/{tid}", tags=["Admin"])
+async def update_tarif_medecin(tid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+    t = db.query(models.TarifMedecin).filter(models.TarifMedecin.id == tid).first()
+    if not t: raise HTTPException(404)
+    for k, v in data.items(): setattr(t, k, v)
+    db.commit(); return t
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMPORT PATIENTS DEPUIS EXCEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/admin/import-patients", tags=["Admin"])
+async def import_patients(db: Session = Depends(get_db), _=Depends(require_admin)):
+    """
+    Importe les patients depuis BD.xlsx.
+    Conserve l'ID papier + génère un nouveau numéro RB-XXXX.
+    """
+    from app.seed import import_patients_from_excel
+    excel_path = "/mnt/user-data/uploads/BD.xlsx"
+    if not os.path.exists(excel_path):
+        raise HTTPException(404, "Fichier BD.xlsx non trouvé — uploadez-le d'abord")
+    result = import_patients_from_excel(db, excel_path)
+    return result
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GESTES MÉDICAUX
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/gestes-medicaux", tags=["Gestes"])
+async def list_gestes(specialite: Optional[str] = None, db: Session = Depends(get_db)):
+    """
+    Liste les gestes médicaux.
+    Le caissier filtre par spécialité du médecin concerné.
+    Inclut toujours les gestes "Général" applicables à toutes spécialités.
+    """
+    q = db.query(models.GesteMedical).filter(models.GesteMedical.actif == True)
+    if specialite:
+        q = q.filter(
+            (models.GesteMedical.specialite == specialite) |
+            (models.GesteMedical.specialite == "Général")
+        )
+    return q.order_by(models.GesteMedical.specialite, models.GesteMedical.ordre).all()
+
+@router.post("/admin/gestes-medicaux", status_code=201, tags=["Admin"])
+async def create_geste(data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+    g = models.GesteMedical(
+        specialite=data.get("specialite", "Général"),
+        libelle=data.get("libelle", ""),
+        prix_suggere=float(data.get("prix_suggere", 0)),
+        prix_min=data.get("prix_min"),
+        prix_max=data.get("prix_max"),
+        prix_fixe=data.get("prix_fixe", False),
+    )
+    db.add(g); db.commit(); db.refresh(g); return g
+
+@router.put("/admin/gestes-medicaux/{gid}", tags=["Admin"])
+async def update_geste(gid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+    g = db.query(models.GesteMedical).filter(models.GesteMedical.id == gid).first()
+    if not g: raise HTTPException(404)
+    for k, v in data.items(): setattr(g, k, v)
+    db.commit(); return g
+
+@router.delete("/admin/gestes-medicaux/{gid}", tags=["Admin"])
+async def delete_geste(gid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
+    g = db.query(models.GesteMedical).filter(models.GesteMedical.id == gid).first()
+    if not g: raise HTTPException(404)
+    g.actif = False; db.commit(); return {"message": "Supprimé"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ACTE AVEC GESTE LIBRE (saisi par caissier)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/caissier/acte-geste", status_code=201, tags=["Caissier"])
+async def enregistrer_acte_geste(data: dict, db: Session = Depends(get_db),
+                                   current_user=Depends(get_current_user)):
+    """
+    Enregistre un geste médical avec prix saisi par le caissier.
+    Champs :
+      - patient_nom, patient_id : patient concerné
+      - medecin_nom, specialite : médecin concerné
+      - geste_libelle : description du geste (libre ou depuis liste)
+      - montant : prix saisi par le caissier (obligatoire)
+      - mode_paiement : especes, moncash, etc.
+      - devise : HTG ou USD
+    """
+    montant = float(data.get("montant", 0))
+    if montant <= 0:
+        raise HTTPException(422, "Le montant du geste est obligatoire")
+
+    mode     = data.get("mode_paiement", "especes")
+    devise_s = data.get("devise", "HTG")
+    devise   = models.DeviseEnum.USD if devise_s == "USD" else models.DeviseEnum.HTG
+
+    # Chercher le profil médecin pour la répartition
+    medecin_nom = data.get("medecin_nom", "")
+    medecin = db.query(models.ProfilMedecin).filter(
+        models.ProfilMedecin.nom.ilike(f"%{medecin_nom}%"),
+        models.ProfilMedecin.actif == True,
+    ).first()
+
+    # Calcul répartition selon type médecin
+    if medecin:
+        regle = db.query(models.ReglePartage).filter(
+            models.ReglePartage.type_medecin == medecin.type_medecin,
+            models.ReglePartage.type_acte == "geste",
+        ).first()
+        pct_med = regle.pct_medecin if regle else 70
+        montant_medecin  = round(montant * pct_med / 100, 2)
+        montant_clinique = round(montant - montant_medecin, 2)
+    else:
+        montant_medecin  = 0
+        montant_clinique = montant
+
+    compte_tresor = models.get_compte_tresorerie(mode, devise_s)
+
+    # Écriture comptable recette
+    mouv = _creer_mouvement(
+        db=db, journal=models.JournalEnum.VTE,
+        type_mouv=models.TypeMouvementEnum.recette,
+        categorie="Gestes médicaux",
+        description=f"Geste: {data.get('geste_libelle','Geste')} — {data.get('patient_nom','')} (Dr {medecin_nom})",
+        montant=montant_clinique,
+        compte_debit=compte_tresor, compte_credit="702",
+        libelle_debit=f"Trésorerie {mode}",
+        libelle_credit="Gestes médicaux (702)",
+        mode_paiement=mode, devise=devise,
+        created_by=current_user.id,
+    )
+
+    # Créer l'acte facturable
+    acte = models.ActeFacturable(
+        medecin_nom=medecin_nom,
+        patient_nom=data.get("patient_nom", ""),
+        type_acte="geste",
+        specialite=data.get("specialite", ""),
+        description=data.get("geste_libelle", ""),
+        montant_total=montant,
+        montant_medecin=montant_medecin,
+        montant_clinique=montant_clinique,
+        pct_medecin=round(montant_medecin/montant*100, 1) if montant > 0 else 0,
+        mode_paiement=mode,
+        balance_ok=True,
+        created_by=current_user.id,
+    )
+    db.add(acte); db.commit(); db.refresh(acte)
+    return {
+        "message": "Geste enregistré",
+        "acte_id": acte.id,
+        "geste": data.get("geste_libelle"),
+        "montant_total": montant,
+        "montant_medecin": montant_medecin,
+        "montant_clinique": montant_clinique,
+        "numero_piece": mouv.numero_piece,
+    }
 
 
 def _seed_regles(db: Session):

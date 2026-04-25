@@ -220,6 +220,11 @@ class Patient(Base):
     notes          = Column(Text)
     created_by     = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    # Deux identifiants distincts
+    id_papier            = Column(String(50), nullable=True, index=True)   # Ex: 0001, CR127 — dossier papier CONSERVÉ
+    numero               = Column(String(20), unique=True, index=True)      # #RB-0001 — ID plateforme (généré automatiquement)
+    service              = Column(String(50), default="clinique")           # clinique, dentiste, physio, optometrie
+    date_premiere_visite = Column(DateTime(timezone=True), nullable=True)
     rendez_vous    = relationship("RendezVous", back_populates="patient")
 
 
@@ -588,6 +593,69 @@ class ContratOptometrie(Base):
     updated_at          = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     updated_by          = Column(Integer, ForeignKey("users.id"), nullable=True)
 
+
+# ─── Tarifs Laboratoire ──────────────────────────────────────────────────────
+class TarifLabo(Base):
+    __tablename__ = "tarifs_labo"
+    id      = Column(Integer, primary_key=True)
+    code    = Column(String(50), unique=True, nullable=False)
+    libelle = Column(String(500), nullable=False)
+    montant = Column(Float, default=0)
+    devise  = Column(String(10), default="HTG")
+    actif   = Column(Boolean, default=True)
+
+
+# ─── Tarifs Dentisterie ──────────────────────────────────────────────────────
+class TarifDentiste(Base):
+    __tablename__ = "tarifs_dentiste"
+    id      = Column(Integer, primary_key=True)
+    code    = Column(String(50), unique=True, nullable=False)
+    libelle = Column(String(500), nullable=False)
+    montant = Column(Float, default=0)
+    devise  = Column(String(10), default="HTG")
+    actif   = Column(Boolean, default=True)
+
+
+# ─── Tarifs Médecin (prix par médecin) ───────────────────────────────────────
+class TarifMedecin(Base):
+    __tablename__ = "tarifs_medecins"
+    id                      = Column(Integer, primary_key=True)
+    specialiste_id          = Column(Integer, ForeignKey("specialistes.id"), nullable=True)
+    medecin_nom             = Column(String(255))
+    specialite              = Column(String(255))
+    prix_consultation       = Column(Float, default=0)
+    prix_rdv                = Column(Float, default=0)
+    prix_hospitalisation_jr = Column(Float, default=0)
+    prix_geste_base         = Column(Float, default=0)
+    type_medecin            = Column(Enum(TypeMedecinEnum), nullable=True)
+    actif                   = Column(Boolean, default=True)
+
+
+
+# ─── Gestes Médicaux par Spécialité ─────────────────────────────────────────
+class GesteMedical(Base):
+    """
+    Catalogue des gestes médicaux par spécialité.
+    - Dentisterie : liste fixe avec prix prédéfinis (depuis TarifDentiste)
+    - Autres spécialités : gestes libres, prix saisi par le caissier à l'acte
+    
+    Le caissier voit la liste suggérée pour la spécialité du médecin
+    et peut saisir le prix exact au moment de l'acte.
+    """
+    __tablename__ = "gestes_medicaux"
+    
+    id              = Column(Integer, primary_key=True)
+    specialite      = Column(String(255), nullable=False, index=True)  # Ex: "Orthopédie"
+    libelle         = Column(String(500), nullable=False)               # Ex: "Pose de plâtre"
+    prix_suggere    = Column(Float, default=0)                          # Prix indicatif (modifiable)
+    prix_min        = Column(Float, nullable=True)                      # Fourchette min
+    prix_max        = Column(Float, nullable=True)                      # Fourchette max
+    devise          = Column(String(10), default="HTG")
+    # Si True = prix fixe (ex: dentisterie), si False = prix libre saisi à l'acte
+    prix_fixe       = Column(Boolean, default=False)
+    actif           = Column(Boolean, default=True)
+    ordre           = Column(Integer, default=0)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
 
 class BilanOptometrieMensuel(Base):
     __tablename__ = "bilans_optometrie"

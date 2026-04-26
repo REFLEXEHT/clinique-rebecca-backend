@@ -1325,6 +1325,18 @@ async def update_tarif_labo(code: str, data: dict, db: Session = Depends(get_db)
 # TARIFS DENTISTERIE
 # ══════════════════════════════════════════════════════════════════════════════
 
+@router.post("/admin/labo/ajouter", tags=["Admin"])
+async def add_tarif_labo(data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+    existing = db.query(models.TarifLabo).filter(models.TarifLabo.code == data.get("code")).first()
+    if existing:
+        raise HTTPException(400, "Code déjà existant")
+    t = models.TarifLabo(
+        code=data.get("code"), libelle=data.get("libelle"),
+        montant=float(data.get("montant", 0)), devise="HTG", actif=True
+    )
+    db.add(t); db.commit(); db.refresh(t); return t
+
+
 @router.get("/dentiste/tarifs", tags=["Dentiste"])
 async def list_tarifs_dentiste(db: Session = Depends(get_db)):
     return db.query(models.TarifDentiste).filter(models.TarifDentiste.actif == True).order_by(models.TarifDentiste.libelle).all()

@@ -1721,3 +1721,104 @@ async def stats_specialites(db: Session = Depends(get_db), _=Depends(get_current
     ).group_by(models.RendezVous.specialite).order_by(func.count(models.RendezVous.id).desc()).all()
     return [{"specialite": r.specialite, "count": r.count} for r in results]
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRADUCTION IA — Claude traduit avec précision médicale
+# ══════════════════════════════════════════════════════════════════════════════
+
+LANG_NAMES = {
+    "fr": "français",
+    "en": "anglais",
+    "es": "espagnol",
+    "ht": "créole haïtien",
+    "zh": "mandarin (chinois simplifié)",
+    "pt": "portugais",
+    "ar": "arabe",
+}
+
+TRANSLATION_SYSTEM = """Tu es un traducteur médical expert, spécialisé dans le domaine de la santé en Haïti.
+Tu traduis des textes d'interface d'une clinique médicale haïtienne : la Clinique de la Rebecca, à Delmas.
+
+Règles absolues :
+- Traduis UNIQUEMENT le texte fourni, sans ajouter ni supprimer de contenu
+- Conserve exactement la ponctuation, les majuscules et la mise en forme
+- Pour le créole haïtien : utilise le créole haïtien standard (orthographe IPN officielle)
+- Pour les termes médicaux : utilise la terminologie médicale correcte dans la langue cible
+- Pour les noms propres (noms de médecins, "Clinique de la Rebecca", "Delmas") : ne traduis PAS
+- Pour les numéros de téléphone, emails, adresses : ne traduis PAS
+- Réponds UNIQUEMENT avec le texte traduit, rien d'autre — pas d'explication, pas de guillemets"""
+
+
+@router.post("/translate", tags=["IA"])
+async def translate_text(data: dict):
+    """
+    Traduit un texte ou un lot de textes via Claude avec précision médicale.
+    
+    Body: { "texts": ["texte1", "texte2", ...], "target_lang": "en" }
+    Retourne: { "translations": ["trad1", "trad2", ...] }
+    """
+    texts: list = data.get("texts", [])
+    target_lang: str = data.get("target_lang", "en")
+    
+    if not texts:
+        return {"translations": []}
+    
+    if target_lang == "fr":
+        return {"translations": texts}
+    
+    lang_name = LANG_NAMES.get(target_lang, target_lang)
+    
+    if not settings.ANTHROPIC_API_KEY:
+        # Sans clé API → retourner les textes originaux
+        return {"translations": texts}
+    
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        
+        # Traduire en batch : envoyer tous les textes en une seule requête
+        # Format : numéroter chaque texte pour les retrouver dans la réponse
+        numbered = "\n".join([f"[{i+1}] {text}" for i, text in enumerate(texts)])
+        
+        prompt = f"""Traduis ces textes du français vers le {lang_name}.
+Conserve exactement le format numéroté [1], [2], etc.
+
+{numbered}"""
+        
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            system=TRANSLATION_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        
+        raw = response.content[0].text.strip()
+        
+        # Parser la réponse numérotée
+        translations = list(texts)  # fallback = texte original
+        lines = raw.split("\n")
+        current_idx = None
+        current_lines = []
+        
+        for line in lines:
+            import re
+            match = re.match(r"^\[(\d+)\]\s*(.*)", line)
+            if match:
+                # Sauvegarder le texte précédent
+                if current_idx is not None and current_idx <= len(translations):
+                    translations[current_idx - 1] = "\n".join(current_lines).strip()
+                current_idx = int(match.group(1))
+                current_lines = [match.group(2)]
+            elif current_idx is not None:
+                current_lines.append(line)
+        
+        # Sauvegarder le dernier
+        if current_idx is not None and current_idx <= len(translations):
+            translations[current_idx - 1] = "\n".join(current_lines).strip()
+        
+        return {"translations": translations}
+    
+    except Exception as e:
+        logger.error("Erreur traduction: %s", e)
+        return {"translations": texts}

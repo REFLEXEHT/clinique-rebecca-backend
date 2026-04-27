@@ -206,7 +206,7 @@ class Horaire(Base):
 class Patient(Base):
     __tablename__ = "patients"
     id             = Column(Integer, primary_key=True, index=True)
-    numero         = Column(String(20), unique=True, index=True)
+    numero         = Column(String(20), unique=True, index=True, nullable=True)  # #RB-0001
     nom            = Column(String(255), nullable=False)
     prenom         = Column(String(255))
     date_naissance = Column(String(20))
@@ -220,10 +220,8 @@ class Patient(Base):
     notes          = Column(Text)
     created_by     = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
-    # Deux identifiants distincts
-    id_papier            = Column(String(50), nullable=True, index=True)   # Ex: 0001, CR127 — dossier papier CONSERVÉ
-    numero               = Column(String(20), unique=True, index=True)      # #RB-0001 — ID plateforme (généré automatiquement)
-    service              = Column(String(50), default="clinique")           # clinique, dentiste, physio, optometrie
+    id_papier            = Column(String(50), nullable=True, index=True)
+    service              = Column(String(50), default="clinique")
     date_premiere_visite = Column(DateTime(timezone=True), nullable=True)
     rendez_vous    = relationship("RendezVous", back_populates="patient")
 

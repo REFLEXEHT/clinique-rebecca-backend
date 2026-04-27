@@ -6,10 +6,10 @@ from app.routers import router
 from app.services.scheduler import start_scheduler, stop_scheduler
 from app.seed import seed_database
 import logging
-import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 def ensure_admin():
     from app.database import SessionLocal
@@ -24,32 +24,44 @@ def ensure_admin():
                 email="admin@cliniquerebecca.ht",
                 nom="Administrateur",
                 hashed_password=pwd_context.hash("rebecca2026"),
-                role="admin"
+                role="admin",
+                is_active=True,
             ))
             db.commit()
-            logger.info("✅ Admin créé")
+            logger.info("Admin créé : admin@cliniquerebecca.ht / rebecca2026")
         else:
-            # Reset le mot de passe admin au cas où
             admin.hashed_password = pwd_context.hash("rebecca2026")
             admin.role = "admin"
+            admin.is_active = True
             db.commit()
-            logger.info("✅ Admin mot de passe réinitialisé")
+            logger.info("Admin mot de passe réinitialisé")
     except Exception as e:
         logger.error("Erreur ensure_admin: %s", e)
         db.rollback()
     finally:
         db.close()
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
-    seed_database()
+    try:
+        seed_database()
+    except Exception as e:
+        logger.warning("Seed skipped: %s", e)
     ensure_admin()
     start_scheduler()
     yield
     stop_scheduler()
 
-app = FastAPI(title="Clinique de la Rebecca API", version="1.0.0", lifespan=lifespan, docs_url="/docs", redoc_url=None)
+
+app = FastAPI(
+    title="Clinique de la Rebecca API",
+    version="2.0.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url=None,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,9 +73,11 @@ app.add_middleware(
 
 app.include_router(router, prefix="/api")
 
+
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    return {"status": "ok", "app": "Clinique de la Rebecca API v2.0"}
+
 
 @app.get("/health")
 async def health():

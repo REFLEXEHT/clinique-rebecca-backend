@@ -22,6 +22,16 @@ from app.database import get_db
 from app.auth import (get_current_user, require_admin,
                       verify_password, get_password_hash, create_access_token)
 from app.services.notifications import notify_rdv_confirmed, notify_rdv_video_confirme
+from app.services.propagation import (
+    propager_changement_nom_medecin,
+    propager_changement_type_medecin,
+    propager_changement_specialite_medecin,
+    propager_changement_contact_medecin,
+    propager_changement_tarif,
+    propager_changement_nom_service,
+    propager_changement_contact_patient,
+    propager_changement_regles_partage,
+)
 import asyncio
 import os
 
@@ -164,7 +174,8 @@ async def login(data: schemas.UserLogin, db: Session = Depends(get_db)):
 async def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
     if db.query(models.User).filter(models.User.email == data.email).first():
         raise HTTPException(400, "Email déjà utilisé")
-    is_active = data.role == models.RoleEnum.patient
+    # Patients auto-activés, autres rôles nécessitent validation admin
+    is_active = data.role in [models.RoleEnum.patient]
     user = models.User(
         email=data.email, nom=data.nom,
         hashed_password=get_password_hash(data.password),
@@ -176,14 +187,18 @@ async def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
     if data.role == models.RoleEnum.medecin and data.type_medecin:
         profil = models.ProfilMedecin(
             user_id=user.id, nom=user.nom,
-            specialite=data.specialite, type_medecin=data.type_medecin,
+            specialite=data.specialite or "", type_medecin=data.type_medecin,
         )
         db.add(profil); db.commit()
     if is_active:
         token = create_access_token({"sub": str(user.id)})
         return {"access_token": token, "token_type": "bearer",
                 "user": {"id": user.id, "nom": user.nom, "email": user.email, "role": user.role}}
-    return {"message": "Compte créé — en attente de validation", "role": data.role}
+    return {
+        "message": "Compte créé — en attente de validation par l'administrateur",
+        "role": str(data.role),
+        "email": data.email,
+    }
 
 
 @router.get("/auth/me", tags=["Auth"])
@@ -234,11 +249,25 @@ async def create_specialiste(data: schemas.SpecialisteCreate, db: Session = Depe
     s = models.Specialiste(**data.model_dump()); db.add(s); db.commit(); db.refresh(s); return s
 
 @router.put("/admin/specialistes/{sid}", response_model=schemas.SpecialisteOut, tags=["Admin"])
-async def update_specialiste(sid: int, data: schemas.SpecialisteUpdate, db: Session = Depends(get_db), _=Depends(require_admin)):
+async def update_specialiste(sid: int, data: schemas.SpecialisteUpdate, db: Session = Depends(get_db), current_user=Depends(require_admin)):
     s = db.query(models.Specialiste).filter(models.Specialiste.id == sid).first()
     if not s: raise HTTPException(404)
+    ancien_nom       = s.nom
+    ancienne_spec    = s.specialite
     for k, v in data.model_dump(exclude_none=True).items(): setattr(s, k, v)
-    db.commit(); db.refresh(s); return s
+    db.commit(); db.refresh(s)
+    # Propagation nom si changé
+    if data.nom and data.nom != ancien_nom:
+        propager_changement_nom_medecin(
+            db, ancien_nom, data.nom,
+            specialiste_id=sid, modifie_par=current_user.nom
+        )
+    # Propagation spécialité si changée
+    if data.specialite and data.specialite != ancienne_spec:
+        propager_changement_specialite_medecin(
+            db, s.nom, ancienne_spec, data.specialite, modifie_par=current_user.nom
+        )
+    return s
 
 @router.delete("/admin/specialistes/{sid}", tags=["Admin"])
 async def delete_specialiste(sid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
@@ -322,8 +351,15 @@ async def cancel_rdv(rdv_id: int, db: Session = Depends(get_db), _=Depends(get_c
     return {"message": "RDV annulé"}
 
 @router.get("/medecin/rendez-vous", response_model=List[schemas.RendezVousOut], tags=["Médecin"])
-async def medecin_rdv(db: Session = Depends(get_db), _=Depends(get_current_user)):
-    return db.query(models.RendezVous).order_by(models.RendezVous.date_rdv.desc()).limit(50).all()
+async def medecin_rdv(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """FIX: filtre par spécialité du médecin connecté."""
+    q = db.query(models.RendezVous)
+    if current_user.specialite:
+        q = q.filter(
+            models.RendezVous.specialite.ilike(f"%{current_user.specialite}%") |
+            (models.RendezVous.medecin_nom.ilike(f"%{current_user.nom}%") if current_user.nom else False)
+        )
+    return q.order_by(models.RendezVous.date_rdv.desc()).limit(100).all()
 
 @router.get("/patient/rendez-vous", response_model=List[schemas.RendezVousOut], tags=["Patient"])
 async def patient_rdv(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
@@ -417,11 +453,51 @@ async def list_profils(db: Session = Depends(get_db), _=Depends(get_current_user
     return db.query(models.ProfilMedecin).filter(models.ProfilMedecin.actif == True).all()
 
 @router.put("/admin/profils-medecins/{pid}", tags=["Admin - Compta"])
-async def update_profil(pid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+async def update_profil(pid: int, data: dict, db: Session = Depends(get_db), current_user=Depends(require_admin)):
+    """Mise à jour profil médecin avec propagation complète en cascade."""
     p = db.query(models.ProfilMedecin).filter(models.ProfilMedecin.id == pid).first()
     if not p: raise HTTPException(404)
-    for k, v in data.items(): setattr(p, k, v)
-    db.commit(); return p
+
+    ancien_nom          = p.nom
+    ancien_type         = str(p.type_medecin) if p.type_medecin else None
+    ancienne_specialite = p.specialite
+
+    for k, v in data.items():
+        if k not in ["id", "created_at"]:  # Champs protégés
+            setattr(p, k, v)
+    db.commit()
+
+    propagations = []
+
+    # Propagation changement nom
+    nouveau_nom = data.get("nom")
+    if nouveau_nom and nouveau_nom != ancien_nom:
+        res = propager_changement_nom_medecin(
+            db, ancien_nom, nouveau_nom,
+            profil_medecin_id=pid, modifie_par=current_user.nom
+        )
+        propagations.append({"type": "nom", "result": res})
+
+    # Propagation changement type_medecin
+    nouveau_type = data.get("type_medecin")
+    if nouveau_type and str(nouveau_type) != ancien_type:
+        nom_ref = nouveau_nom or ancien_nom
+        res = propager_changement_type_medecin(
+            db, nom_ref, ancien_type, str(nouveau_type),
+            profil_medecin_id=pid, modifie_par=current_user.nom
+        )
+        propagations.append({"type": "type_medecin", "result": res})
+
+    # Propagation changement spécialité
+    nouvelle_specialite = data.get("specialite")
+    if nouvelle_specialite and nouvelle_specialite != ancienne_specialite:
+        nom_ref = nouveau_nom or ancien_nom
+        res = propager_changement_specialite_medecin(
+            db, nom_ref, ancienne_specialite, nouvelle_specialite, modifie_par=current_user.nom
+        )
+        propagations.append({"type": "specialite", "result": res})
+
+    return {"profil": p, "propagations": propagations}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -433,11 +509,20 @@ async def list_regles(db: Session = Depends(get_db), _=Depends(get_current_user)
     return db.query(models.ReglePartage).all()
 
 @router.put("/admin/regles-partage/{rid}", tags=["Admin - Compta"])
-async def update_regle(rid: int, pct_medecin: float, db: Session = Depends(get_db), _=Depends(require_admin)):
+async def update_regle(rid: int, pct_medecin: float, db: Session = Depends(get_db), current_user=Depends(require_admin)):
+    """Mise à jour règle partage avec rapport d'impact."""
     r = db.query(models.ReglePartage).filter(models.ReglePartage.id == rid).first()
     if not r: raise HTTPException(404)
-    r.pct_medecin = pct_medecin; r.pct_clinique = round(100 - pct_medecin, 2)
-    db.commit(); return r
+    ancien_pct = r.pct_medecin
+    r.pct_medecin = pct_medecin
+    r.pct_clinique = round(100 - pct_medecin, 2)
+    db.commit()
+    # Rapport propagation
+    rapport = propager_changement_regles_partage(
+        db, str(r.type_medecin), str(r.type_acte),
+        ancien_pct, pct_medecin, modifie_par=current_user.nom
+    )
+    return {"regle": r, "propagation": rapport}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1019,10 +1104,18 @@ async def create_analyse(data: dict, db: Session = Depends(get_db), current_user
     db.add(r); db.commit(); db.refresh(r); return r
 
 @router.put("/labo/analyses/{aid}", tags=["Labo"])
-async def update_analyse(aid: int, data: dict, db: Session = Depends(get_db), _=Depends(get_current_user)):
+async def update_analyse(aid: int, data: dict, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """FIX: blocage modification après 24h — règle clinique."""
     r = db.query(models.ResultatLabo).filter(models.ResultatLabo.id == aid).first()
     if not r: raise HTTPException(404)
-    for k, v in data.items(): setattr(r, k, v)
+    # Vérification 24h
+    if r.date_examen:
+        age = (datetime.now(timezone.utc) - r.date_examen.replace(tzinfo=timezone.utc if r.date_examen.tzinfo is None else None)).total_seconds()
+        if age > 86400:  # 24 heures
+            raise HTTPException(423, "Résultat verrouillé — modification impossible après 24 heures.")
+    for k, v in data.items():
+        if k not in ["technicien_id", "patient_id"]:  # champs protégés
+            setattr(r, k, v)
     db.commit(); return r
 
 @router.get("/patient/resultats-labo/{patient_id}", tags=["Patient"])
@@ -1111,11 +1204,74 @@ async def list_users(db: Session = Depends(get_db), _=Depends(require_admin)):
     return db.query(models.User).order_by(models.User.created_at.desc()).all()
 
 @router.put("/admin/users/{uid}", tags=["Admin - Users"])
-async def update_user(uid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+async def update_user(uid: int, data: dict, db: Session = Depends(get_db), current_user=Depends(require_admin)):
+    """Mise à jour utilisateur avec propagation en cascade selon le rôle."""
     u = db.query(models.User).filter(models.User.id == uid).first()
     if not u: raise HTTPException(404)
-    for k, v in data.items(): setattr(u, k, v)
-    db.commit(); return {"message": "Mis à jour"}
+
+    ancien_nom   = u.nom
+    ancien_email = u.email
+    ancien_type  = str(u.type_medecin) if u.type_medecin else None
+    ancienne_spec = u.specialite
+
+    for k, v in data.items():
+        if k not in ["id", "hashed_password", "created_at"]:
+            setattr(u, k, v)
+    db.commit()
+
+    propagations = []
+
+    if u.role == models.RoleEnum.medecin:
+        # Changement nom médecin
+        nouveau_nom = data.get("nom")
+        if nouveau_nom and nouveau_nom != ancien_nom:
+            res = propager_changement_nom_medecin(
+                db, ancien_nom, nouveau_nom, user_id=uid, modifie_par=current_user.nom
+            )
+            propagations.append({"type": "nom", "result": res})
+
+        # Changement email médecin
+        nouveau_email = data.get("email")
+        if nouveau_email and nouveau_email != ancien_email:
+            res = propager_changement_contact_medecin(
+                db, ancien_nom, ancien_email, nouveau_email, modifie_par=current_user.nom
+            )
+            propagations.append({"type": "email", "result": res})
+
+        # Changement type_medecin
+        nouveau_type = data.get("type_medecin")
+        if nouveau_type and str(nouveau_type) != ancien_type:
+            nom_ref = data.get("nom", ancien_nom)
+            res = propager_changement_type_medecin(
+                db, nom_ref, ancien_type, str(nouveau_type),
+                user_id=uid, modifie_par=current_user.nom
+            )
+            propagations.append({"type": "type_medecin", "result": res})
+
+        # Changement spécialité
+        nouvelle_spec = data.get("specialite")
+        if nouvelle_spec and nouvelle_spec != ancienne_spec:
+            nom_ref = data.get("nom", ancien_nom)
+            res = propager_changement_specialite_medecin(
+                db, nom_ref, ancienne_spec, nouvelle_spec,
+                user_id=uid, modifie_par=current_user.nom
+            )
+            propagations.append({"type": "specialite", "result": res})
+
+    elif u.role == models.RoleEnum.patient:
+        # Propagation contact patient
+        nouveau_email = data.get("email")
+        nouveau_tel   = data.get("telephone")
+        if nouveau_email != ancien_email or nouveau_tel != u.telephone:
+            res = propager_changement_contact_patient(
+                db,
+                patient_email_ancien=ancien_email, patient_email_nouveau=nouveau_email,
+                patient_tel_ancien=None, patient_tel_nouveau=None,
+                modifie_par=current_user.nom
+            )
+            propagations.append({"type": "contact_patient", "result": res})
+
+    return {"message": "Mis à jour", "propagations": propagations}
 
 @router.put("/admin/users/{uid}/activate", tags=["Admin - Users"])
 async def activate_user(uid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
@@ -1144,9 +1300,11 @@ async def dashboard_stats(db: Session = Depends(get_db), _=Depends(get_current_u
     rdv_today    = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.date_rdv >= today_start).scalar()
     rdv_month    = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.date_rdv >= month_start).scalar()
     recettes_day = db.query(func.sum(models.Mouvement.montant)).filter(
-        models.Mouvement.type == "recette", models.Mouvement.created_at >= today_start).scalar() or 0.0
+        models.Mouvement.type == models.TypeMouvementEnum.recette,
+        models.Mouvement.created_at >= today_start).scalar() or 0.0
     recettes_month = db.query(func.sum(models.Mouvement.montant)).filter(
-        models.Mouvement.type == "recette", models.Mouvement.periode_mois == now.month,
+        models.Mouvement.type == models.TypeMouvementEnum.recette,
+        models.Mouvement.periode_mois == now.month,
         models.Mouvement.periode_annee == now.year).scalar() or 0.0
     rdv_attente = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.statut == "en_attente").scalar()
     rdv_total   = db.query(func.count(models.RendezVous.id)).scalar() or 1
@@ -1171,7 +1329,7 @@ async def recettes_par_jour(jours: int = 7, db: Session = Depends(get_db), _=Dep
     now = datetime.now(timezone.utc)
     return [{"date": (now - timedelta(days=i)).strftime("%d/%m"),
              "total": float(db.query(func.sum(models.Mouvement.montant)).filter(
-                models.Mouvement.type == "recette",
+                models.Mouvement.type == models.TypeMouvementEnum.recette,
                 models.Mouvement.created_at.between(
                     (now - timedelta(days=i)).replace(hour=0,minute=0,second=0),
                     (now - timedelta(days=i)).replace(hour=23,minute=59,second=59)
@@ -1360,7 +1518,7 @@ async def list_tarifs_medecins(db: Session = Depends(get_db)):
     return db.query(models.TarifMedecin).filter(models.TarifMedecin.actif == True).all()
 
 @router.put("/admin/tarifs-medecins/{tid}", tags=["Admin"])
-async def update_tarif_medecin(tid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+async def update_tarif_medecin(tid: int, data: dict, db: Session = Depends(get_db), current_user=Depends(require_admin)):
     t = db.query(models.TarifMedecin).filter(models.TarifMedecin.id == tid).first()
     if not t: raise HTTPException(404)
     for k, v in data.items(): setattr(t, k, v)
@@ -1533,3 +1691,14 @@ def _seed_regles(db: Session):
     for tm, ta, pm, pc in regles:
         db.add(models.ReglePartage(type_medecin=tm, type_acte=ta, pct_medecin=pm, pct_clinique=pc))
     db.commit()
+
+
+@router.get("/admin/stats/specialites", tags=["Stats"])
+async def stats_specialites(db: Session = Depends(get_db), _=Depends(get_current_user)):
+    """Statistiques RDV par spécialité."""
+    results = db.query(
+        models.RendezVous.specialite,
+        func.count(models.RendezVous.id).label("count")
+    ).group_by(models.RendezVous.specialite).order_by(func.count(models.RendezVous.id).desc()).all()
+    return [{"specialite": r.specialite, "count": r.count} for r in results]
+

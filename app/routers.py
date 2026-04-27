@@ -1,3 +1,6 @@
+import logging
+logger = logging.getLogger(__name__)
+
 """
 routers.py — Clinique de la Rebecca
 Conformité PCN Haïti + IFRS for SMEs
@@ -256,17 +259,33 @@ async def update_specialiste(sid: int, data: schemas.SpecialisteUpdate, db: Sess
     ancienne_spec    = s.specialite
     for k, v in data.model_dump(exclude_none=True).items(): setattr(s, k, v)
     db.commit(); db.refresh(s)
-    # Propagation nom si changé
+    # Propagation nom si changé → RDV, actes, mouvements ET TarifMedecin
     if data.nom and data.nom != ancien_nom:
         propager_changement_nom_medecin(
             db, ancien_nom, data.nom,
             specialiste_id=sid, modifie_par=current_user.nom
         )
-    # Propagation spécialité si changée
+        # Mise à jour directe de TarifMedecin.medecin_nom
+        tarifs = db.query(models.TarifMedecin).filter(
+            models.TarifMedecin.medecin_nom.ilike(f"%{ancien_nom}%")
+        ).all()
+        for t in tarifs:
+            t.medecin_nom = t.medecin_nom.replace(ancien_nom, data.nom)
+        if tarifs:
+            db.commit()
+            logger.info("Propagation TarifMedecin: %s → %s (%d lignes)", ancien_nom, data.nom, len(tarifs))
+    # Propagation spécialité si changée → TarifMedecin.specialite aussi
     if data.specialite and data.specialite != ancienne_spec:
         propager_changement_specialite_medecin(
             db, s.nom, ancienne_spec, data.specialite, modifie_par=current_user.nom
         )
+        tarifs_spec = db.query(models.TarifMedecin).filter(
+            models.TarifMedecin.medecin_nom.ilike(f"%{s.nom}%")
+        ).all()
+        for t in tarifs_spec:
+            t.specialite = data.specialite
+        if tarifs_spec:
+            db.commit()
     return s
 
 @router.delete("/admin/specialistes/{sid}", tags=["Admin"])

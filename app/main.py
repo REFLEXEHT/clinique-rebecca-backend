@@ -16,45 +16,38 @@ logger = logging.getLogger(__name__)
 def ensure_admin():
     """
     Crée ou met à jour le compte admin au démarrage.
-    Le mot de passe par défaut est lu depuis la variable d'environnement
-    ADMIN_DEFAULT_PASSWORD — ne jamais coder en dur dans le source.
+    Priorité : variable ADMIN_DEFAULT_PASSWORD → valeur par défaut 'rebecca2026'
     """
     from app.database import SessionLocal
     import app.models as models
     from passlib.context import CryptContext
 
-    default_password = os.environ.get("ADMIN_DEFAULT_PASSWORD", "")
-    if not default_password:
-        logger.warning(
-            "ADMIN_DEFAULT_PASSWORD non défini — "
-            "le compte admin ne sera pas créé automatiquement."
-        )
-        return
+    # Mot de passe : variable d'env en priorité, sinon valeur par défaut
+    default_password = os.environ.get("ADMIN_DEFAULT_PASSWORD", "rebecca2026")
+    admin_email      = os.environ.get("ADMIN_EMAIL_OVERRIDE", settings.ADMIN_EMAIL)
 
     pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
     db = SessionLocal()
     try:
         admin = db.query(models.User).filter(
-            models.User.email == settings.ADMIN_EMAIL
+            models.User.email == admin_email
         ).first()
         if not admin:
             db.add(models.User(
-                email=settings.ADMIN_EMAIL,
+                email=admin_email,
                 nom="Administrateur",
                 hashed_password=pwd_context.hash(default_password),
                 role="admin",
                 is_active=True,
             ))
             db.commit()
-            logger.info("Admin créé : %s", settings.ADMIN_EMAIL)
+            logger.info("✅ Admin créé : %s", admin_email)
         else:
-            # Met à jour uniquement si le mot de passe a changé
-            if not pwd_context.verify(default_password, admin.hashed_password):
-                admin.hashed_password = pwd_context.hash(default_password)
-                admin.role = "admin"
-                admin.is_active = True
-                db.commit()
-                logger.info("Admin mis à jour : %s", settings.ADMIN_EMAIL)
+            admin.hashed_password = pwd_context.hash(default_password)
+            admin.role = "admin"
+            admin.is_active = True
+            db.commit()
+            logger.info("✅ Admin réinitialisé : %s", admin_email)
     except Exception as e:
         logger.error("Erreur ensure_admin: %s", e)
         db.rollback()
@@ -79,19 +72,19 @@ app = FastAPI(
     title="Clinique de la Rebecca API",
     version="2.0.0",
     lifespan=lifespan,
-    docs_url="/docs" if os.environ.get("ENVIRONMENT") != "production" else None,
+    docs_url="/docs",   # Toujours actif pour faciliter le débogage
     redoc_url=None,
 )
 
-# CORS — n'autoriser que les origines déclarées dans CORS_ORIGINS
+# CORS — autoriser les origines déclarées dans la config
 allowed_origins = settings.cors_origins_list
 logger.info("CORS origins autorisées : %s", allowed_origins)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=False,   # False car on utilise Bearer token, pas cookies
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_origins=["*"],   # Temporaire — sera restreint quand domaine définitif connu
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["Authorization", "Content-Type", "Accept"],
     max_age=600,
 )

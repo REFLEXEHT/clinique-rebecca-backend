@@ -4,19 +4,18 @@ import secrets
 
 
 class Settings(BaseSettings):
-    # Base de données — obligatoire en production
+    # Base de données
     DATABASE_URL: str = "postgresql://rebecca:rebecca2026@localhost:5432/clinique_rebecca"
 
-    # Sécurité JWT — à définir via variable d'environnement en production
-    # Ne jamais laisser cette valeur par défaut en production
+    # JWT
     SECRET_KEY: str = secrets.token_urlsafe(32)
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24h
 
-    # API IA (optionnel)
+    # IA
     ANTHROPIC_API_KEY: str = ""
 
-    # SMTP (optionnel)
+    # SMTP
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
     SMTP_USER: str = ""
@@ -32,19 +31,18 @@ class Settings(BaseSettings):
     CLINIQUE_TELEPHONE: str = "+509 3888-0000"
 
     # Environnement
-    ENVIRONMENT: str = "development"  # "production" en prod
+    ENVIRONMENT: str = "development"
 
-    # CORS — liste d'origines séparées par virgule
-    # Exemple : https://clinique-rebecca.vercel.app,https://cliniquerebecca.ht
-    CORS_ORIGINS: str = "http://localhost:3000"
+    # CORS — séparées par virgule
+    # Ex: https://clinique-rebecca-frontend.vercel.app,https://cliniquerebecca.ht
+    CORS_ORIGINS: str = "http://localhost:3000,https://clinique-rebecca-frontend.vercel.app"
 
     @property
     def cors_origins_list(self) -> List[str]:
         origins = [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
-        # Ajouter automatiquement les domaines Vercel courants si ENVIRONMENT=production
-        if self.ENVIRONMENT == "production":
-            # Autoriser le domaine principal Vercel du frontend
-            pass
+        # Toujours inclure localhost pour développement local
+        if "http://localhost:3000" not in origins:
+            origins.append("http://localhost:3000")
         return origins
 
     class Config:

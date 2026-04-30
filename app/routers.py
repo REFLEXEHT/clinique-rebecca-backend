@@ -163,6 +163,25 @@ async def login(data: schemas.UserLogin, db: Session = Depends(get_db)):
 
 @router.post("/auth/register", tags=["Auth"])
 async def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
+    """
+    Inscription publique — patients uniquement.
+    Règles :
+    - Patients : email personnel obligatoire (pas @cliniquerebecca.ht)
+    - Personnel (médecin, admin, caissier, labo, infirmier, pharmacie) :
+      email @cliniquerebecca.ht obligatoire — compte créé par l'admin uniquement
+    """
+    email_lower = data.email.lower()
+    is_staff_role = data.role not in [models.RoleEnum.patient]
+    is_clinic_email = email_lower.endswith("@cliniquerebecca.ht")
+
+    # Personnel ne peut pas s'inscrire en self-service
+    if is_staff_role:
+        raise HTTPException(403, "L'inscription en libre-service est réservée aux patients. Le personnel doit contacter l'administrateur.")
+
+    # Patients ne peuvent pas utiliser l'email clinique
+    if is_clinic_email:
+        raise HTTPException(400, "Les comptes patients doivent utiliser un email personnel. Les emails @cliniquerebecca.ht sont réservés au personnel.")
+
     if db.query(models.User).filter(models.User.email == data.email).first():
         raise HTTPException(400, "Email déjà utilisé")
     is_active = data.role == models.RoleEnum.patient
@@ -2333,6 +2352,48 @@ async def list_avis(db: Session = Depends(get_db), _=Depends(require_admin)):
 # ══════════════════════════════════════════════════════════════════════════════
 # ADMIN — RABAIS + COMPTES EN ATTENTE
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+@router.post("/admin/creer-compte-personnel", status_code=201, tags=["Admin - Users"])
+async def creer_compte_personnel(data: dict, db: Session = Depends(get_db),
+                                  current_user=Depends(require_admin)):
+    """
+    L'admin crée les comptes du personnel (médecin, caissier, labo, infirmier, pharmacie).
+    Email @cliniquerebecca.ht obligatoire pour tous les rôles staff.
+    """
+    email = data.get("email", "").lower()
+    role_str = data.get("role", "")
+    
+    # Valider email clinique pour le personnel
+    if role_str != "patient" and not email.endswith("@cliniquerebecca.ht"):
+        raise HTTPException(400, f"Le compte {role_str} doit utiliser un email @cliniquerebecca.ht")
+    
+    if db.query(models.User).filter(models.User.email == email).first():
+        raise HTTPException(400, "Email déjà utilisé")
+    
+    try:
+        role = models.RoleEnum(role_str)
+    except:
+        raise HTTPException(422, f"Rôle invalide: {role_str}")
+    
+    user = models.User(
+        email=email,
+        nom=data.get("nom", ""),
+        hashed_password=get_password_hash(data.get("password", "clinique2026")),
+        role=role,
+        telephone=data.get("telephone"),
+        specialite=data.get("specialite"),
+        is_active=True,
+    )
+    db.add(user); db.commit(); db.refresh(user)
+    
+    log_audit(db, "COMPTE_PERSONNEL_CREE",
+              actor_id=current_user.id, actor_role="admin",
+              target_id=email, target_type="user",
+              details=f"Rôle: {role_str}")
+    
+    return {"message": f"Compte {role_str} créé", "email": email, "id": user.id}
+
 
 @router.get("/admin/comptes-en-attente", tags=["Admin - Users"])
 async def comptes_en_attente(db: Session = Depends(get_db), _=Depends(require_admin)):

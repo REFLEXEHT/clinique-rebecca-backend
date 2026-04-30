@@ -1209,6 +1209,37 @@ async def chat(data: schemas.ChatMessage):
     return {"response": response}
 
 
+
+@router.post("/setup-admin-init", tags=["Setup"])
+async def setup_admin_init(db: Session = Depends(get_db)):
+    """
+    Force reset admin account.
+    Creates or resets wolfjer26@gmail.com as admin with password rebecca2026.
+    Call this once after deployment: POST /api/setup-admin-init
+    """
+    from app.auth import get_password_hash
+    import os
+
+    admin_email = os.environ.get("ADMIN_EMAIL_OVERRIDE", "wolfjer26@gmail.com")
+    admin_pwd   = os.environ.get("ADMIN_DEFAULT_PASSWORD", "rebecca2026")
+
+    user = db.query(models.User).filter(models.User.email == admin_email).first()
+    if user:
+        user.role       = models.RoleEnum.admin
+        user.is_active  = True
+        user.hashed_password = get_password_hash(admin_pwd)
+        db.commit()
+        return {"message": f"Admin reset: {admin_email}", "role": "admin", "email": admin_email}
+    else:
+        user = models.User(
+            email=admin_email, nom="Administrateur",
+            hashed_password=get_password_hash(admin_pwd),
+            role=models.RoleEnum.admin, is_active=True,
+        )
+        db.add(user); db.commit()
+        return {"message": f"Admin created: {admin_email}", "role": "admin", "email": admin_email}
+
+
 @router.post("/migrate-db")
 def migrate_db(db: Session = Depends(get_db)):
     """Migration automatique — ajoute les colonnes manquantes sans supprimer les données."""

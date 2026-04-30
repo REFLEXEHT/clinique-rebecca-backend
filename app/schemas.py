@@ -223,9 +223,7 @@ class RendezVousOut(BaseModel):
     patient_nom: str
     patient_telephone: str
     patient_email: Optional[str]
-    code_patient: Optional[str] = None
     specialite: str
-    medecin_nom: Optional[str] = None
     date_rdv: datetime
     type_rdv: TypeRDVEnum
     statut: StatutRDVEnum
@@ -234,7 +232,6 @@ class RendezVousOut(BaseModel):
     mode_paiement: Optional[str]
     lien_video: Optional[str]
     numero_rdv: Optional[str]
-    rappel_envoye: bool = False
     created_at: datetime
 
     class Config:
@@ -417,18 +414,3 @@ class DashboardStats(BaseModel):
 class ChatMessage(BaseModel):
     message: str
     historique: Optional[List[dict]] = []
-
-
-# ─── Résultat labo (création) ─────────────────────────────────────────────────
-class ResultatLaboCreate(BaseModel):
-    patient_id: str
-    patient_nom: str
-    patient_telephone: Optional[str] = None
-    patient_email: Optional[str] = None
-    type_examen: str
-    resultats: str
-    valeurs_normales: Optional[str] = None
-    interpretation: Optional[str] = None
-    notes: Optional[str] = None
-    date_examen: Optional[datetime] = None
-

@@ -1,6 +1,3 @@
-import logging
-logger = logging.getLogger(__name__)
-
 """
 routers.py — Clinique de la Rebecca
 Conformité PCN Haïti + IFRS for SMEs
@@ -25,16 +22,6 @@ from app.database import get_db
 from app.auth import (get_current_user, require_admin,
                       verify_password, get_password_hash, create_access_token)
 from app.services.notifications import notify_rdv_confirmed, notify_rdv_video_confirme
-from app.services.propagation import (
-    propager_changement_nom_medecin,
-    propager_changement_type_medecin,
-    propager_changement_specialite_medecin,
-    propager_changement_contact_medecin,
-    propager_changement_tarif,
-    propager_changement_nom_service,
-    propager_changement_contact_patient,
-    propager_changement_regles_partage,
-)
 import asyncio
 import os
 
@@ -177,8 +164,7 @@ async def login(data: schemas.UserLogin, db: Session = Depends(get_db)):
 async def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
     if db.query(models.User).filter(models.User.email == data.email).first():
         raise HTTPException(400, "Email déjà utilisé")
-    # Patients auto-activés, autres rôles nécessitent validation admin
-    is_active = data.role in [models.RoleEnum.patient]
+    is_active = data.role == models.RoleEnum.patient
     user = models.User(
         email=data.email, nom=data.nom,
         hashed_password=get_password_hash(data.password),
@@ -190,18 +176,14 @@ async def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
     if data.role == models.RoleEnum.medecin and data.type_medecin:
         profil = models.ProfilMedecin(
             user_id=user.id, nom=user.nom,
-            specialite=data.specialite or "", type_medecin=data.type_medecin,
+            specialite=data.specialite, type_medecin=data.type_medecin,
         )
         db.add(profil); db.commit()
     if is_active:
         token = create_access_token({"sub": str(user.id)})
         return {"access_token": token, "token_type": "bearer",
                 "user": {"id": user.id, "nom": user.nom, "email": user.email, "role": user.role}}
-    return {
-        "message": "Compte créé — en attente de validation par l'administrateur",
-        "role": str(data.role),
-        "email": data.email,
-    }
+    return {"message": "Compte créé — en attente de validation", "role": data.role}
 
 
 @router.get("/auth/me", tags=["Auth"])
@@ -252,41 +234,11 @@ async def create_specialiste(data: schemas.SpecialisteCreate, db: Session = Depe
     s = models.Specialiste(**data.model_dump()); db.add(s); db.commit(); db.refresh(s); return s
 
 @router.put("/admin/specialistes/{sid}", response_model=schemas.SpecialisteOut, tags=["Admin"])
-async def update_specialiste(sid: int, data: schemas.SpecialisteUpdate, db: Session = Depends(get_db), current_user=Depends(require_admin)):
+async def update_specialiste(sid: int, data: schemas.SpecialisteUpdate, db: Session = Depends(get_db), _=Depends(require_admin)):
     s = db.query(models.Specialiste).filter(models.Specialiste.id == sid).first()
     if not s: raise HTTPException(404)
-    ancien_nom       = s.nom
-    ancienne_spec    = s.specialite
     for k, v in data.model_dump(exclude_none=True).items(): setattr(s, k, v)
-    db.commit(); db.refresh(s)
-    # Propagation nom si changé → RDV, actes, mouvements ET TarifMedecin
-    if data.nom and data.nom != ancien_nom:
-        propager_changement_nom_medecin(
-            db, ancien_nom, data.nom,
-            specialiste_id=sid, modifie_par=current_user.nom
-        )
-        # Mise à jour directe de TarifMedecin.medecin_nom
-        tarifs = db.query(models.TarifMedecin).filter(
-            models.TarifMedecin.medecin_nom.ilike(f"%{ancien_nom}%")
-        ).all()
-        for t in tarifs:
-            t.medecin_nom = t.medecin_nom.replace(ancien_nom, data.nom)
-        if tarifs:
-            db.commit()
-            logger.info("Propagation TarifMedecin: %s → %s (%d lignes)", ancien_nom, data.nom, len(tarifs))
-    # Propagation spécialité si changée → TarifMedecin.specialite aussi
-    if data.specialite and data.specialite != ancienne_spec:
-        propager_changement_specialite_medecin(
-            db, s.nom, ancienne_spec, data.specialite, modifie_par=current_user.nom
-        )
-        tarifs_spec = db.query(models.TarifMedecin).filter(
-            models.TarifMedecin.medecin_nom.ilike(f"%{s.nom}%")
-        ).all()
-        for t in tarifs_spec:
-            t.specialite = data.specialite
-        if tarifs_spec:
-            db.commit()
-    return s
+    db.commit(); db.refresh(s); return s
 
 @router.delete("/admin/specialistes/{sid}", tags=["Admin"])
 async def delete_specialiste(sid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
@@ -370,15 +322,8 @@ async def cancel_rdv(rdv_id: int, db: Session = Depends(get_db), _=Depends(get_c
     return {"message": "RDV annulé"}
 
 @router.get("/medecin/rendez-vous", response_model=List[schemas.RendezVousOut], tags=["Médecin"])
-async def medecin_rdv(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    """FIX: filtre par spécialité du médecin connecté."""
-    q = db.query(models.RendezVous)
-    if current_user.specialite:
-        q = q.filter(
-            models.RendezVous.specialite.ilike(f"%{current_user.specialite}%") |
-            (models.RendezVous.medecin_nom.ilike(f"%{current_user.nom}%") if current_user.nom else False)
-        )
-    return q.order_by(models.RendezVous.date_rdv.desc()).limit(100).all()
+async def medecin_rdv(db: Session = Depends(get_db), _=Depends(get_current_user)):
+    return db.query(models.RendezVous).order_by(models.RendezVous.date_rdv.desc()).limit(50).all()
 
 @router.get("/patient/rendez-vous", response_model=List[schemas.RendezVousOut], tags=["Patient"])
 async def patient_rdv(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
@@ -472,51 +417,11 @@ async def list_profils(db: Session = Depends(get_db), _=Depends(get_current_user
     return db.query(models.ProfilMedecin).filter(models.ProfilMedecin.actif == True).all()
 
 @router.put("/admin/profils-medecins/{pid}", tags=["Admin - Compta"])
-async def update_profil(pid: int, data: dict, db: Session = Depends(get_db), current_user=Depends(require_admin)):
-    """Mise à jour profil médecin avec propagation complète en cascade."""
+async def update_profil(pid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
     p = db.query(models.ProfilMedecin).filter(models.ProfilMedecin.id == pid).first()
     if not p: raise HTTPException(404)
-
-    ancien_nom          = p.nom
-    ancien_type         = str(p.type_medecin) if p.type_medecin else None
-    ancienne_specialite = p.specialite
-
-    for k, v in data.items():
-        if k not in ["id", "created_at"]:  # Champs protégés
-            setattr(p, k, v)
-    db.commit()
-
-    propagations = []
-
-    # Propagation changement nom
-    nouveau_nom = data.get("nom")
-    if nouveau_nom and nouveau_nom != ancien_nom:
-        res = propager_changement_nom_medecin(
-            db, ancien_nom, nouveau_nom,
-            profil_medecin_id=pid, modifie_par=current_user.nom
-        )
-        propagations.append({"type": "nom", "result": res})
-
-    # Propagation changement type_medecin
-    nouveau_type = data.get("type_medecin")
-    if nouveau_type and str(nouveau_type) != ancien_type:
-        nom_ref = nouveau_nom or ancien_nom
-        res = propager_changement_type_medecin(
-            db, nom_ref, ancien_type, str(nouveau_type),
-            profil_medecin_id=pid, modifie_par=current_user.nom
-        )
-        propagations.append({"type": "type_medecin", "result": res})
-
-    # Propagation changement spécialité
-    nouvelle_specialite = data.get("specialite")
-    if nouvelle_specialite and nouvelle_specialite != ancienne_specialite:
-        nom_ref = nouveau_nom or ancien_nom
-        res = propager_changement_specialite_medecin(
-            db, nom_ref, ancienne_specialite, nouvelle_specialite, modifie_par=current_user.nom
-        )
-        propagations.append({"type": "specialite", "result": res})
-
-    return {"profil": p, "propagations": propagations}
+    for k, v in data.items(): setattr(p, k, v)
+    db.commit(); return p
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -528,20 +433,11 @@ async def list_regles(db: Session = Depends(get_db), _=Depends(get_current_user)
     return db.query(models.ReglePartage).all()
 
 @router.put("/admin/regles-partage/{rid}", tags=["Admin - Compta"])
-async def update_regle(rid: int, pct_medecin: float, db: Session = Depends(get_db), current_user=Depends(require_admin)):
-    """Mise à jour règle partage avec rapport d'impact."""
+async def update_regle(rid: int, pct_medecin: float, db: Session = Depends(get_db), _=Depends(require_admin)):
     r = db.query(models.ReglePartage).filter(models.ReglePartage.id == rid).first()
     if not r: raise HTTPException(404)
-    ancien_pct = r.pct_medecin
-    r.pct_medecin = pct_medecin
-    r.pct_clinique = round(100 - pct_medecin, 2)
-    db.commit()
-    # Rapport propagation
-    rapport = propager_changement_regles_partage(
-        db, str(r.type_medecin), str(r.type_acte),
-        ancien_pct, pct_medecin, modifie_par=current_user.nom
-    )
-    return {"regle": r, "propagation": rapport}
+    r.pct_medecin = pct_medecin; r.pct_clinique = round(100 - pct_medecin, 2)
+    db.commit(); return r
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1123,18 +1019,10 @@ async def create_analyse(data: dict, db: Session = Depends(get_db), current_user
     db.add(r); db.commit(); db.refresh(r); return r
 
 @router.put("/labo/analyses/{aid}", tags=["Labo"])
-async def update_analyse(aid: int, data: dict, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    """FIX: blocage modification après 24h — règle clinique."""
+async def update_analyse(aid: int, data: dict, db: Session = Depends(get_db), _=Depends(get_current_user)):
     r = db.query(models.ResultatLabo).filter(models.ResultatLabo.id == aid).first()
     if not r: raise HTTPException(404)
-    # Vérification 24h
-    if r.date_examen:
-        age = (datetime.now(timezone.utc) - r.date_examen.replace(tzinfo=timezone.utc if r.date_examen.tzinfo is None else None)).total_seconds()
-        if age > 86400:  # 24 heures
-            raise HTTPException(423, "Résultat verrouillé — modification impossible après 24 heures.")
-    for k, v in data.items():
-        if k not in ["technicien_id", "patient_id"]:  # champs protégés
-            setattr(r, k, v)
+    for k, v in data.items(): setattr(r, k, v)
     db.commit(); return r
 
 @router.get("/patient/resultats-labo/{patient_id}", tags=["Patient"])
@@ -1223,74 +1111,11 @@ async def list_users(db: Session = Depends(get_db), _=Depends(require_admin)):
     return db.query(models.User).order_by(models.User.created_at.desc()).all()
 
 @router.put("/admin/users/{uid}", tags=["Admin - Users"])
-async def update_user(uid: int, data: dict, db: Session = Depends(get_db), current_user=Depends(require_admin)):
-    """Mise à jour utilisateur avec propagation en cascade selon le rôle."""
+async def update_user(uid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
     u = db.query(models.User).filter(models.User.id == uid).first()
     if not u: raise HTTPException(404)
-
-    ancien_nom   = u.nom
-    ancien_email = u.email
-    ancien_type  = str(u.type_medecin) if u.type_medecin else None
-    ancienne_spec = u.specialite
-
-    for k, v in data.items():
-        if k not in ["id", "hashed_password", "created_at"]:
-            setattr(u, k, v)
-    db.commit()
-
-    propagations = []
-
-    if u.role == models.RoleEnum.medecin:
-        # Changement nom médecin
-        nouveau_nom = data.get("nom")
-        if nouveau_nom and nouveau_nom != ancien_nom:
-            res = propager_changement_nom_medecin(
-                db, ancien_nom, nouveau_nom, user_id=uid, modifie_par=current_user.nom
-            )
-            propagations.append({"type": "nom", "result": res})
-
-        # Changement email médecin
-        nouveau_email = data.get("email")
-        if nouveau_email and nouveau_email != ancien_email:
-            res = propager_changement_contact_medecin(
-                db, ancien_nom, ancien_email, nouveau_email, modifie_par=current_user.nom
-            )
-            propagations.append({"type": "email", "result": res})
-
-        # Changement type_medecin
-        nouveau_type = data.get("type_medecin")
-        if nouveau_type and str(nouveau_type) != ancien_type:
-            nom_ref = data.get("nom", ancien_nom)
-            res = propager_changement_type_medecin(
-                db, nom_ref, ancien_type, str(nouveau_type),
-                user_id=uid, modifie_par=current_user.nom
-            )
-            propagations.append({"type": "type_medecin", "result": res})
-
-        # Changement spécialité
-        nouvelle_spec = data.get("specialite")
-        if nouvelle_spec and nouvelle_spec != ancienne_spec:
-            nom_ref = data.get("nom", ancien_nom)
-            res = propager_changement_specialite_medecin(
-                db, nom_ref, ancienne_spec, nouvelle_spec,
-                user_id=uid, modifie_par=current_user.nom
-            )
-            propagations.append({"type": "specialite", "result": res})
-
-    elif u.role == models.RoleEnum.patient:
-        # Propagation contact patient
-        nouveau_email = data.get("email")
-        nouveau_tel   = data.get("telephone")
-        if nouveau_email != ancien_email or nouveau_tel != u.telephone:
-            res = propager_changement_contact_patient(
-                db,
-                patient_email_ancien=ancien_email, patient_email_nouveau=nouveau_email,
-                patient_tel_ancien=None, patient_tel_nouveau=None,
-                modifie_par=current_user.nom
-            )
-            propagations.append({"type": "contact_patient", "result": res})
-
-    return {"message": "Mis à jour", "propagations": propagations}
+    for k, v in data.items(): setattr(u, k, v)
+    db.commit(); return {"message": "Mis à jour"}
 
 @router.put("/admin/users/{uid}/activate", tags=["Admin - Users"])
 async def activate_user(uid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
@@ -1319,11 +1144,9 @@ async def dashboard_stats(db: Session = Depends(get_db), _=Depends(get_current_u
     rdv_today    = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.date_rdv >= today_start).scalar()
     rdv_month    = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.date_rdv >= month_start).scalar()
     recettes_day = db.query(func.sum(models.Mouvement.montant)).filter(
-        models.Mouvement.type == models.TypeMouvementEnum.recette,
-        models.Mouvement.created_at >= today_start).scalar() or 0.0
+        models.Mouvement.type == "recette", models.Mouvement.created_at >= today_start).scalar() or 0.0
     recettes_month = db.query(func.sum(models.Mouvement.montant)).filter(
-        models.Mouvement.type == models.TypeMouvementEnum.recette,
-        models.Mouvement.periode_mois == now.month,
+        models.Mouvement.type == "recette", models.Mouvement.periode_mois == now.month,
         models.Mouvement.periode_annee == now.year).scalar() or 0.0
     rdv_attente = db.query(func.count(models.RendezVous.id)).filter(models.RendezVous.statut == "en_attente").scalar()
     rdv_total   = db.query(func.count(models.RendezVous.id)).scalar() or 1
@@ -1348,7 +1171,7 @@ async def recettes_par_jour(jours: int = 7, db: Session = Depends(get_db), _=Dep
     now = datetime.now(timezone.utc)
     return [{"date": (now - timedelta(days=i)).strftime("%d/%m"),
              "total": float(db.query(func.sum(models.Mouvement.montant)).filter(
-                models.Mouvement.type == models.TypeMouvementEnum.recette,
+                models.Mouvement.type == "recette",
                 models.Mouvement.created_at.between(
                     (now - timedelta(days=i)).replace(hour=0,minute=0,second=0),
                     (now - timedelta(days=i)).replace(hour=23,minute=59,second=59)
@@ -1429,6 +1252,18 @@ def migrate_db(db: Session = Depends(get_db)):
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS service VARCHAR(50) DEFAULT \'clinique\'",
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS date_premiere_visite TIMESTAMP WITH TIME ZONE",
         # Nouvelles tables (créées via create_all)
+        "ALTER TABLE patients ADD COLUMN IF NOT EXISTS id_papier VARCHAR(50)",
+        "ALTER TABLE patients ADD COLUMN IF NOT EXISTS service VARCHAR(50) DEFAULT 'clinique'",
+        "ALTER TABLE patients ADD COLUMN IF NOT EXISTS date_premiere_visite TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS mode_paiement VARCHAR(50)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS reference_paiement VARCHAR(100)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS devise VARCHAR(10) DEFAULT 'HTG'",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS mouvement_id INTEGER",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS numero_rdv VARCHAR(50)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS rappel_envoye BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS code_patient VARCHAR(20)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS medecin_nom VARCHAR(255)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS medecin_email VARCHAR(255)",
 
     ]
     results = []
@@ -1537,7 +1372,7 @@ async def list_tarifs_medecins(db: Session = Depends(get_db)):
     return db.query(models.TarifMedecin).filter(models.TarifMedecin.actif == True).all()
 
 @router.put("/admin/tarifs-medecins/{tid}", tags=["Admin"])
-async def update_tarif_medecin(tid: int, data: dict, db: Session = Depends(get_db), current_user=Depends(require_admin)):
+async def update_tarif_medecin(tid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
     t = db.query(models.TarifMedecin).filter(models.TarifMedecin.id == tid).first()
     if not t: raise HTTPException(404)
     for k, v in data.items(): setattr(t, k, v)
@@ -1696,6 +1531,376 @@ async def enregistrer_acte_geste(data: dict, db: Session = Depends(get_db),
     }
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEMANDES D'ACCÈS DOSSIER — MÉDECIN → ADMIN → AUTORISATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/medecin/demande-acces-dossier", status_code=201, tags=["Médecin"])
+async def demander_acces_dossier(data: dict, request: Request,
+                                  db: Session = Depends(get_db),
+                                  current_user=Depends(get_current_user)):
+    """
+    Le médecin demande l'accès à un dossier patient.
+    Déclenche une notification à l'admin.
+    Accès accordé uniquement si admin approuve.
+    """
+    patient_numero = data.get("patient_numero", "").strip()
+    motif          = data.get("motif", "").strip()
+    urgence        = data.get("urgence", False)
+
+    if not patient_numero:
+        raise HTTPException(422, "Numéro patient requis")
+    if not motif:
+        raise HTTPException(422, "Motif de la demande requis")
+
+    # Chercher le patient par son numéro
+    patient = db.query(models.Patient).filter(
+        models.Patient.numero == patient_numero
+    ).first()
+
+    demande = models.DemandeAccesDossier(
+        medecin_id=current_user.id,
+        medecin_nom=current_user.nom,
+        medecin_specialite=current_user.specialite,
+        patient_id=patient.id if patient else None,
+        patient_numero=patient_numero,
+        dossier_id=data.get("dossier_id"),
+        motif=motif,
+        urgence=urgence,
+        duree_acces_h=data.get("duree_acces_h", 24),
+    )
+    db.add(demande); db.commit(); db.refresh(demande)
+
+    log_audit(db, "DEMANDE_ACCES_DOSSIER",
+              actor_id=current_user.id, actor_role="medecin",
+              target_id=patient_numero, target_type="patient",
+              ip_address=request.client.host if request.client else None,
+              details=f"Motif: {motif[:100]} | Urgence: {urgence}")
+
+    return {
+        "message": "Demande envoyée à l'administrateur",
+        "demande_id": demande.id,
+        "statut": "en_attente",
+        "urgence": urgence,
+    }
+
+
+@router.get("/medecin/mes-demandes-acces", tags=["Médecin"])
+async def mes_demandes_acces(db: Session = Depends(get_db),
+                              current_user=Depends(get_current_user)):
+    """Le médecin voit le statut de ses demandes d'accès."""
+    return db.query(models.DemandeAccesDossier).filter(
+        models.DemandeAccesDossier.medecin_id == current_user.id
+    ).order_by(models.DemandeAccesDossier.created_at.desc()).all()
+
+
+@router.get("/admin/demandes-acces-dossier", tags=["Admin"])
+async def list_demandes_acces(db: Session = Depends(get_db), _=Depends(require_admin)):
+    """Admin voit toutes les demandes d'accès en attente."""
+    return db.query(models.DemandeAccesDossier).order_by(
+        models.DemandeAccesDossier.urgence.desc(),
+        models.DemandeAccesDossier.created_at.asc()
+    ).all()
+
+
+@router.put("/admin/demandes-acces-dossier/{did}/approuver", tags=["Admin"])
+async def approuver_acces(did: int, data: dict, request: Request,
+                           db: Session = Depends(get_db),
+                           current_user=Depends(require_admin)):
+    """
+    Admin approuve la demande d'accès.
+    Génère un accès temporaire pour le médecin (durée configurable, défaut 24h).
+    """
+    demande = db.query(models.DemandeAccesDossier).filter(
+        models.DemandeAccesDossier.id == did
+    ).first()
+    if not demande:
+        raise HTTPException(404, "Demande introuvable")
+    if demande.statut != models.StatutDemandeEnum.en_attente:
+        raise HTTPException(400, f"Demande déjà traitée : {demande.statut}")
+
+    duree_h = int(data.get("duree_acces_h", demande.duree_acces_h or 24))
+    expire  = datetime.now(timezone.utc) + timedelta(hours=duree_h)
+
+    demande.statut           = models.StatutDemandeEnum.approuve
+    demande.admin_id         = current_user.id
+    demande.admin_commentaire = data.get("commentaire", "")
+    demande.duree_acces_h    = duree_h
+    demande.acces_expire_at  = expire
+    demande.decided_at       = datetime.now(timezone.utc)
+    db.commit()
+
+    log_audit(db, "ACCES_DOSSIER_APPROUVE",
+              actor_id=current_user.id, actor_role="admin",
+              target_id=demande.patient_numero, target_type="patient",
+              ip_address=request.client.host if request.client else None,
+              details=f"Dr {demande.medecin_nom} | Durée: {duree_h}h | Expire: {expire.isoformat()}",
+              retention_ans=7)
+
+    return {
+        "message": f"Accès accordé à Dr {demande.medecin_nom} pour {duree_h}h",
+        "acces_expire_at": expire.isoformat(),
+        "patient_numero": demande.patient_numero,
+    }
+
+
+@router.put("/admin/demandes-acces-dossier/{did}/refuser", tags=["Admin"])
+async def refuser_acces(did: int, data: dict, request: Request,
+                         db: Session = Depends(get_db),
+                         current_user=Depends(require_admin)):
+    """Admin refuse la demande avec un motif obligatoire."""
+    motif_refus = data.get("motif_refus", "").strip()
+    if not motif_refus:
+        raise HTTPException(422, "Motif de refus obligatoire")
+
+    demande = db.query(models.DemandeAccesDossier).filter(
+        models.DemandeAccesDossier.id == did
+    ).first()
+    if not demande:
+        raise HTTPException(404, "Demande introuvable")
+
+    demande.statut            = models.StatutDemandeEnum.refuse
+    demande.admin_id          = current_user.id
+    demande.admin_commentaire = motif_refus
+    demande.decided_at        = datetime.now(timezone.utc)
+    db.commit()
+
+    log_audit(db, "ACCES_DOSSIER_REFUSE",
+              actor_id=current_user.id, actor_role="admin",
+              target_id=demande.patient_numero,
+              details=f"Dr {demande.medecin_nom} refusé | Motif: {motif_refus[:100]}",
+              retention_ans=7)
+
+    return {"message": f"Accès refusé — Dr {demande.medecin_nom} notifié"}
+
+
+@router.get("/medecin/acces-autorise/{patient_numero}", tags=["Médecin"])
+async def verifier_acces_autorise(patient_numero: str, request: Request,
+                                   db: Session = Depends(get_db),
+                                   current_user=Depends(get_current_user)):
+    """
+    Vérifie si le médecin a un accès admin autorisé pour ce patient.
+    Retourne le dossier si accès valide et non expiré.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Chercher demande approuvée non expirée
+    demande = db.query(models.DemandeAccesDossier).filter(
+        models.DemandeAccesDossier.medecin_id == current_user.id,
+        models.DemandeAccesDossier.patient_numero == patient_numero,
+        models.DemandeAccesDossier.statut == models.StatutDemandeEnum.approuve,
+        models.DemandeAccesDossier.acces_expire_at > now,
+    ).order_by(models.DemandeAccesDossier.created_at.desc()).first()
+
+    if not demande:
+        raise HTTPException(403,
+            "Accès non autorisé — aucune autorisation admin valide pour ce patient. "
+            "Soumettez une demande d'accès via votre dashboard."
+        )
+
+    # Accès autorisé — récupérer le dossier
+    patient = db.query(models.Patient).filter(
+        models.Patient.numero == patient_numero
+    ).first()
+    if not patient:
+        raise HTTPException(404, "Patient introuvable")
+
+    dossiers = db.query(models.DossierPatient).filter(
+        models.DossierPatient.patient_id == patient.id
+    ).order_by(models.DossierPatient.date_visite.desc()).limit(5).all()
+
+    log_audit(db, "DOSSIER_CONSULTE_AUTORISATION_ADMIN",
+              actor_id=current_user.id, actor_role="medecin",
+              target_id=patient_numero, target_type="patient",
+              ip_address=request.client.host if request.client else None,
+              details=f"Accès admin #{demande.id} | Expire: {demande.acces_expire_at.isoformat()}",
+              retention_ans=5)
+
+    return {
+        "acces_valide": True,
+        "expire_at": demande.acces_expire_at.isoformat(),
+        "duree_restante_h": round((demande.acces_expire_at - now).total_seconds() / 3600, 1),
+        "patient": patient,
+        "dossiers": dossiers,
+        "demande_id": demande.id,
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMPRESSION DOCUMENTS — INFIRMIER & CAISSIER (accès impression uniquement)
+# Règle : cherche par ID patient → confirme existence → imprime uniquement
+# JAMAIS de données médicales affichées à l'écran pour ces rôles
+# ══════════════════════════════════════════════════════════════════════════════
+
+DOCS_IMPRIMABLES_INFIRMIER = [
+    "certificat",
+    "exeat",
+    "ecg",
+    "sortie_contre_avis",
+    "resultats_labo",
+]
+DOCS_IMPRIMABLES_CAISSIER = [
+    "resultats_labo",
+    "etat_compte",
+]
+
+@router.get("/infirmier/documents-disponibles/{patient_numero}", tags=["Infirmier"])
+async def docs_disponibles_infirmier(patient_numero: str, request: Request,
+                                      db: Session = Depends(get_db),
+                                      current_user=Depends(get_current_user)):
+    """
+    L'infirmier cherche par ID patient.
+    Retourne UNIQUEMENT la liste des documents disponibles pour impression.
+    JAMAIS le contenu médical.
+    """
+    patient = db.query(models.Patient).filter(
+        models.Patient.numero == patient_numero
+    ).first()
+    if not patient:
+        raise HTTPException(404, f"Patient {patient_numero} introuvable")
+
+    # Vérifier documents disponibles
+    docs = []
+
+    # Dossiers terminés = certificats/exéat potentiels
+    dossiers = db.query(models.DossierPatient).filter(
+        models.DossierPatient.patient_id == patient.id,
+        models.DossierPatient.statut.in_([
+            models.StatutDossierEnum.termine,
+            models.StatutDossierEnum.observation,
+            models.StatutDossierEnum.hospitalisation,
+        ])
+    ).all()
+
+    if dossiers:
+        docs.append({"type": "certificat",         "label": "Certificat Médical",        "icone": "📋", "disponible": True})
+        docs.append({"type": "exeat",              "label": "Note d'Exéat",              "icone": "🚪", "disponible": True})
+        docs.append({"type": "ecg",                "label": "Compte Rendu ECG",          "icone": "❤️", "disponible": len([d for d in dossiers]) > 0})
+        docs.append({"type": "sortie_contre_avis", "label": "Sortie Contre Avis Médical","icone": "🚫", "disponible": True})
+
+    # Résultats labo disponibles
+    resultats = db.query(models.ResultatLabo).filter(
+        models.ResultatLabo.patient_id == str(patient.id),
+        models.ResultatLabo.status.in_(["disponible", "modifie", "en_attente"])
+    ).all()
+
+    if resultats:
+        docs.append({
+            "type": "resultats_labo",
+            "label": f"Résultats Laboratoire ({len(resultats)} examen{'s' if len(resultats) > 1 else ''})",
+            "icone": "🔬",
+            "disponible": True,
+            "nb_resultats": len(resultats),
+            "derniere_date": str(resultats[0].date_examen) if resultats else None,
+        })
+
+    # Audit log
+    log_audit(db, "DOCUMENTS_CONSULTES_LISTE",
+              actor_id=current_user.id, actor_role=str(current_user.role),
+              target_id=patient_numero, target_type="patient",
+              ip_address=request.client.host if request.client else None,
+              result="succes", details="Liste documents pour impression uniquement")
+
+    return {
+        "patient_numero": patient_numero,
+        "patient_nom": f"{patient.nom} {patient.prenom or ''}".strip(),
+        "documents": docs,
+        "message": "Impression uniquement — aucun accès au dossier médical",
+    }
+
+
+@router.get("/caissier/documents-disponibles/{patient_numero}", tags=["Caissier"])
+async def docs_disponibles_caissier(patient_numero: str, request: Request,
+                                     db: Session = Depends(get_db),
+                                     current_user=Depends(get_current_user)):
+    """
+    Le caissier cherche par ID patient.
+    Peut imprimer : résultats labo + état de compte.
+    JAMAIS le dossier médical.
+    """
+    patient = db.query(models.Patient).filter(
+        models.Patient.numero == patient_numero
+    ).first()
+    if not patient:
+        raise HTTPException(404, f"Patient {patient_numero} introuvable")
+
+    docs = []
+
+    # Résultats labo
+    resultats = db.query(models.ResultatLabo).filter(
+        models.ResultatLabo.patient_id == str(patient.id)
+    ).all()
+    if resultats:
+        docs.append({
+            "type": "resultats_labo",
+            "label": f"Résultats Laboratoire ({len(resultats)} examen{'s' if len(resultats)>1 else ''})",
+            "icone": "🔬", "disponible": True,
+        })
+
+    # État de compte (paiements)
+    paiements = db.query(models.Mouvement).filter(
+        models.Mouvement.description.ilike(f"%{patient_numero}%"),
+    ).count()
+    docs.append({
+        "type": "etat_compte",
+        "label": "État de Compte",
+        "icone": "💰", "disponible": True,
+        "nb_transactions": paiements,
+    })
+
+    log_audit(db, "DOCUMENTS_IMPRIMES_CAISSIER",
+              actor_id=current_user.id, actor_role="caissier",
+              target_id=patient_numero, target_type="patient",
+              ip_address=request.client.host if request.client else None,
+              result="succes")
+
+    return {
+        "patient_numero": patient_numero,
+        "patient_nom": f"{patient.nom} {patient.prenom or ''}".strip(),
+        "documents": docs,
+    }
+
+
+@router.get("/infirmier/imprimer-resultats-labo/{patient_numero}", tags=["Infirmier"])
+async def imprimer_resultats_labo_infirmier(patient_numero: str, request: Request,
+                                             db: Session = Depends(get_db),
+                                             current_user=Depends(get_current_user)):
+    """
+    Retourne les données de résultats labo formatées pour impression.
+    UNIQUEMENT les résultats — pas le dossier médical complet.
+    """
+    patient = db.query(models.Patient).filter(models.Patient.numero == patient_numero).first()
+    if not patient: raise HTTPException(404, "Patient introuvable")
+
+    resultats = db.query(models.ResultatLabo).filter(
+        models.ResultatLabo.patient_id == str(patient.id)
+    ).order_by(models.ResultatLabo.date_examen.desc()).all()
+
+    log_audit(db, "RESULTATS_LABO_IMPRIMES",
+              actor_id=current_user.id, actor_role=str(current_user.role),
+              target_id=patient_numero, target_type="patient",
+              ip_address=request.client.host if request.client else None,
+              result="succes", details=f"{len(resultats)} résultats imprimés", retention_ans=5)
+
+    return {
+        "patient_numero": patient_numero,
+        "patient_nom": f"{patient.nom} {patient.prenom or ''}".strip(),
+        "resultats": [
+            {
+                "type_examen": r.type_examen,
+                "resultats": r.resultats,
+                "notes": r.notes,
+                "date_examen": str(r.date_examen),
+                "status": r.status,
+            } for r in resultats
+        ],
+        "clinique": "Clinique de la Rebecca — #44, Rue Rebecca, Pétion-Ville — (509) 4858-5757",
+        "date_impression": str(datetime.now(timezone.utc)),
+    }
+
+
 def _seed_regles(db: Session):
     if db.query(models.ReglePartage).count() > 0: return
     regles = [
@@ -1712,113 +1917,483 @@ def _seed_regles(db: Session):
     db.commit()
 
 
-@router.get("/admin/stats/specialites", tags=["Stats"])
-async def stats_specialites(db: Session = Depends(get_db), _=Depends(get_current_user)):
-    """Statistiques RDV par spécialité."""
-    results = db.query(
-        models.RendezVous.specialite,
-        func.count(models.RendezVous.id).label("count")
-    ).group_by(models.RendezVous.specialite).order_by(func.count(models.RendezVous.id).desc()).all()
-    return [{"specialite": r.specialite, "count": r.count} for r in results]
-
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# TRADUCTION IA — Claude traduit avec précision médicale
+# AUDIT LOG — JOURNAL D'AUDIT IMMUABLE
 # ══════════════════════════════════════════════════════════════════════════════
 
-LANG_NAMES = {
-    "fr": "français",
-    "en": "anglais",
-    "es": "espagnol",
-    "ht": "créole haïtien",
-    "zh": "mandarin (chinois simplifié)",
-    "pt": "portugais",
-    "ar": "arabe",
-}
+import uuid as uuid_lib
+from fastapi import Request
 
-TRANSLATION_SYSTEM = """Tu es un traducteur médical expert, spécialisé dans le domaine de la santé en Haïti.
-Tu traduis des textes d'interface d'une clinique médicale haïtienne : la Clinique de la Rebecca, à Delmas.
-
-Règles absolues :
-- Traduis UNIQUEMENT le texte fourni, sans ajouter ni supprimer de contenu
-- Conserve exactement la ponctuation, les majuscules et la mise en forme
-- Pour le créole haïtien : utilise le créole haïtien standard (orthographe IPN officielle)
-- Pour les termes médicaux : utilise la terminologie médicale correcte dans la langue cible
-- Pour les noms propres (noms de médecins, "Clinique de la Rebecca", "Delmas") : ne traduis PAS
-- Pour les numéros de téléphone, emails, adresses : ne traduis PAS
-- Réponds UNIQUEMENT avec le texte traduit, rien d'autre — pas d'explication, pas de guillemets"""
-
-
-@router.post("/translate", tags=["IA"])
-async def translate_text(data: dict):
-    """
-    Traduit un texte ou un lot de textes via Claude avec précision médicale.
-    
-    Body: { "texts": ["texte1", "texte2", ...], "target_lang": "en" }
-    Retourne: { "translations": ["trad1", "trad2", ...] }
-    """
-    texts: list = data.get("texts", [])
-    target_lang: str = data.get("target_lang", "en")
-    
-    if not texts:
-        return {"translations": []}
-    
-    if target_lang == "fr":
-        return {"translations": texts}
-    
-    lang_name = LANG_NAMES.get(target_lang, target_lang)
-    
-    if not settings.ANTHROPIC_API_KEY:
-        # Sans clé API → retourner les textes originaux
-        return {"translations": texts}
-    
+def log_audit(
+    db, event_type: str, actor_id: int = None, actor_role: str = None,
+    target_id: str = None, target_type: str = None,
+    ip_address: str = None, device_info: str = None,
+    session_id: str = None, result: str = "succes",
+    details: str = None, retention_ans: int = 5
+):
+    """Enregistre un événement dans le journal d'audit immuable."""
     try:
-        import anthropic as _anthropic
-        client = _anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        
-        # Traduire en batch : envoyer tous les textes en une seule requête
-        # Format : numéroter chaque texte pour les retrouver dans la réponse
-        numbered = "\n".join([f"[{i+1}] {text}" for i, text in enumerate(texts)])
-        
-        prompt = f"""Traduis ces textes du français vers le {lang_name}.
-Conserve exactement le format numéroté [1], [2], etc.
-
-{numbered}"""
-        
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2048,
-            system=TRANSLATION_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
+        entry = models.AuditLog(
+            audit_id=str(uuid_lib.uuid4()),
+            event_type=event_type,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            target_id=str(target_id) if target_id else None,
+            target_type=target_type,
+            ip_address=ip_address,
+            device_info=device_info,
+            session_id=session_id,
+            result=result,
+            details=details,
+            retention_ans=retention_ans,
         )
-        
-        raw = response.content[0].text.strip()
-        
-        # Parser la réponse numérotée
-        translations = list(texts)  # fallback = texte original
-        lines = raw.split("\n")
-        current_idx = None
-        current_lines = []
-        
-        for line in lines:
-            import re
-            match = re.match(r"^\[(\d+)\]\s*(.*)", line)
-            if match:
-                # Sauvegarder le texte précédent
-                if current_idx is not None and current_idx <= len(translations):
-                    translations[current_idx - 1] = "\n".join(current_lines).strip()
-                current_idx = int(match.group(1))
-                current_lines = [match.group(2)]
-            elif current_idx is not None:
-                current_lines.append(line)
-        
-        # Sauvegarder le dernier
-        if current_idx is not None and current_idx <= len(translations):
-            translations[current_idx - 1] = "\n".join(current_lines).strip()
-        
-        return {"translations": translations}
-    
+        db.add(entry)
+        db.commit()
     except Exception as e:
-        logger.error("Erreur traduction: %s", e)
-        return {"translations": texts}
+        pass  # Ne jamais faire échouer une requête à cause de l'audit
+
+@router.get("/admin/audit-log", tags=["Admin - Audit"])
+async def get_audit_log(
+    event_type: Optional[str] = None,
+    actor_id: Optional[int] = None,
+    target_id: Optional[str] = None,
+    result: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin)
+):
+    """Journal d'audit — accessible uniquement par l'admin. Lecture seule."""
+    q = db.query(models.AuditLog)
+    if event_type: q = q.filter(models.AuditLog.event_type == event_type)
+    if actor_id:   q = q.filter(models.AuditLog.actor_id == actor_id)
+    if target_id:  q = q.filter(models.AuditLog.target_id == target_id)
+    if result:     q = q.filter(models.AuditLog.result == result)
+    return q.order_by(models.AuditLog.timestamp.desc()).limit(limit).all()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOSSIERS PATIENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/caissier/nouveau-dossier", status_code=201, tags=["Caissier"])
+async def creer_dossier(data: dict, request: Request, db: Session = Depends(get_db),
+                         current_user=Depends(get_current_user)):
+    """
+    Le caissier crée un dossier après paiement.
+    Déclenche : accès infirmier pour signes vitaux, puis médecin.
+    """
+    patient_id = data.get("patient_id")
+    patient = db.query(models.Patient).filter(models.Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(404, "Patient introuvable")
+
+    dossier = models.DossierPatient(
+        patient_id=patient_id,
+        patient_numero=patient.numero or "",
+        type_visite=data.get("type_visite", "premiere_consultation"),
+        service=data.get("service", "clinique"),
+        specialite=data.get("specialite"),
+        paiement_effectue=True,
+        locked=False,
+        statut=models.StatutDossierEnum.attente_infirmier,
+        motif_consultation=data.get("motif"),
+        created_by=current_user.id,
+    )
+    db.add(dossier); db.commit(); db.refresh(dossier)
+
+    log_audit(db, "DOSSIER_CREE", actor_id=current_user.id, actor_role=str(current_user.role),
+              target_id=str(dossier.id), target_type="dossier",
+              ip_address=request.client.host if request.client else None,
+              details=f"Patient #{patient.numero}")
+    return dossier
+
+@router.get("/infirmier/dossiers-en-attente", tags=["Infirmier"])
+async def dossiers_en_attente(db: Session = Depends(get_db), _=Depends(get_current_user)):
+    """Liste des dossiers attendant les signes vitaux."""
+    return db.query(models.DossierPatient).filter(
+        models.DossierPatient.statut == models.StatutDossierEnum.attente_infirmier,
+        models.DossierPatient.paiement_effectue == True,
+    ).order_by(models.DossierPatient.date_visite.desc()).all()
+
+@router.post("/infirmier/signes-vitaux", status_code=201, tags=["Infirmier"])
+async def saisir_signes_vitaux(data: dict, request: Request, db: Session = Depends(get_db),
+                                current_user=Depends(get_current_user)):
+    """
+    L'infirmier saisit les signes vitaux.
+    Déverrouille le dossier pour le médecin + place en file d'attente.
+    Alerte IA si valeurs critiques.
+    """
+    dossier_id = data.get("dossier_id")
+    dossier = db.query(models.DossierPatient).filter(models.DossierPatient.id == dossier_id).first()
+    if not dossier:
+        raise HTTPException(404, "Dossier introuvable")
+    if not dossier.paiement_effectue:
+        raise HTTPException(403, "Paiement requis avant saisie des signes vitaux")
+
+    # Détection valeurs critiques
+    alerte = False; alerte_msg = []
+    tension_sys = data.get("tension_systolique")
+    glycemie    = data.get("glycemie")
+    spo2        = data.get("saturation_o2")
+    temp        = data.get("temperature")
+    fc          = data.get("frequence_cardiaque")
+
+    if tension_sys and (tension_sys > 180 or tension_sys < 80):
+        alerte = True; alerte_msg.append(f"⚠️ Tension critique : {tension_sys} mmHg")
+    if glycemie and glycemie > 600:
+        alerte = True; alerte_msg.append(f"⚠️ Glycémie critique : {glycemie} mg/dL")
+    if spo2 and spo2 < 90:
+        alerte = True; alerte_msg.append(f"⚠️ SpO2 critique : {spo2}%")
+    if temp and (temp > 40 or temp < 35):
+        alerte = True; alerte_msg.append(f"⚠️ Température critique : {temp}°C")
+    if fc and (fc > 150 or fc < 40):
+        alerte = True; alerte_msg.append(f"⚠️ FC critique : {fc} bpm")
+
+    sv = models.SignesVitaux(
+        dossier_id=dossier_id,
+        patient_id=dossier.patient_id,
+        tension_systolique=tension_sys,
+        tension_diastolique=data.get("tension_diastolique"),
+        frequence_cardiaque=fc,
+        temperature=temp,
+        frequence_respiratoire=data.get("frequence_respiratoire"),
+        saturation_o2=spo2,
+        poids=data.get("poids"),
+        taille=data.get("taille"),
+        glycemie=glycemie,
+        notes=data.get("notes"),
+        alerte_critique=alerte,
+        alerte_message="\n".join(alerte_msg) if alerte_msg else None,
+        saisi_par=current_user.id,
+    )
+    db.add(sv)
+
+    # Passer statut → attente_medecin et placer en file
+    dossier.statut = models.StatutDossierEnum.attente_medecin
+    dossier.infirmier_id = current_user.id
+
+    file = models.FileAttente(
+        dossier_id=dossier_id,
+        patient_id=dossier.patient_id,
+        patient_numero=dossier.patient_numero,
+        medecin_id=dossier.medecin_id,
+        priorite=1 if alerte else 5,
+        place_par=current_user.id,
+    )
+    db.add(file); db.commit(); db.refresh(sv)
+
+    log_audit(db, "SIGNES_VITAUX_SAISIS", actor_id=current_user.id, actor_role="infirmier",
+              target_id=str(dossier_id), target_type="dossier",
+              ip_address=request.client.host if request.client else None,
+              details=f"Alerte: {alerte}")
+    return {"message": "Signes vitaux enregistrés", "alerte": alerte, "alertes": alerte_msg, "sv_id": sv.id}
+
+@router.get("/medecin/file-attente", tags=["Médecin"])
+async def file_attente_medecin(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """Liste des patients en attente pour ce médecin."""
+    return db.query(models.FileAttente).filter(
+        models.FileAttente.statut == "en_attente"
+    ).order_by(models.FileAttente.priorite, models.FileAttente.heure_entree).all()
+
+@router.get("/medecin/dossier/{dossier_id}", tags=["Médecin"])
+async def get_dossier_medecin(dossier_id: int, request: Request,
+                               db: Session = Depends(get_db),
+                               current_user=Depends(get_current_user)):
+    """
+    Accès médecin au dossier patient.
+    RÈGLES CRITIQUES :
+    - Paiement effectué requis
+    - Signes vitaux saisis par infirmier requis
+    - Journal d'audit systématique
+    """
+    dossier = db.query(models.DossierPatient).filter(models.DossierPatient.id == dossier_id).first()
+    if not dossier:
+        raise HTTPException(404, "Dossier introuvable")
+    if not dossier.paiement_effectue:
+        log_audit(db, "ACCES_DOSSIER_REFUSE", actor_id=current_user.id,
+                  actor_role=str(current_user.role), target_id=str(dossier_id),
+                  result="echec", details="Paiement non effectué")
+        raise HTTPException(403, "Accès refusé — paiement requis")
+    if dossier.statut == models.StatutDossierEnum.attente_infirmier:
+        raise HTTPException(403, "Accès refusé — signes vitaux non encore saisis")
+
+    log_audit(db, "DOSSIER_CONSULTE", actor_id=current_user.id,
+              actor_role=str(current_user.role), target_id=str(dossier_id),
+              target_type="dossier", ip_address=request.client.host if request.client else None,
+              result="succes", details=f"Patient #{dossier.patient_numero}", retention_ans=5)
+
+    # Signes vitaux
+    sv = db.query(models.SignesVitaux).filter(
+        models.SignesVitaux.dossier_id == dossier_id
+    ).order_by(models.SignesVitaux.created_at.desc()).first()
+
+    # Prescriptions antérieures
+    prescriptions = db.query(models.Prescription).filter(
+        models.Prescription.patient_id == dossier.patient_id
+    ).order_by(models.Prescription.date_prescription.desc()).limit(5).all()
+
+    # Résultats labo récents
+    resultats = db.query(models.ResultatLabo).filter(
+        models.ResultatLabo.patient_id == str(dossier.patient_id)
+    ).order_by(models.ResultatLabo.date_examen.desc()).limit(5).all()
+
+    return {
+        "dossier": dossier,
+        "signes_vitaux": sv,
+        "prescriptions_anterieures": prescriptions,
+        "resultats_labo": resultats,
+    }
+
+@router.put("/medecin/dossier/{dossier_id}/consultation", tags=["Médecin"])
+async def terminer_consultation(dossier_id: int, data: dict, request: Request,
+                                 db: Session = Depends(get_db),
+                                 current_user=Depends(get_current_user)):
+    """Le médecin termine la consultation — verrouille le dossier pour l'infirmier."""
+    dossier = db.query(models.DossierPatient).filter(models.DossierPatient.id == dossier_id).first()
+    if not dossier: raise HTTPException(404)
+
+    dossier.diagnostic     = data.get("diagnostic")
+    dossier.examen_clinique = data.get("examen_clinique")
+    dossier.notes_medecin  = data.get("notes_medecin")
+    dossier.statut         = models.StatutDossierEnum.termine
+    dossier.date_fin_consultation = datetime.now(timezone.utc)
+    dossier.locked         = True  # Infirmier perd l'accès
+
+    # Créer prescription si fournie
+    if data.get("medicaments"):
+        import hashlib, json
+        med_json = json.dumps(data.get("medicaments", []))
+        hash_sig = hashlib.sha256(f"{current_user.id}{dossier_id}{med_json}".encode()).hexdigest()
+        presc = models.Prescription(
+            dossier_id=dossier_id, patient_id=dossier.patient_id,
+            medecin_id=dossier.medecin_id, medecin_nom=current_user.nom,
+            medicaments=med_json, examens_requis=data.get("examens_requis"),
+            notes=data.get("notes_prescription"),
+            signature_hash=hash_sig, signee=True,
+        )
+        db.add(presc)
+
+    # Mettre à jour file d'attente
+    fa = db.query(models.FileAttente).filter(
+        models.FileAttente.dossier_id == dossier_id,
+        models.FileAttente.statut == "en_cours"
+    ).first()
+    if fa:
+        fa.statut = "termine"
+        fa.heure_fin = datetime.now(timezone.utc)
+
+    db.commit()
+    log_audit(db, "CONSULTATION_TERMINEE", actor_id=current_user.id,
+              actor_role="medecin", target_id=str(dossier_id), retention_ans=5)
+    return {"message": "Consultation terminée", "dossier_statut": "termine"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RÉSULTATS LABO — fenêtre 24h
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.put("/labo/resultats/{rid}", tags=["Labo"])
+async def modifier_resultat(rid: int, data: dict, request: Request,
+                             db: Session = Depends(get_db),
+                             current_user=Depends(get_current_user)):
+    """Modification résultat labo — fenêtre de 24h uniquement."""
+    r = db.query(models.ResultatLabo).filter(models.ResultatLabo.id == rid).first()
+    if not r: raise HTTPException(404, "Résultat introuvable")
+
+    # Vérifier fenêtre 24h
+    age = datetime.now(timezone.utc) - r.date_examen.replace(tzinfo=timezone.utc)
+    if age.total_seconds() > 86400:
+        raise HTTPException(423, "Résultat verrouillé — fenêtre de 24h dépassée")
+
+    ancienne_val = r.resultats
+    r.resultats = data.get("resultats", r.resultats)
+    r.notes     = data.get("notes", r.notes)
+    r.status    = "modifie"
+    db.commit()
+
+    log_audit(db, "RESULTAT_LABO_MODIFIE", actor_id=current_user.id,
+              actor_role="labo", target_id=str(rid), target_type="resultat_labo",
+              ip_address=request.client.host if request.client else None,
+              details=f"Ancienne valeur: {ancienne_val[:100] if ancienne_val else ''}", retention_ans=5)
+    return r
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PATIENT — SON PROPRE DOSSIER
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/patient/mon-dossier", tags=["Patient"])
+async def mon_dossier(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """Le patient voit uniquement son propre dossier — jamais celui d'un autre."""
+    patient = db.query(models.Patient).filter(
+        models.Patient.email == current_user.email
+    ).first()
+    if not patient:
+        return {"message": "Aucun dossier trouvé", "dossiers": []}
+
+    dossiers = db.query(models.DossierPatient).filter(
+        models.DossierPatient.patient_id == patient.id
+    ).order_by(models.DossierPatient.date_visite.desc()).limit(10).all()
+
+    prescriptions = db.query(models.Prescription).filter(
+        models.Prescription.patient_id == patient.id,
+        models.Prescription.statut == "active"
+    ).all()
+
+    resultats = db.query(models.ResultatLabo).filter(
+        models.ResultatLabo.patient_id == str(patient.id)
+    ).order_by(models.ResultatLabo.date_examen.desc()).limit(10).all()
+
+    return {
+        "patient": patient,
+        "dossiers": dossiers,
+        "prescriptions_actives": prescriptions,
+        "resultats_labo": resultats,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HOSPITALISATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/caissier/hospitalisation", status_code=201, tags=["Caissier"])
+async def creer_hospitalisation(data: dict, db: Session = Depends(get_db),
+                                 current_user=Depends(get_current_user)):
+    patient = db.query(models.Patient).filter(models.Patient.id == data.get("patient_id")).first()
+    if not patient: raise HTTPException(404, "Patient introuvable")
+
+    # Créer ou récupérer dossier
+    dossier = models.DossierPatient(
+        patient_id=patient.id, patient_numero=patient.numero or "",
+        type_visite="hospitalisation", service=data.get("type_sejour", "hospitalisation"),
+        paiement_effectue=True, statut=models.StatutDossierEnum.hospitalisation,
+        locked=False, created_by=current_user.id,
+    )
+    db.add(dossier); db.flush()
+
+    hospit = models.Hospitalisation(
+        dossier_id=dossier.id, patient_id=patient.id,
+        patient_numero=patient.numero or "",
+        type_sejour=data.get("type_sejour", "hospitalisation"),
+        lit_numero=data.get("lit_numero"),
+        service=data.get("service"),
+        tarif_journalier=float(data.get("tarif_journalier", 0)),
+        created_by=current_user.id,
+    )
+    db.add(hospit); db.commit(); db.refresh(hospit)
+    return hospit
+
+@router.put("/caissier/hospitalisation/{hid}/sortie", tags=["Caissier"])
+async def sortie_hospitalisation(hid: int, data: dict, db: Session = Depends(get_db),
+                                  current_user=Depends(get_current_user)):
+    h = db.query(models.Hospitalisation).filter(models.Hospitalisation.id == hid).first()
+    if not h: raise HTTPException(404)
+    h.date_sortie    = datetime.now(timezone.utc)
+    h.nb_jours       = data.get("nb_jours", h.nb_jours)
+    h.total_hebergement = h.nb_jours * h.tarif_journalier
+    h.acquittement_total = data.get("acquittement_total", False)
+    if not h.acquittement_total:
+        raise HTTPException(402, "Acquittement total requis avant sortie")
+    h.statut = "sorti"
+    if h.dossier_id:
+        dossier = db.query(models.DossierPatient).filter(models.DossierPatient.id == h.dossier_id).first()
+        if dossier:
+            dossier.statut = models.StatutDossierEnum.termine
+            dossier.locked = True
+    db.commit()
+    return h
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AVIS PATIENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/patient/avis", status_code=201, tags=["Patient"])
+async def soumettre_avis(data: dict, db: Session = Depends(get_db),
+                          current_user=Depends(get_current_user)):
+    patient = db.query(models.Patient).filter(models.Patient.email == current_user.email).first()
+    note = int(data.get("note", 3))
+    if not 1 <= note <= 5:
+        raise HTTPException(422, "Note entre 1 et 5 requise")
+    avis = models.AvisPatient(
+        patient_id=patient.id if patient else None,
+        dossier_id=data.get("dossier_id"),
+        medecin_nom=data.get("medecin_nom"),
+        service=data.get("service"),
+        note=note, commentaire=data.get("commentaire"),
+        anonyme=data.get("anonyme", False),
+    )
+    db.add(avis); db.commit(); db.refresh(avis)
+    return avis
+
+@router.get("/admin/avis", tags=["Admin"])
+async def list_avis(db: Session = Depends(get_db), _=Depends(require_admin)):
+    return db.query(models.AvisPatient).order_by(models.AvisPatient.created_at.desc()).all()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN — RABAIS + COMPTES EN ATTENTE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/admin/comptes-en-attente", tags=["Admin - Users"])
+async def comptes_en_attente(db: Session = Depends(get_db), _=Depends(require_admin)):
+    """Liste tous les comptes internes en attente de validation."""
+    return db.query(models.User).filter(
+        models.User.is_active == False,
+        models.User.role != models.RoleEnum.patient,
+    ).order_by(models.User.created_at.desc()).all()
+
+@router.put("/admin/users/{uid}/suspendre", tags=["Admin - Users"])
+async def suspendre_user(uid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
+    u = db.query(models.User).filter(models.User.id == uid).first()
+    if not u: raise HTTPException(404)
+    u.is_active = False; db.commit()
+    return {"message": f"Compte {u.nom} suspendu — sessions invalidées"}
+
+@router.put("/admin/users/{uid}/reactiver", tags=["Admin - Users"])
+async def reactiver_user(uid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
+    u = db.query(models.User).filter(models.User.id == uid).first()
+    if not u: raise HTTPException(404)
+    u.is_active = True; db.commit()
+    return {"message": f"Compte {u.nom} réactivé"}
+
+@router.post("/admin/rabais", status_code=201, tags=["Admin"])
+async def appliquer_rabais(data: dict, db: Session = Depends(get_db),
+                            current_user=Depends(require_admin)):
+    """Admin peut appliquer un rabais ou laisser passer un patient sans paiement."""
+    log_audit(db, "AUTORISATION_SPECIALE_ADMIN",
+              actor_id=current_user.id, actor_role="admin",
+              target_id=str(data.get("patient_id")), target_type="patient",
+              details=f"Rabais: {data.get('rabais_pct')}% — {data.get('justification')}", retention_ans=7)
+    return {"message": "Rabais enregistré", "data": data}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MIGRATION — ajoute les nouvelles colonnes et tables
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/migrate-db-v2", tags=["Setup"])
+def migrate_db_v2(db: Session = Depends(get_db)):
+    """Migration v2 — nouveaux rôles, tables audit, dossiers, hospitalisations."""
+    from sqlalchemy import text
+    migrations = [
+        # Nouveaux rôles
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'roleenum') THEN RAISE NOTICE 'type not found'; END IF; END $$",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN DEFAULT FALSE",
+        # Nouvelles tables via create_all
+    ]
+    errors = []
+    for sql in migrations:
+        try:
+            db.execute(text(sql)); db.commit()
+        except Exception as e:
+            errors.append(str(e)[:100]); db.rollback()
+
+    # Créer toutes les nouvelles tables
+    try:
+        from app.database import engine, Base
+        Base.metadata.create_all(bind=engine)
+    except Exception as e:
+        errors.append(str(e))
+
+    return {"message": "Migration v2 terminée", "errors": errors}

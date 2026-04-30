@@ -34,6 +34,7 @@ class RoleEnum(str, enum.Enum):
     caissier  = "caissier"
     labo      = "labo"
     pharmacie = "pharmacie"
+    infirmier = "infirmier"
 
 
 class StatutRDVEnum(str, enum.Enum):
@@ -206,7 +207,7 @@ class Horaire(Base):
 class Patient(Base):
     __tablename__ = "patients"
     id             = Column(Integer, primary_key=True, index=True)
-    numero         = Column(String(20), unique=True, index=True, nullable=True)  # #RB-0001
+    numero         = Column(String(20), unique=True, index=True)
     nom            = Column(String(255), nullable=False)
     prenom         = Column(String(255))
     date_naissance = Column(String(20))
@@ -220,8 +221,10 @@ class Patient(Base):
     notes          = Column(Text)
     created_by     = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
-    id_papier            = Column(String(50), nullable=True, index=True)
-    service              = Column(String(50), default="clinique")
+    # Deux identifiants distincts
+    id_papier            = Column(String(50), nullable=True, index=True)   # Ex: 0001, CR127 — dossier papier CONSERVÉ
+    numero               = Column(String(20), unique=True, index=True)      # #RB-0001 — ID plateforme (généré automatiquement)
+    service              = Column(String(50), default="clinique")           # clinique, dentiste, physio, optometrie
     date_premiere_visite = Column(DateTime(timezone=True), nullable=True)
     rendez_vous    = relationship("RendezVous", back_populates="patient")
 
@@ -670,3 +673,276 @@ class BilanOptometrieMensuel(Base):
     difference                  = Column(Float, default=0)
     statut                      = Column(String(20), default="en_attente")
     created_at                  = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RÔLES MANQUANTS
+# ══════════════════════════════════════════════════════════════════════════════
+# Ajout infirmier et pharmacie dans RoleEnum — fait via migration SQL
+# (RoleEnum déjà défini en haut, modifié via ALTER TYPE)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEMANDE D'ACCÈS DOSSIER (médecin → admin → autorisation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StatutDemandeEnum(str, enum.Enum):
+    en_attente = "en_attente"
+    approuve   = "approuve"
+    refuse     = "refuse"
+    expire     = "expire"
+
+
+class DemandeAccesDossier(Base):
+    """
+    Système d'autorisation admin pour accès médecin à un dossier.
+    Flux : médecin demande → admin approuve/refuse → accès temporaire 24h.
+    Tout est journalisé dans audit_logs.
+    """
+    __tablename__ = "demandes_acces_dossier"
+
+    id              = Column(Integer, primary_key=True)
+    # Demandeur
+    medecin_id      = Column(Integer, ForeignKey("users.id"), nullable=False)
+    medecin_nom     = Column(String(255), nullable=False)
+    medecin_specialite = Column(String(255), nullable=True)
+    # Patient concerné
+    patient_id      = Column(Integer, ForeignKey("patients.id"), nullable=True)
+    patient_numero  = Column(String(20), nullable=False)
+    dossier_id      = Column(Integer, ForeignKey("dossiers_patients.id"), nullable=True)
+    # Motif de la demande
+    motif           = Column(Text, nullable=False)
+    urgence         = Column(Boolean, default=False)
+    # Décision admin
+    statut          = Column(Enum(StatutDemandeEnum), default=StatutDemandeEnum.en_attente)
+    admin_id        = Column(Integer, ForeignKey("users.id"), nullable=True)
+    admin_commentaire = Column(Text, nullable=True)
+    # Durée d'accès si approuvé (heures)
+    duree_acces_h   = Column(Integer, default=24)
+    acces_expire_at = Column(DateTime(timezone=True), nullable=True)
+    # Timestamps
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    decided_at      = Column(DateTime(timezone=True), nullable=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JOURNAL D'AUDIT IMMUABLE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AuditLog(Base):
+    """
+    Journal d'audit immuable — HIPAA / RGPD / OPS-OMS.
+    JAMAIS de UPDATE ou DELETE sur cette table.
+    Timestamp toujours généré côté serveur UTC.
+    """
+    __tablename__ = "audit_logs"
+
+    id          = Column(Integer, primary_key=True)
+    audit_id    = Column(String(36), unique=True, nullable=False)  # UUID
+    event_type  = Column(String(50), nullable=False)   # DOSSIER_CONSULTE, CONNEXION, etc.
+    actor_id    = Column(Integer, nullable=True)
+    actor_role  = Column(String(30), nullable=True)
+    target_id   = Column(String(100), nullable=True)   # ID patient, dossier, transaction
+    target_type = Column(String(50), nullable=True)    # patient, dossier, paiement
+    timestamp   = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    ip_address  = Column(String(45), nullable=True)
+    device_info = Column(String(500), nullable=True)
+    session_id  = Column(String(100), nullable=True)
+    result      = Column(String(10), default="succes") # succes / echec
+    details     = Column(Text, nullable=True)
+    # Rétention selon type (en années)
+    retention_ans = Column(Integer, default=5)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOSSIER PATIENT MÉDICAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StatutDossierEnum(str, enum.Enum):
+    attente_infirmier  = "attente_infirmier"
+    attente_medecin    = "attente_medecin"
+    en_consultation    = "en_consultation"
+    observation        = "observation"
+    hospitalisation    = "hospitalisation"
+    maternite          = "maternite"
+    salle_sop          = "salle_sop"
+    termine            = "termine"
+    archive            = "archive"
+
+
+class DossierPatient(Base):
+    """
+    Dossier médical d'une visite.
+    Chaque visite crée un nouveau dossier (pas de fusion).
+    Accès contrôlé par statut + rôle.
+    """
+    __tablename__ = "dossiers_patients"
+
+    id              = Column(Integer, primary_key=True)
+    # Liens
+    patient_id      = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    patient_numero  = Column(String(20), nullable=False)  # #RB-0001
+    medecin_id      = Column(Integer, ForeignKey("profils_medecins.id"), nullable=True)
+    infirmier_id    = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Type de visite
+    type_visite     = Column(String(50), default="premiere_consultation")  # premiere_consultation, rendez_vous, urgence
+    service         = Column(String(50), default="clinique")
+    specialite      = Column(String(100), nullable=True)
+    # Statut
+    statut          = Column(Enum(StatutDossierEnum), default=StatutDossierEnum.attente_infirmier)
+    # Paiement requis avant accès médecin
+    paiement_effectue = Column(Boolean, default=False)
+    mouvement_paiement_id = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
+    # Verrouillage
+    locked          = Column(Boolean, default=True)   # True = accès restreint
+    unlock_par      = Column(Integer, ForeignKey("users.id"), nullable=True)
+    unlock_at       = Column(DateTime(timezone=True), nullable=True)
+    # Contenu médical
+    motif_consultation = Column(Text, nullable=True)
+    anamnese        = Column(Text, nullable=True)       # Histoire de la maladie
+    examen_clinique = Column(Text, nullable=True)       # Examen physique
+    diagnostic      = Column(Text, nullable=True)
+    notes_medecin   = Column(Text, nullable=True)
+    synthese_ia     = Column(Text, nullable=True)       # Résumé généré par IA
+    # Dates
+    date_visite     = Column(DateTime(timezone=True), server_default=func.now())
+    date_fin_consultation = Column(DateTime(timezone=True), nullable=True)
+    created_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIGNES VITAUX (Infirmier)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SignesVitaux(Base):
+    __tablename__ = "signes_vitaux"
+
+    id              = Column(Integer, primary_key=True)
+    dossier_id      = Column(Integer, ForeignKey("dossiers_patients.id"), nullable=False)
+    patient_id      = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    # Mesures
+    tension_systolique  = Column(Float, nullable=True)   # mmHg
+    tension_diastolique = Column(Float, nullable=True)   # mmHg
+    frequence_cardiaque = Column(Integer, nullable=True) # bpm
+    temperature         = Column(Float, nullable=True)   # °C
+    frequence_respiratoire = Column(Integer, nullable=True)  # /min
+    saturation_o2       = Column(Float, nullable=True)   # %
+    poids               = Column(Float, nullable=True)   # kg
+    taille              = Column(Float, nullable=True)   # cm
+    glycemie            = Column(Float, nullable=True)   # mg/dL
+    notes               = Column(Text, nullable=True)
+    # Alertes IA
+    alerte_critique     = Column(Boolean, default=False)
+    alerte_message      = Column(Text, nullable=True)
+    # Audit
+    saisi_par       = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRESCRIPTIONS / ORDONNANCES
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Prescription(Base):
+    __tablename__ = "prescriptions"
+
+    id              = Column(Integer, primary_key=True)
+    dossier_id      = Column(Integer, ForeignKey("dossiers_patients.id"), nullable=False)
+    patient_id      = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    medecin_id      = Column(Integer, ForeignKey("profils_medecins.id"), nullable=True)
+    medecin_nom     = Column(String(255), nullable=True)
+    # Médicaments (JSON-like en texte)
+    medicaments     = Column(Text, nullable=False)  # JSON: [{nom, dose, duree, instructions}]
+    examens_requis  = Column(Text, nullable=True)   # Examens prescrits
+    notes           = Column(Text, nullable=True)
+    # Signature numérique (hash)
+    signature_hash  = Column(String(64), nullable=True)
+    signee          = Column(Boolean, default=False)
+    date_prescription = Column(DateTime(timezone=True), server_default=func.now())
+    valide_jusqu_au = Column(DateTime(timezone=True), nullable=True)
+    statut          = Column(String(20), default="active")  # active, executee, expiree
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FILE D'ATTENTE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FileAttente(Base):
+    __tablename__ = "file_attente"
+
+    id              = Column(Integer, primary_key=True)
+    dossier_id      = Column(Integer, ForeignKey("dossiers_patients.id"), nullable=False)
+    patient_id      = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    patient_numero  = Column(String(20), nullable=False)
+    medecin_id      = Column(Integer, ForeignKey("profils_medecins.id"), nullable=True)
+    medecin_nom     = Column(String(255), nullable=True)
+    priorite        = Column(Integer, default=5)     # 1=urgence, 5=normal
+    statut          = Column(String(20), default="en_attente")  # en_attente, en_cours, termine
+    heure_entree    = Column(DateTime(timezone=True), server_default=func.now())
+    heure_appel     = Column(DateTime(timezone=True), nullable=True)
+    heure_fin       = Column(DateTime(timezone=True), nullable=True)
+    place_par       = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HOSPITALISATION / OBSERVATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Hospitalisation(Base):
+    __tablename__ = "hospitalisations"
+
+    id              = Column(Integer, primary_key=True)
+    dossier_id      = Column(Integer, ForeignKey("dossiers_patients.id"), nullable=False)
+    patient_id      = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    patient_numero  = Column(String(20), nullable=False)
+    type_sejour     = Column(String(30), default="hospitalisation")  # hospitalisation, observation, maternite, sop
+    medecin_id      = Column(Integer, ForeignKey("profils_medecins.id"), nullable=True)
+    lit_numero      = Column(String(20), nullable=True)
+    service         = Column(String(100), nullable=True)
+    date_admission  = Column(DateTime(timezone=True), server_default=func.now())
+    date_sortie     = Column(DateTime(timezone=True), nullable=True)
+    # Facturation
+    nb_jours        = Column(Integer, default=0)
+    tarif_journalier = Column(Float, default=0)
+    total_hebergement = Column(Float, default=0)
+    acquittement_total = Column(Boolean, default=False)
+    mouvement_id    = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
+    statut          = Column(String(20), default="actif")  # actif, sorti
+    created_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NOTATION / AVIS PATIENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AvisPatient(Base):
+    __tablename__ = "avis_patients"
+
+    id              = Column(Integer, primary_key=True)
+    patient_id      = Column(Integer, ForeignKey("patients.id"), nullable=True)
+    dossier_id      = Column(Integer, ForeignKey("dossiers_patients.id"), nullable=True)
+    medecin_nom     = Column(String(255), nullable=True)
+    service         = Column(String(100), nullable=True)
+    note            = Column(Integer, nullable=False)   # 1-5
+    commentaire     = Column(Text, nullable=True)
+    sentiment_ia    = Column(String(20), nullable=True) # positif, neutre, negatif
+    anonyme         = Column(Boolean, default=False)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIEN VIDÉO SÉCURISÉ (JWT 2h)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LienVideoRdv(Base):
+    __tablename__ = "liens_video_rdv"
+
+    id              = Column(Integer, primary_key=True)
+    rdv_id          = Column(Integer, ForeignKey("rendez_vous.id"), nullable=False)
+    token_jwt       = Column(String(500), unique=True, nullable=False)
+    lien_video      = Column(String(500), nullable=False)
+    expire_at       = Column(DateTime(timezone=True), nullable=False)  # +2h à partir connexion
+    utilise         = Column(Boolean, default=False)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())

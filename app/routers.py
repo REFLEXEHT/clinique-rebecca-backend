@@ -11,7 +11,7 @@ Corrections appliquées :
   - Lettrage RDV ↔ mouvement
   - Immobilisations + amortissements
 """
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func, extract
 from datetime import datetime, timedelta, timezone
@@ -24,6 +24,7 @@ from app.auth import (get_current_user, require_admin,
 from app.services.notifications import notify_rdv_confirmed, notify_rdv_video_confirme
 import asyncio
 import os
+import uuid as uuid_lib
 
 router = APIRouter()
 
@@ -1921,8 +1922,6 @@ def _seed_regles(db: Session):
 # AUDIT LOG — JOURNAL D'AUDIT IMMUABLE
 # ══════════════════════════════════════════════════════════════════════════════
 
-import uuid as uuid_lib
-from fastapi import Request
 
 def log_audit(
     db, event_type: str, actor_id: int = None, actor_role: str = None,

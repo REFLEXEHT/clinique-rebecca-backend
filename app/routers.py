@@ -19,6 +19,10 @@ from typing import List, Optional
 import app.models as models
 import app.schemas as schemas
 from app.database import get_db
+
+# ── Token blacklist (in-memory — à remplacer par Redis en prod) ──────────
+REVOKED_TOKENS: set = set()
+
 from app.auth import (get_current_user, require_admin,
                       verify_password, get_password_hash, create_access_token)
 from app.services.notifications import notify_rdv_confirmed, notify_rdv_video_confirme
@@ -1952,6 +1956,483 @@ async def imprimer_resultats_labo_infirmier(patient_numero: str, request: Reques
     }
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATIENT — Dashboard complet
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/patient/mon-dossier", tags=["Patient"])
+async def mon_dossier_complet(db: Session = Depends(get_db),
+                               current_user=Depends(get_current_user)):
+    """Dossier patient complet: visites, prescriptions actives, résultats labo 3 mois"""
+    if current_user.role != models.RoleEnum.patient:
+        raise HTTPException(403, "Accès réservé aux patients")
+
+    patient = db.query(models.Patient).filter(
+        models.Patient.user_id == current_user.id
+    ).first()
+
+    if not patient:
+        return {"dossiers": [], "prescriptions_actives": [], "resultats_labo": []}
+
+    from datetime import datetime, timedelta, timezone
+    trois_mois = datetime.now(timezone.utc) - timedelta(days=90)
+
+    dossiers = db.query(models.DossierPatient).filter(
+        models.DossierPatient.patient_id == patient.id
+    ).order_by(models.DossierPatient.date_visite.desc()).limit(10).all()
+
+    prescriptions = db.query(models.Prescription).filter(
+        models.Prescription.patient_id == patient.id,
+        models.Prescription.date_prescription >= trois_mois
+    ).order_by(models.Prescription.date_prescription.desc()).all()
+
+    resultats = db.query(models.ResultatLabo).filter(
+        models.ResultatLabo.patient_id == str(patient.id),
+        models.ResultatLabo.date_examen >= trois_mois.date()
+    ).order_by(models.ResultatLabo.date_examen.desc()).all()
+
+    return {
+        "patient_numero": patient.numero,
+        "dossiers": [{"id": d.id, "date_visite": str(d.date_visite),
+                       "type_visite": d.type_visite, "specialite": d.specialite,
+                       "diagnostic": d.diagnostic, "statut": str(d.statut)} for d in dossiers],
+        "prescriptions_actives": [{"id": p.id, "medicaments": p.medicaments,
+                                    "medecin_nom": p.medecin_nom,
+                                    "date_prescription": str(p.date_prescription),
+                                    "valide_jusqu_au": str(p.valide_jusqu_au) if p.valide_jusqu_au else None} for p in prescriptions],
+        "resultats_labo": [{"id": r.id, "type_examen": r.type_examen,
+                             "resultats": r.resultats, "notes": r.notes,
+                             "date_examen": str(r.date_examen), "status": r.status} for r in resultats],
+    }
+
+
+@router.post("/patient/avis", tags=["Patient"])
+async def soumettre_avis(data: dict, db: Session = Depends(get_db),
+                          current_user=Depends(get_current_user)):
+    """Patient soumet une note et un avis post-consultation"""
+    if current_user.role != models.RoleEnum.patient:
+        raise HTTPException(403, "Réservé aux patients")
+
+    note = data.get("note", 0)
+    if not (1 <= note <= 5):
+        raise HTTPException(422, "Note entre 1 et 5 requise")
+
+    avis = models.AvisPatient(
+        patient_id=current_user.id,
+        dossier_id=data.get("dossier_id"),
+        note=note,
+        commentaire=data.get("commentaire", ""),
+    )
+    db.add(avis); db.commit()
+    return {"message": "Avis enregistré", "note": note}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MÉDECIN — Recommandation vers autre spécialiste
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/medecin/recommander/{dossier_id}", tags=["Médecin"])
+async def recommander_specialiste(dossier_id: int, data: dict,
+                                   db: Session = Depends(get_db),
+                                   current_user=Depends(get_current_user)):
+    """
+    Médecin recommande le patient vers un autre spécialiste.
+    Le physiothérapeute/dentiste/optométriste recevra un accès
+    LIMITÉ au résumé de recommandation uniquement.
+    """
+    dossier = db.query(models.DossierPatient).filter(
+        models.DossierPatient.id == dossier_id).first()
+    if not dossier:
+        raise HTTPException(404, "Dossier introuvable")
+
+    specialiste_cible = data.get("specialiste_cible", "")
+    motif = data.get("motif", "")
+    notes_recommandation = data.get("notes", "")
+
+    # Enregistrer la recommandation
+    rec = models.GesteMedical(
+        dossier_id=dossier_id,
+        type_geste="RECOMMANDATION",
+        description=f"Recommandation vers {specialiste_cible} — {motif}",
+        notes=notes_recommandation,
+        medecin_id=current_user.id,
+    )
+    db.add(rec)
+
+    log_audit(db, "RECOMMANDATION_EMISE",
+              actor_id=current_user.id, actor_role=str(current_user.role),
+              target_id=str(dossier_id), target_type="dossier",
+              details=f"→ {specialiste_cible}: {motif}", retention_ans=5)
+    db.commit()
+
+    return {"message": f"Recommandation vers {specialiste_cible} enregistrée",
+            "dossier_id": dossier_id, "specialiste": specialiste_cible}
+
+
+@router.get("/medecin/recommandations/{patient_id}", tags=["Médecin"])
+async def get_recommandations_patient(patient_id: int,
+                                       db: Session = Depends(get_db),
+                                       current_user=Depends(get_current_user)):
+    """Physiothérapeute/dentiste/optométriste voit UNIQUEMENT le résumé de recommandation"""
+    SPECIALITES_LIMITEES = ['dentisterie','dentiste','optometrie','physiotherapie','physiothérapie']
+    user_spec = (current_user.specialite or '').lower()
+    
+    recs = db.query(models.GesteMedical).filter(
+        models.GesteMedical.type_geste == "RECOMMANDATION",
+        models.GesteMedical.dossier_id.in_(
+            db.query(models.DossierPatient.id).filter(
+                models.DossierPatient.patient_id == patient_id
+            )
+        )
+    ).all()
+
+    return {"recommandations": [
+        {"id": r.id, "description": r.description, "notes": r.notes,
+         "date": str(r.created_at)} for r in recs
+    ]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMIN — Tableau de bord analytique IA
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/admin/dashboard-analytics", tags=["Admin - Analytics"])
+async def dashboard_analytics(db: Session = Depends(get_db),
+                               _=Depends(require_admin)):
+    """Tableau de bord analytique complet pour l'admin"""
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import func
+    
+    now = datetime.now(timezone.utc)
+    debut_mois = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    debut_semaine = now - timedelta(days=7)
+
+    # Revenus par service (30 derniers jours)
+    debut_30j = now - timedelta(days=30)
+    
+    # Dossiers par spécialité
+    dossiers_par_spec = db.query(
+        models.DossierPatient.specialite,
+        func.count(models.DossierPatient.id).label("count")
+    ).filter(
+        models.DossierPatient.date_visite >= debut_30j.date()
+    ).group_by(models.DossierPatient.specialite).all()
+
+    # Paiements du mois
+    paiements_mois = db.query(
+        func.sum(models.Mouvement.montant_debit)
+    ).filter(
+        models.Mouvement.date >= debut_mois
+    ).scalar() or 0
+
+    # Nouveaux patients (mois)
+    nouveaux_patients = db.query(func.count(models.Patient.id)).filter(
+        models.Patient.created_at >= debut_mois
+    ).scalar() or 0
+
+    # Comptes en attente
+    comptes_attente = db.query(func.count(models.User.id)).filter(
+        models.User.is_active == False,
+        models.User.role != models.RoleEnum.patient
+    ).scalar() or 0
+
+    # Taux occupation par service
+    services = db.query(
+        models.DossierPatient.type_visite,
+        func.count(models.DossierPatient.id).label("count")
+    ).filter(
+        models.DossierPatient.date_visite >= debut_semaine.date()
+    ).group_by(models.DossierPatient.type_visite).all()
+
+    # Accès suspects (>20 dossiers/jour par user)
+    from sqlalchemy import cast, Date as SADate
+    acces_suspects = db.query(
+        models.AuditLog.actor_id,
+        func.count(models.AuditLog.id).label("nb_acces")
+    ).filter(
+        models.AuditLog.event_type == "DOSSIER_CONSULTE",
+        cast(models.AuditLog.timestamp, SADate) == now.date()
+    ).group_by(models.AuditLog.actor_id).having(
+        func.count(models.AuditLog.id) > 20
+    ).all()
+
+    return {
+        "periode": "30 derniers jours",
+        "revenus_mois": float(paiements_mois),
+        "nouveaux_patients": nouveaux_patients,
+        "comptes_en_attente": comptes_attente,
+        "dossiers_par_specialite": [{"specialite": d[0] or "Non spécifié", "count": d[1]} for d in dossiers_par_spec],
+        "taux_occupation_semaine": [{"service": s[0] or "Autre", "count": s[1]} for s in services],
+        "alertes_acces_suspects": [{"actor_id": a[0], "nb_acces": a[1]} for a in acces_suspects],
+        "alerte_comptes_attente_48h": comptes_attente > 0,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMIN — Activation/Rejet compte avec notification email
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/admin/users/{user_id}/activer", tags=["Admin - Users"])
+async def activer_compte(user_id: int, data: dict = {}, 
+                          db: Session = Depends(get_db),
+                          current_user=Depends(require_admin)):
+    """Activer un compte interne + envoyer email de confirmation"""
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+    
+    user.is_active = True
+    db.commit()
+
+    log_audit(db, "COMPTE_ACTIVE",
+              actor_id=current_user.id, actor_role="admin",
+              target_id=str(user_id), target_type="user",
+              details=f"Compte {user.email} activé par admin")
+
+    # Email notification (async)
+    try:
+        import asyncio
+        from app.services.notifications import envoyer_email_activation
+        asyncio.create_task(envoyer_email_activation(user.email, user.nom, activated=True))
+    except Exception:
+        pass
+
+    return {"message": f"Compte {user.email} activé", "email": user.email}
+
+
+@router.post("/admin/users/{user_id}/rejeter", tags=["Admin - Users"])
+async def rejeter_compte(user_id: int, data: dict,
+                          db: Session = Depends(get_db),
+                          current_user=Depends(require_admin)):
+    """Rejeter une demande de compte avec motif"""
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+    
+    motif = data.get("motif", "Demande non conforme")
+    user.is_active = False
+    db.commit()
+
+    log_audit(db, "COMPTE_REJETE",
+              actor_id=current_user.id, actor_role="admin",
+              target_id=str(user_id), details=f"Motif: {motif}")
+
+    try:
+        import asyncio
+        from app.services.notifications import envoyer_email_activation
+        asyncio.create_task(envoyer_email_activation(user.email, user.nom, activated=False, motif=motif))
+    except Exception:
+        pass
+
+    return {"message": f"Compte {user.email} rejeté", "motif": motif}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LABO — Alerte IA valeurs critiques → notification médecin
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/labo/alerte-critique/{resultat_id}", tags=["Laboratoire"])
+async def alerte_valeur_critique(resultat_id: int, data: dict,
+                                  db: Session = Depends(get_db),
+                                  current_user=Depends(get_current_user)):
+    """
+    Alerte IA: valeur critique détectée → notification au médecin prescripteur
+    Déclenchée automatiquement par le frontend après saisie d'un résultat labo
+    """
+    resultat = db.query(models.ResultatLabo).filter(
+        models.ResultatLabo.id == resultat_id).first()
+    if not resultat:
+        raise HTTPException(404, "Résultat introuvable")
+
+    valeur_critique = data.get("valeur", "")
+    examen = data.get("examen", "")
+    
+    # Trouver le médecin prescripteur via le dossier
+    medecin_email = data.get("medecin_email", "")
+    
+    log_audit(db, "ALERTE_VALEUR_CRITIQUE",
+              actor_id=current_user.id, actor_role="labo",
+              target_id=str(resultat_id), target_type="resultat_labo",
+              details=f"Valeur critique: {examen} = {valeur_critique}",
+              result="alerte", retention_ans=5)
+
+    # Notification (email/WhatsApp) au médecin prescripteur
+    try:
+        import asyncio
+        from app.services.notifications import notifier_medecin_valeur_critique
+        asyncio.create_task(notifier_medecin_valeur_critique(
+            medecin_email=medecin_email,
+            patient_id=resultat.patient_id,
+            examen=examen, valeur=valeur_critique
+        ))
+    except Exception:
+        pass
+
+    return {"message": "Alerte envoyée au médecin prescripteur", "examen": examen}
+
+
+
+@router.post("/caissier/paiement", status_code=201, tags=["Caissier"])
+async def enregistrer_paiement(data: dict, request: Request,
+                                db: Session = Depends(get_db),
+                                current_user=Depends(get_current_user)):
+    """Enregistrement d'un paiement avec génération de reçu"""
+    patient_id = data.get("patient_id")
+    patient = db.query(models.Patient).filter(models.Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(404, "Patient introuvable")
+
+    montant = float(data.get("montant", 0))
+    service = data.get("service", "")
+    mode    = data.get("mode_paiement", "especes")
+    ref     = data.get("reference", "")
+
+    import uuid as uuid_lib2
+    recu_num = f"REC-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(uuid_lib2.uuid4())[:6].upper()}"
+
+    mouvement = models.Mouvement(
+        numero_piece=recu_num,
+        description=f"Paiement {service} — Patient {patient.numero}",
+        montant_debit=montant,
+        mode_paiement=mode,
+        reference_paiement=ref,
+        patient_id=patient_id,
+    )
+    db.add(mouvement); db.commit()
+
+    log_audit(db, "PAIEMENT_ENREGISTRE",
+              actor_id=current_user.id, actor_role="caissier",
+              target_id=patient.numero, target_type="patient",
+              ip_address=request.client.host if request.client else None,
+              details=f"Service: {service} — Montant: {montant} HTG — Mode: {mode}",
+              result="succes", retention_ans=7)
+
+    return {
+        "message": "Paiement enregistré",
+        "recu_numero": recu_num,
+        "patient_id": patient_id,
+        "patient_nom": patient.nom,
+        "service": service,
+        "montant": montant,
+        "mode_paiement": mode,
+    }
+
+
+@router.get("/caissier/paiements-jour", tags=["Caissier"])
+async def paiements_du_jour(db: Session = Depends(get_db),
+                             current_user=Depends(get_current_user)):
+    """Liste des paiements du jour avec total"""
+    from sqlalchemy import cast, Date as SADate
+    from datetime import datetime, timezone
+    
+    aujourd_hui = datetime.now(timezone.utc).date()
+    paiements = db.query(models.Mouvement).filter(
+        cast(models.Mouvement.date, SADate) == aujourd_hui,
+        models.Mouvement.montant_debit > 0
+    ).order_by(models.Mouvement.date.desc()).all()
+
+    total = sum(float(p.montant_debit or 0) for p in paiements)
+
+    return {
+        "paiements": [
+            {
+                "id": p.id,
+                "patient_id": p.patient_id,
+                "service": p.description,
+                "montant": float(p.montant_debit or 0),
+                "mode_paiement": p.mode_paiement or "especes",
+                "recu_numero": p.numero_piece,
+                "date": str(p.date),
+            } for p in paiements
+        ],
+        "total": total,
+        "nb_transactions": len(paiements),
+        "date": str(aujourd_hui),
+    }
+
+
+@router.post("/caissier/nouveau-patient", status_code=201, tags=["Caissier"])
+async def creer_nouveau_patient_caissier(data: dict, request: Request,
+                                          db: Session = Depends(get_db),
+                                          current_user=Depends(get_current_user)):
+    """Caissier crée un nouveau patient avec ID unique"""
+    import uuid as uuid_lib3
+    
+    nom    = data.get("nom", "").upper().strip()
+    prenom = data.get("prenom", "").strip()
+    if not nom or not prenom:
+        raise HTTPException(422, "Nom et prénom requis")
+
+    # Generate short readable ID
+    count = db.query(models.Patient).count()
+    numero = f"#RB-{(count + 1):04d}"
+
+    patient = models.Patient(
+        nom=nom, prenom=prenom,
+        age=data.get("age"),
+        adresse=data.get("adresse", ""),
+        telephone=data.get("telephone", ""),
+        email=data.get("email", ""),
+        contact_urgence=data.get("contact_urgence", ""),
+        numero=numero,
+        is_premiere_visite=data.get("is_premiere_visite", True),
+    )
+    db.add(patient); db.commit(); db.refresh(patient)
+
+    log_audit(db, "PATIENT_CREE",
+              actor_id=current_user.id, actor_role="caissier",
+              target_id=numero, target_type="patient",
+              ip_address=request.client.host if request.client else None,
+              details=f"Nouveau patient: {prenom} {nom}", retention_ans=5)
+
+    return {"message": "Patient créé", "patient": {
+        "id": patient.id, "nom": f"{prenom} {nom}", "numero": numero,
+        "telephone": patient.telephone,
+    }}
+
+
+
+@router.post("/caissier/decaissement", status_code=201, tags=["Caissier"])
+async def enregistrer_decaissement(data: dict, request: Request,
+                                    db: Session = Depends(get_db),
+                                    current_user=Depends(get_current_user)):
+    """Caissier enregistre une dépense/décaissement journalier"""
+    description = data.get("description", "").strip()
+    montant = float(data.get("montant", 0))
+    categorie = data.get("categorie", "autre")
+
+    if not description or montant <= 0:
+        raise HTTPException(422, "Description et montant requis")
+
+    import uuid as u_lib
+    piece = f"DEC-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(u_lib.uuid4())[:6].upper()}"
+
+    dec = models.Mouvement(
+        numero_piece=piece,
+        description=f"[DÉCAISSEMENT — {categorie.upper()}] {description}",
+        montant_credit=montant,
+        mode_paiement="especes",
+    )
+    db.add(dec); db.commit(); db.refresh(dec)
+
+    log_audit(db, "DECAISSEMENT_ENREGISTRE",
+              actor_id=current_user.id, actor_role="caissier",
+              target_id=piece, target_type="mouvement",
+              ip_address=request.client.host if request.client else None,
+              details=f"{description}: {montant} HTG",
+              result="succes", retention_ans=7)
+
+    return {
+        "id": dec.id,
+        "description": description,
+        "montant": montant,
+        "categorie": categorie,
+        "numero_piece": piece,
+        "date": str(datetime.now(timezone.utc).date()),
+    }
+
+
 def _seed_regles(db: Session):
     if db.query(models.ReglePartage).count() > 0: return
     regles = [
@@ -2150,11 +2631,28 @@ async def get_dossier_medecin(dossier_id: int, request: Request,
                                current_user=Depends(get_current_user)):
     """
     Accès médecin au dossier patient.
-    RÈGLES CRITIQUES :
+    RÈGLES CRITIQUES (SPEC §5.3) :
     - Paiement effectué requis
     - Signes vitaux saisis par infirmier requis
+    - DENTISTE / OPTOMÉTRISTE / PHYSIOTHÉRAPEUTE → accès INTERDIT au dossier complet
     - Journal d'audit systématique
     """
+    # ── RESTRICTION SPÉCIALITÉS (CRITIQUE) ────────────────────────────────
+    SPECIALITES_SANS_ACCES = [
+        'dentisterie', 'dentiste', 'optometrie', 'optométrie',
+        'physiotherapie', 'physiothérapie',
+    ]
+    user_spec = (current_user.specialite or '').lower().strip()
+    if any(s in user_spec for s in SPECIALITES_SANS_ACCES):
+        log_audit(db, "ACCES_DOSSIER_REFUSE_SPECIALITE",
+                  actor_id=current_user.id, actor_role=str(current_user.role),
+                  target_id=str(dossier_id), result="echec",
+                  details=f"Spécialité {current_user.specialite} non autorisée — accès dossier interdit",
+                  ip_address=request.client.host if request.client else None)
+        raise HTTPException(403,
+            f"Accès refusé — Les {current_user.specialite}s n'ont pas accès au dossier médical complet. "
+            "Contactez un médecin pour une recommandation.")
+
     dossier = db.query(models.DossierPatient).filter(models.DossierPatient.id == dossier_id).first()
     if not dossier:
         raise HTTPException(404, "Dossier introuvable")

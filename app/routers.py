@@ -261,8 +261,31 @@ async def create_specialiste(data: schemas.SpecialisteCreate, db: Session = Depe
 async def update_specialiste(sid: int, data: schemas.SpecialisteUpdate, db: Session = Depends(get_db), _=Depends(require_admin)):
     s = db.query(models.Specialiste).filter(models.Specialiste.id == sid).first()
     if not s: raise HTTPException(404)
-    for k, v in data.model_dump(exclude_none=True).items(): setattr(s, k, v)
-    db.commit(); db.refresh(s); return s
+    
+    old_nom = s.nom
+    update_data = data.model_dump(exclude_none=True)
+    for k, v in update_data.items(): setattr(s, k, v)
+    db.commit(); db.refresh(s)
+    
+    # ── PROPAGATION: sync TarifMedecin if name changed ──────────────────
+    if 'nom' in update_data and update_data['nom'] != old_nom:
+        tarif = db.query(models.TarifMedecin).filter(
+            models.TarifMedecin.nom_medecin == old_nom
+        ).first()
+        if tarif:
+            tarif.nom_medecin = update_data['nom']
+            if 'specialite' in update_data:
+                tarif.specialite = update_data['specialite']
+            db.commit()
+    
+    # ── PROPAGATION: sync User table if email or specialite changed ─────
+    if 'email' in update_data or 'specialite' in update_data:
+        user = db.query(models.User).filter(models.User.email == s.email).first()
+        if user:
+            if 'specialite' in update_data: user.specialite = update_data['specialite']
+            db.commit()
+    
+    return s
 
 @router.delete("/admin/specialistes/{sid}", tags=["Admin"])
 async def delete_specialiste(sid: int, db: Session = Depends(get_db), _=Depends(require_admin)):

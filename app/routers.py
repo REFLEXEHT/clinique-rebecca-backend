@@ -2393,43 +2393,176 @@ async def creer_nouveau_patient_caissier(data: dict, request: Request,
 
 
 
-@router.post("/caissier/decaissement", status_code=201, tags=["Caissier"])
-async def enregistrer_decaissement(data: dict, request: Request,
-                                    db: Session = Depends(get_db),
-                                    current_user=Depends(get_current_user)):
-    """Caissier enregistre une dépense/décaissement journalier"""
-    description = data.get("description", "").strip()
-    montant = float(data.get("montant", 0))
-    categorie = data.get("categorie", "autre")
-
-    if not description or montant <= 0:
-        raise HTTPException(422, "Description et montant requis")
-
-    import uuid as u_lib
-    piece = f"DEC-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(u_lib.uuid4())[:6].upper()}"
-
-    dec = models.Mouvement(
-        numero_piece=piece,
-        description=f"[DÉCAISSEMENT — {categorie.upper()}] {description}",
-        montant_credit=montant,
-        mode_paiement="especes",
+@router.post("/caissier/depense", status_code=201, tags=["Caissier"])
+async def enregistrer_depense(data: dict, request: Request,
+                               db: Session = Depends(get_db),
+                               current_user=Depends(get_current_user)):
+    """Enregistre une dépense/décaissement journalier"""
+    import uuid as uid2
+    num = f"DEP-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(uid2.uuid4())[:6].upper()}"
+    
+    mouvement = models.Mouvement(
+        numero_piece=num,
+        description=f"[{data.get('categorie','')}] {data.get('description','')}",
+        montant_credit=float(data.get('montant', 0)),
+        mode_paiement=data.get('mode','especes'),
     )
-    db.add(dec); db.commit(); db.refresh(dec)
-
-    log_audit(db, "DECAISSEMENT_ENREGISTRE",
+    db.add(mouvement); db.commit()
+    
+    log_audit(db, "DEPENSE_ENREGISTREE",
               actor_id=current_user.id, actor_role="caissier",
-              target_id=piece, target_type="mouvement",
-              ip_address=request.client.host if request.client else None,
-              details=f"{description}: {montant} HTG",
-              result="succes", retention_ans=7)
-
+              target_id=num, details=f"{data.get('categorie')}: {data.get('montant')} HTG",
+              retention_ans=7)
+    
     return {
-        "id": dec.id,
-        "description": description,
-        "montant": montant,
-        "categorie": categorie,
-        "numero_piece": piece,
-        "date": str(datetime.now(timezone.utc).date()),
+        "id": mouvement.id, "numero_piece": num,
+        "categorie": data.get('categorie'), "description": data.get('description'),
+        "montant": float(data.get('montant',0)), "mode": data.get('mode')
+    }
+
+
+@router.get("/caissier/depenses-jour", tags=["Caissier"])
+async def depenses_du_jour(db: Session = Depends(get_db),
+                            current_user=Depends(get_current_user)):
+    """Dépenses/décaissements du jour"""
+    from sqlalchemy import cast, Date as SADate
+    aujourd_hui = datetime.now(timezone.utc).date()
+    
+    depenses = db.query(models.Mouvement).filter(
+        cast(models.Mouvement.date, SADate) == aujourd_hui,
+        models.Mouvement.montant_credit > 0
+    ).order_by(models.Mouvement.date.desc()).all()
+    
+    total = sum(float(d.montant_credit or 0) for d in depenses)
+    
+    return {
+        "depenses": [
+            {"id":d.id, "description":d.description, "montant":float(d.montant_credit or 0),
+             "mode":d.mode_paiement or 'especes', "categorie": (d.description or '').split(']')[0].replace('[','')}
+            for d in depenses
+        ],
+        "total": total
+    }
+
+
+@router.get("/medecin/certificat/{patient_id}", tags=["Médecin"])
+async def get_dernier_certificat(patient_id: int, db: Session = Depends(get_db),
+                                  current_user=Depends(get_current_user)):
+    """Récupère le dernier certificat médical signé pour un patient"""
+    dossier = db.query(models.DossierPatient).filter(
+        models.DossierPatient.patient_id == patient_id,
+        models.DossierPatient.statut == models.StatutDossierEnum.termine
+    ).order_by(models.DossierPatient.date_visite.desc()).first()
+    
+    if not dossier:
+        raise HTTPException(404, "Aucun certificat disponible")
+    
+    medecin = db.query(models.User).filter(models.User.id == dossier.medecin_id).first() if dossier.medecin_id else None
+    
+    return {
+        "medecin_nom": medecin.nom if medecin else None,
+        "specialite": medecin.specialite if medecin else None,
+        "contenu": dossier.notes or "",
+        "date": str(dossier.date_visite)
+    }
+
+
+@router.post("/medecin/recommander-avec-resume/{dossier_id}", tags=["Médecin"])
+async def recommander_avec_resume_ia(dossier_id: int, data: dict,
+                                      db: Session = Depends(get_db),
+                                      current_user=Depends(get_current_user)):
+    """
+    Médecin recommande vers un spécialiste (physio/dentiste/optométriste).
+    L'IA génère un résumé limité pour le spécialiste — PAS le dossier complet.
+    Le spécialiste n'aura accès QU'à ce résumé.
+    """
+    dossier = db.query(models.DossierPatient).filter(
+        models.DossierPatient.id == dossier_id).first()
+    if not dossier:
+        raise HTTPException(404, "Dossier introuvable")
+    
+    specialiste_cible = data.get("specialiste_cible", "")
+    motif = data.get("motif", "")
+    
+    # Récupérer contexte minimal pour le résumé IA
+    patient = db.query(models.Patient).filter(
+        models.Patient.id == dossier.patient_id).first()
+    
+    sv = db.query(models.SignesVitaux).filter(
+        models.SignesVitaux.dossier_id == dossier_id
+    ).order_by(models.SignesVitaux.created_at.desc()).first()
+    
+    # Le résumé IA sera limité: motif de recommandation + points essentiels UNIQUEMENT
+    resume_context = {
+        "motif_recommandation": motif,
+        "specialite_cible": specialiste_cible,
+        "medecin_referent": current_user.nom,
+        "signes_vitaux_recents": {
+            "tension": f"{sv.tension_systolique}/{sv.tension_diastolique}" if sv else None,
+            "temperature": sv.temperature if sv else None,
+        } if sv else {},
+        "type_visite": dossier.type_visite,
+    }
+    
+    # Enregistrer la recommandation
+    geste = models.GesteMedical(
+        dossier_id=dossier_id,
+        type_geste="RECOMMANDATION",
+        description=f"Recommandation vers {specialiste_cible} — Motif: {motif}",
+        notes=f"Résumé IA disponible pour {specialiste_cible}",
+        medecin_id=current_user.id,
+    )
+    db.add(geste)
+    
+    log_audit(db, "RECOMMANDATION_EMISE",
+              actor_id=current_user.id, actor_role=str(current_user.role),
+              target_id=str(dossier_id), target_type="dossier",
+              details=f"→ {specialiste_cible}: {motif}", retention_ans=5)
+    db.commit()
+    
+    return {
+        "message": f"Recommandation vers {specialiste_cible} enregistrée",
+        "dossier_id": dossier_id,
+        "specialiste": specialiste_cible,
+        "motif": motif,
+        "resume_context": resume_context,  # Le frontend utilisera ça pour générer le résumé IA
+    }
+
+
+@router.get("/specialiste/ma-recommandation/{dossier_id}", tags=["Spécialistes"])
+async def get_recommandation_specialiste(dossier_id: int,
+                                          db: Session = Depends(get_db),
+                                          current_user=Depends(get_current_user)):
+    """
+    Physio/Dentiste/Optométriste voit UNIQUEMENT le résumé de recommandation.
+    PAS le dossier complet.
+    """
+    SPECIALITES_LIMITEES = ['dentisterie','dentiste','optometrie','optométrie','physiotherapie','physiothérapie']
+    user_spec = (current_user.specialite or '').lower()
+    
+    if not any(s in user_spec for s in SPECIALITES_LIMITEES):
+        raise HTTPException(403, "Endpoint réservé aux spécialistes avec accès limité")
+    
+    # Récupérer uniquement la recommandation, pas le dossier
+    rec = db.query(models.GesteMedical).filter(
+        models.GesteMedical.dossier_id == dossier_id,
+        models.GesteMedical.type_geste == "RECOMMANDATION"
+    ).order_by(models.GesteMedical.created_at.desc()).first()
+    
+    if not rec:
+        raise HTTPException(404, "Aucune recommandation trouvée pour ce dossier")
+    
+    log_audit(db, "RECOMMANDATION_CONSULTEE_SPECIALISTE",
+              actor_id=current_user.id, actor_role=str(current_user.role),
+              target_id=str(dossier_id), result="succes",
+              details=f"Spécialiste {current_user.specialite} — résumé uniquement")
+    
+    return {
+        "recommandation": rec.description,
+        "date": str(rec.created_at),
+        "notes": rec.notes,
+        "acces": "resume_uniquement",
+        "avertissement": "Vous n'avez accès qu'au résumé de recommandation. Le dossier médical complet n'est pas accessible."
     }
 
 

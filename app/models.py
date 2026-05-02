@@ -158,6 +158,7 @@ class User(Base):
     specialite      = Column(String(255))
     type_medecin    = Column(Enum(TypeMedecinEnum), nullable=True)
     is_active       = Column(Boolean, default=True)
+    signature_image = Column(Text, nullable=True)  # base64 PNG — médecin uniquement
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -2594,6 +2594,52 @@ async def get_recommandation_specialiste(dossier_id: int,
 # PARCOURS PATIENT AMÉLIORÉ
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIGNATURE MÉDECIN — accès strictement réservé au médecin lui-même
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.put("/medecin/ma-signature", tags=["Médecin"])
+async def enregistrer_signature(data: dict, request: Request,
+                                 db: Session = Depends(get_db),
+                                 current_user=Depends(get_current_user)):
+    """Médecin enregistre sa propre signature (PNG base64). Accès strictement limité au médecin lui-même."""
+    if str(current_user.role) != 'medecin':
+        raise HTTPException(403, "Seul un médecin peut enregistrer sa signature")
+    signature_b64 = data.get("signature", "")
+    if not signature_b64.startswith("data:image/png;base64,"):
+        raise HTTPException(422, "Format invalide — PNG base64 requis")
+    current_user.signature_image = signature_b64
+    db.commit()
+    log_audit(db, "SIGNATURE_ENREGISTREE", actor_id=current_user.id,
+              actor_role="medecin", target_id=str(current_user.id), retention_ans=10)
+    return {"message": "Signature enregistrée"}
+
+
+@router.get("/medecin/ma-signature", tags=["Médecin"])
+async def get_ma_signature(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """Médecin récupère SA PROPRE signature — aucun autre rôle n'y a accès."""
+    if str(current_user.role) != 'medecin':
+        raise HTTPException(403, "Réservé au médecin")
+    if not current_user.signature_image:
+        return {"signature": None}
+    log_audit(db, "SIGNATURE_CONSULTEE", actor_id=current_user.id,
+              actor_role="medecin", target_id=str(current_user.id), retention_ans=5)
+    return {"signature": current_user.signature_image, "medecin_nom": current_user.nom}
+
+
+@router.delete("/medecin/ma-signature", tags=["Médecin"])
+async def supprimer_signature(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """Médecin supprime sa propre signature."""
+    if str(current_user.role) != 'medecin':
+        raise HTTPException(403, "Réservé au médecin")
+    current_user.signature_image = None
+    db.commit()
+    log_audit(db, "SIGNATURE_SUPPRIMEE", actor_id=current_user.id,
+              actor_role="medecin", target_id=str(current_user.id), retention_ans=10)
+    return {"message": "Signature supprimée"}
+
+
 @router.post("/rdv/confirmer/{rdv_id}", tags=["RDV"])
 async def confirmer_rdv(rdv_id: int, request: Request,
                          db: Session = Depends(get_db),

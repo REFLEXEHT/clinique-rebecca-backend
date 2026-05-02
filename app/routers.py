@@ -3242,31 +3242,70 @@ async def modifier_resultat(rid: int, data: dict, request: Request,
 
 @router.get("/patient/mon-dossier", tags=["Patient"])
 async def mon_dossier(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    """Le patient voit uniquement son propre dossier — jamais celui d'un autre."""
+    """
+    Le patient voit l'intégralité de ses données médicales personnelles.
+    - Toutes ses visites avec diagnostic et notes
+    - Toutes ses prescriptions (actives + historique)
+    - Tous ses résultats de laboratoire
+    - Ses RDV à venir et passés
+    - Son profil patient (nom, téléphone, email, #ID)
+    """
     patient = db.query(models.Patient).filter(
         models.Patient.email == current_user.email
     ).first()
     if not patient:
-        return {"message": "Aucun dossier trouvé", "dossiers": []}
+        return {"message": "Aucun dossier trouvé", "dossiers": [], "rdv": []}
 
+    # Toutes les visites (sans limite)
     dossiers = db.query(models.DossierPatient).filter(
         models.DossierPatient.patient_id == patient.id
-    ).order_by(models.DossierPatient.date_visite.desc()).limit(10).all()
+    ).order_by(models.DossierPatient.date_visite.desc()).all()
 
-    prescriptions = db.query(models.Prescription).filter(
+    # Prescriptions actives (90 jours)
+    from datetime import timedelta
+    seuil_90j = datetime.now(timezone.utc) - timedelta(days=90)
+    prescriptions_actives = db.query(models.Prescription).filter(
         models.Prescription.patient_id == patient.id,
-        models.Prescription.statut == "active"
-    ).all()
+        models.Prescription.date_prescription >= seuil_90j,
+    ).order_by(models.Prescription.date_prescription.desc()).all()
 
+    # Toutes les prescriptions historique
+    prescriptions_historique = db.query(models.Prescription).filter(
+        models.Prescription.patient_id == patient.id,
+        models.Prescription.date_prescription < seuil_90j,
+    ).order_by(models.Prescription.date_prescription.desc()).limit(20).all()
+
+    # Tous les résultats labo (sans limite)
     resultats = db.query(models.ResultatLabo).filter(
         models.ResultatLabo.patient_id == str(patient.id)
-    ).order_by(models.ResultatLabo.date_examen.desc()).limit(10).all()
+    ).order_by(models.ResultatLabo.date_examen.desc()).all()
+
+    # RDV passés et à venir
+    rdv_a_venir = db.query(models.RendezVous).filter(
+        models.RendezVous.patient_email == current_user.email,
+        models.RendezVous.date_rdv >= datetime.now(timezone.utc),
+    ).order_by(models.RendezVous.date_rdv).all()
+
+    rdv_passes = db.query(models.RendezVous).filter(
+        models.RendezVous.patient_email == current_user.email,
+        models.RendezVous.date_rdv < datetime.now(timezone.utc),
+    ).order_by(models.RendezVous.date_rdv.desc()).limit(20).all()
+
+    # Médecins consultés (unique, depuis les dossiers)
+    medecins_ids = list({d.medecin_id for d in dossiers if d.medecin_id})
+    medecins = db.query(models.User).filter(models.User.id.in_(medecins_ids)).all() if medecins_ids else []
 
     return {
         "patient": patient,
-        "dossiers": dossiers,
-        "prescriptions_actives": prescriptions,
-        "resultats_labo": resultats,
+        "numero_patient": patient.numero,
+        "dossiers": dossiers,                          # Toutes les visites
+        "nb_visites": len(dossiers),
+        "prescriptions_actives": prescriptions_actives,    # 90 derniers jours
+        "prescriptions_historique": prescriptions_historique,  # Archives
+        "resultats_labo": resultats,                   # Tous les résultats
+        "rdv_a_venir": rdv_a_venir,                   # Prochains RDV
+        "rdv_passes": rdv_passes,                      # Historique RDV
+        "medecins_consultes": [{"nom": m.nom, "specialite": m.specialite, "email": m.email} for m in medecins],
     }
 
 

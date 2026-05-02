@@ -2827,6 +2827,83 @@ async def initiation_rdv_physique(rdv_id: int, data: dict, request: Request,
     }
 
 
+@router.get("/medecin/dossier-par-patient/{patient_numero}", tags=["Médecin"])
+async def get_dossier_par_patient_numero(patient_numero: str, request: Request,
+                                          db: Session = Depends(get_db),
+                                          current_user=Depends(get_current_user)):
+    """
+    Médecin cherche un dossier directement par numéro patient (#RB-XXXX).
+    Utilisé quand le patient se présente avec son ID sans rendez-vous préalable.
+    Retourne le dossier ACTIF en attente_medecin pour ce patient.
+    """
+    if str(current_user.role) != 'medecin':
+        raise HTTPException(403, "Réservé aux médecins")
+
+    patient = db.query(models.Patient).filter(
+        models.Patient.numero == patient_numero.strip().upper()
+    ).first()
+    if not patient:
+        raise HTTPException(404, f"Patient {patient_numero} introuvable")
+
+    # Chercher dossier actif (payé + signes vitaux saisis + attente médecin)
+    dossier = db.query(models.DossierPatient).filter(
+        models.DossierPatient.patient_id == patient.id,
+        models.DossierPatient.paiement_effectue == True,
+        models.DossierPatient.statut == models.StatutDossierEnum.attente_medecin
+    ).order_by(models.DossierPatient.date_visite.desc()).first()
+
+    if not dossier:
+        # Check if dossier exists but not ready yet
+        dossier_any = db.query(models.DossierPatient).filter(
+            models.DossierPatient.patient_id == patient.id,
+            models.DossierPatient.paiement_effectue == True,
+        ).order_by(models.DossierPatient.date_visite.desc()).first()
+
+        if dossier_any:
+            statut = str(dossier_any.statut)
+            if statut == 'attente_infirmier':
+                raise HTTPException(403, f"Dossier {patient_numero} en attente de signes vitaux (infirmière)")
+            elif statut == 'termine':
+                raise HTTPException(404, f"Aucun dossier actif pour {patient_numero} — dernière consultation terminée")
+            else:
+                raise HTTPException(404, f"Dossier {patient_numero} non disponible (statut: {statut})")
+        else:
+            raise HTTPException(404, f"Aucun dossier actif pour {patient_numero}. Le patient doit d'abord payer à la caisse.")
+
+    # Vérifier restrictions spécialités
+    SPECIALITES_SANS_ACCES = ['dentisterie', 'dentiste', 'optometrie', 'optométrie', 'physiotherapie', 'physiothérapie']
+    user_spec = (current_user.specialite or '').lower()
+    if any(s in user_spec for s in SPECIALITES_SANS_ACCES):
+        raise HTTPException(403, f"Les {current_user.specialite}s n'ont pas accès au dossier médical complet")
+
+    sv = db.query(models.SignesVitaux).filter(
+        models.SignesVitaux.dossier_id == dossier.id
+    ).order_by(models.SignesVitaux.created_at.desc()).first()
+
+    prescriptions = db.query(models.Prescription).filter(
+        models.Prescription.patient_id == patient.id
+    ).order_by(models.Prescription.date_prescription.desc()).limit(10).all()
+
+    resultats = db.query(models.ResultatLabo).filter(
+        models.ResultatLabo.patient_id == str(patient.id)
+    ).order_by(models.ResultatLabo.date_examen.desc()).limit(10).all()
+
+    log_audit(db, "DOSSIER_CONSULTE_PAR_ID",
+              actor_id=current_user.id, actor_role="medecin",
+              target_id=patient_numero, target_type="patient",
+              ip_address=request.client.host if request.client else None,
+              details=f"Accès direct par ID patient — Dossier #{dossier.id}",
+              retention_ans=5)
+
+    return {
+        "dossier": dossier,
+        "patient": patient,
+        "signes_vitaux": sv,
+        "prescriptions_anterieures": prescriptions,
+        "resultats_labo": resultats,
+    }
+
+
 def _seed_regles(db: Session):
     if db.query(models.ReglePartage).count() > 0: return
     regles = [

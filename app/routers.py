@@ -3243,69 +3243,104 @@ async def modifier_resultat(rid: int, data: dict, request: Request,
 @router.get("/patient/mon-dossier", tags=["Patient"])
 async def mon_dossier(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     """
-    Le patient voit l'intégralité de ses données médicales personnelles.
-    - Toutes ses visites avec diagnostic et notes
-    - Toutes ses prescriptions (actives + historique)
-    - Tous ses résultats de laboratoire
-    - Ses RDV à venir et passés
-    - Son profil patient (nom, téléphone, email, #ID)
+    CONFIDENTIALITÉ STRICTE — Le dossier appartient à la clinique.
+    Le patient voit UNIQUEMENT :
+    - Son identité et numéro patient
+    - Ses RDV (passés et à venir) avec statut et lien vidéo
+    - Ses résultats de laboratoire (type + résultats bruts, sans interprétation)
+    - Ses prescriptions actives (liste de médicaments uniquement)
+    - Un TRÈS BREF résumé de visite généré par IA (pas de diagnostic précis)
+    PAS de diagnostic complet, pas de notes médecin, pas d'examen clinique détaillé.
     """
     patient = db.query(models.Patient).filter(
         models.Patient.email == current_user.email
     ).first()
     if not patient:
-        return {"message": "Aucun dossier trouvé", "dossiers": [], "rdv": []}
+        return {"message": "Aucun dossier trouvé", "visites": [], "rdv_a_venir": [], "rdv_passes": []}
 
-    # Toutes les visites (sans limite)
-    dossiers = db.query(models.DossierPatient).filter(
+    # Résumé des visites — SEULEMENT date + spécialité + statut + nb prescriptions
+    # PAS de diagnostic précis, PAS d'examen clinique, PAS de notes médecin
+    dossiers_raw = db.query(models.DossierPatient).filter(
         models.DossierPatient.patient_id == patient.id
     ).order_by(models.DossierPatient.date_visite.desc()).all()
 
-    # Prescriptions actives (90 jours)
+    visites_resumees = [
+        {
+            "id": d.id,
+            "date_visite": str(d.date_visite),
+            "specialite": d.specialite or d.type_visite,
+            "statut": str(d.statut),
+            "service": d.service,
+            # Résumé IA très court (1 phrase, sans diagnostic précis)
+            # Généré côté frontend via Anthropic API
+            # On envoie SEULEMENT la spécialité et le service, pas le diagnostic
+            "contexte_visite": f"{d.specialite or 'Consultation'} — {d.service or 'Clinique'}",
+        }
+        for d in dossiers_raw
+    ]
+
+    # Prescriptions actives : liste des médicaments uniquement (90 jours)
     from datetime import timedelta
-    seuil_90j = datetime.now(timezone.utc) - timedelta(days=90)
-    prescriptions_actives = db.query(models.Prescription).filter(
+    seuil = datetime.now(timezone.utc) - timedelta(days=90)
+    prescriptions_raw = db.query(models.Prescription).filter(
         models.Prescription.patient_id == patient.id,
-        models.Prescription.date_prescription >= seuil_90j,
+        models.Prescription.date_prescription >= seuil,
     ).order_by(models.Prescription.date_prescription.desc()).all()
 
-    # Toutes les prescriptions historique
-    prescriptions_historique = db.query(models.Prescription).filter(
-        models.Prescription.patient_id == patient.id,
-        models.Prescription.date_prescription < seuil_90j,
-    ).order_by(models.Prescription.date_prescription.desc()).limit(20).all()
+    prescriptions_patient = [
+        {
+            "date": str(p.date_prescription),
+            "medicaments": p.medicaments,  # Liste de médicaments seulement
+            "medecin_nom": p.medecin_nom,
+            # PAS d'examens_requis ni de notes_prescription
+        }
+        for p in prescriptions_raw
+    ]
 
-    # Tous les résultats labo (sans limite)
-    resultats = db.query(models.ResultatLabo).filter(
+    # Résultats labo : type d'examen + résultats bruts (sans interprétation médicale)
+    resultats_raw = db.query(models.ResultatLabo).filter(
         models.ResultatLabo.patient_id == str(patient.id)
-    ).order_by(models.ResultatLabo.date_examen.desc()).all()
+    ).order_by(models.ResultatLabo.date_examen.desc()).limit(20).all()
 
-    # RDV passés et à venir
+    resultats_patient = [
+        {
+            "date_examen": str(r.date_examen),
+            "type_examen": r.type_examen,
+            "resultats": r.resultats,  # Valeurs brutes uniquement
+            # PAS de notes médicales, PAS d'interprétation
+            "alerte_critique": r.alerte_critique,  # Booléen — alerte si critique
+        }
+        for r in resultats_raw
+    ]
+
+    # RDV à venir
     rdv_a_venir = db.query(models.RendezVous).filter(
         models.RendezVous.patient_email == current_user.email,
         models.RendezVous.date_rdv >= datetime.now(timezone.utc),
     ).order_by(models.RendezVous.date_rdv).all()
 
+    # RDV passés (résumé — 12 derniers mois seulement)
     rdv_passes = db.query(models.RendezVous).filter(
         models.RendezVous.patient_email == current_user.email,
         models.RendezVous.date_rdv < datetime.now(timezone.utc),
+        models.RendezVous.date_rdv >= datetime.now(timezone.utc) - timedelta(days=365),
     ).order_by(models.RendezVous.date_rdv.desc()).limit(20).all()
 
-    # Médecins consultés (unique, depuis les dossiers)
-    medecins_ids = list({d.medecin_id for d in dossiers if d.medecin_id})
-    medecins = db.query(models.User).filter(models.User.id.in_(medecins_ids)).all() if medecins_ids else []
-
     return {
-        "patient": patient,
+        "patient": {
+            "nom": patient.nom,
+            "email": patient.email,
+            "telephone": patient.telephone,
+            "numero": patient.numero,
+            "created_at": str(patient.created_at) if hasattr(patient, 'created_at') else None,
+        },
         "numero_patient": patient.numero,
-        "dossiers": dossiers,                          # Toutes les visites
-        "nb_visites": len(dossiers),
-        "prescriptions_actives": prescriptions_actives,    # 90 derniers jours
-        "prescriptions_historique": prescriptions_historique,  # Archives
-        "resultats_labo": resultats,                   # Tous les résultats
-        "rdv_a_venir": rdv_a_venir,                   # Prochains RDV
-        "rdv_passes": rdv_passes,                      # Historique RDV
-        "medecins_consultes": [{"nom": m.nom, "specialite": m.specialite, "email": m.email} for m in medecins],
+        "nb_visites": len(dossiers_raw),
+        "visites": visites_resumees,           # Résumé sans données médicales précises
+        "prescriptions_actives": prescriptions_patient,  # Médicaments seulement (90j)
+        "resultats_labo": resultats_patient,   # Valeurs brutes sans interprétation
+        "rdv_a_venir": rdv_a_venir,
+        "rdv_passes": rdv_passes,
     }
 
 

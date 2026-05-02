@@ -38,10 +38,13 @@ class RoleEnum(str, enum.Enum):
 
 
 class StatutRDVEnum(str, enum.Enum):
-    en_attente = "en_attente"
-    confirme   = "confirme"
-    annule     = "annule"
-    termine    = "termine"
+    en_attente           = "en_attente"
+    paiement_requis      = "paiement_requis"
+    paiement_effectue    = "paiement_effectue"
+    confirme             = "confirme"
+    propose_autre_moment = "propose_autre_moment"
+    annule               = "annule"
+    termine              = "termine"
 
 
 class TypeRDVEnum(str, enum.Enum):
@@ -243,7 +246,11 @@ class RendezVous(Base):
     medecin_email      = Column(String(255))
     date_rdv           = Column(DateTime(timezone=True), nullable=False)
     type_rdv           = Column(Enum(TypeRDVEnum), default=TypeRDVEnum.presentiel)
-    statut             = Column(Enum(StatutRDVEnum), default=StatutRDVEnum.en_attente)
+    statut               = Column(Enum(StatutRDVEnum), default=StatutRDVEnum.en_attente)
+    confirme_par         = Column(Integer, nullable=True)
+    confirme_par_role    = Column(String(20), nullable=True)
+    autre_moment_propose = Column(String(50), nullable=True)
+    autre_moment_message = Column(String(500), nullable=True)
     motif              = Column(Text)
     notes_admin        = Column(Text)
     mode_paiement      = Column(String(50))

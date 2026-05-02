@@ -2589,6 +2589,244 @@ async def get_recommandation_specialiste(dossier_id: int,
     }
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PARCOURS PATIENT AMÉLIORÉ
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/rdv/confirmer/{rdv_id}", tags=["RDV"])
+async def confirmer_rdv(rdv_id: int, request: Request,
+                         db: Session = Depends(get_db),
+                         current_user=Depends(get_current_user)):
+    """
+    Caissier OU médecin confirme un RDV.
+    - Caissier confirme après accord verbal avec le médecin
+    - Médecin confirme directement depuis son dashboard
+    Dans les deux cas: notification au patient + enregistrement dans registre
+    """
+    rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
+    if not rdv:
+        raise HTTPException(404, "RDV introuvable")
+
+    role = str(current_user.role)
+    if role not in ("caissier", "medecin", "admin"):
+        raise HTTPException(403, "Seul un caissier, médecin ou admin peut confirmer un RDV")
+
+    ancien_statut = str(rdv.statut)
+    rdv.statut = models.StatutRDVEnum.confirme
+    rdv.confirme_par = current_user.id
+    rdv.confirme_par_role = role
+
+    # Si vidéo → générer lien Jitsi
+    if str(rdv.type_rdv) == "video" and not rdv.lien_video:
+        numero = rdv.numero_rdv or f"rdv{rdv.id}"
+        rdv.lien_video = f"https://meet.jit.si/clinique-rebecca-{numero}"
+
+    db.commit()
+
+    log_audit(db, "RDV_CONFIRME",
+              actor_id=current_user.id, actor_role=role,
+              target_id=str(rdv_id),
+              details=f"RDV {rdv.patient_nom} confirmé par {role} {current_user.nom}")
+
+    # Notifier le patient
+    rdv_data = {
+        "patient_nom": rdv.patient_nom,
+        "patient_telephone": rdv.patient_telephone,
+        "patient_email": rdv.patient_email,
+        "specialite": rdv.specialite,
+        "date_rdv": rdv.date_rdv,
+        "type_rdv": str(rdv.type_rdv),
+        "motif": rdv.motif,
+        "lien_video": rdv.lien_video,
+        "confirme_par": f"{role} — {current_user.nom}",
+    }
+    import asyncio
+    asyncio.create_task(notify_rdv_video_confirme(rdv_data))
+
+    return {
+        "message": "RDV confirmé",
+        "rdv_id": rdv_id,
+        "confirme_par_role": role,
+        "lien_video": rdv.lien_video,
+    }
+
+
+@router.post("/rdv/proposer-autre-moment/{rdv_id}", tags=["RDV"])
+async def proposer_autre_moment(rdv_id: int, data: dict,
+                                 db: Session = Depends(get_db),
+                                 current_user=Depends(get_current_user)):
+    """
+    Médecin propose un autre créneau si non disponible.
+    Le patient recevra une notification avec la suggestion.
+    """
+    rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
+    if not rdv:
+        raise HTTPException(404, "RDV introuvable")
+    if str(current_user.role) not in ("medecin", "caissier", "admin"):
+        raise HTTPException(403, "Accès refusé")
+
+    rdv.statut = models.StatutRDVEnum.propose_autre_moment
+    rdv.autre_moment_propose = data.get("nouveau_moment", "")
+    rdv.autre_moment_message = data.get("message", "Le médecin n'est pas disponible à cette date.")
+    db.commit()
+
+    log_audit(db, "RDV_AUTRE_MOMENT_PROPOSE",
+              actor_id=current_user.id, actor_role=str(current_user.role),
+              target_id=str(rdv_id),
+              details=f"Nouveau moment proposé: {data.get('nouveau_moment')}")
+
+    return {"message": "Proposition envoyée au patient", "nouveau_moment": data.get("nouveau_moment")}
+
+
+@router.post("/rdv/paiement-video/{rdv_id}", tags=["RDV"])
+async def confirmer_paiement_video(rdv_id: int, data: dict,
+                                    db: Session = Depends(get_db),
+                                    current_user=Depends(get_current_user)):
+    """
+    Pour consultation vidéo: enregistre le paiement en ligne.
+    Passe statut: paiement_requis → paiement_effectue
+    Déclenche demande de confirmation au médecin.
+    """
+    rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
+    if not rdv:
+        raise HTTPException(404, "RDV introuvable")
+    if str(rdv.type_rdv) != "video":
+        raise HTTPException(400, "Réservé aux consultations vidéo")
+
+    rdv.statut = models.StatutRDVEnum.paiement_effectue
+    rdv.reference_paiement = data.get("reference", "")
+    rdv.mode_paiement = data.get("mode", "moncash")
+    db.commit()
+
+    log_audit(db, "PAIEMENT_VIDEO_CONFIRME",
+              actor_id=current_user.id if current_user else 0,
+              actor_role="patient",
+              target_id=str(rdv_id),
+              details=f"Paiement vidéo: {data.get('mode')} — ref: {data.get('reference')}")
+
+    return {"message": "Paiement enregistré — confirmation en attente", "statut": "paiement_effectue"}
+
+
+@router.get("/registre-rdv", tags=["RDV"])
+async def registre_rdv(medecin_id: Optional[int] = None,
+                         jours: int = 30,
+                         db: Session = Depends(get_db),
+                         current_user=Depends(get_current_user)):
+    """
+    Registre de tous les RDV à venir.
+    - Caissier: voit tous les RDV (pour coordonner avec les médecins)
+    - Médecin: voit ses propres RDV
+    - Admin: voit tout + peut filtrer par médecin
+    """
+    from sqlalchemy import cast, Date as SADate
+    role = str(current_user.role)
+    aujourd = datetime.now(timezone.utc)
+    limite = aujourd + timedelta(days=jours)
+
+    q = db.query(models.RendezVous).filter(
+        models.RendezVous.date_rdv >= aujourd,
+        models.RendezVous.date_rdv <= limite,
+        models.RendezVous.statut.in_(["en_attente", "paiement_effectue", "confirme"])
+    )
+
+    if role == "medecin":
+        # Médecin voit ses RDV
+        q = q.filter(
+            (models.RendezVous.medecin_id == current_user.id) |
+            (models.RendezVous.specialite.ilike(f"%{current_user.specialite or ''}%"))
+        )
+    elif medecin_id and role == "admin":
+        q = q.filter(models.RendezVous.medecin_id == medecin_id)
+
+    rdvs = q.order_by(models.RendezVous.date_rdv).all()
+
+    return {
+        "rdvs": [
+            {
+                "id": r.id,
+                "patient_nom": r.patient_nom,
+                "patient_telephone": r.patient_telephone,
+                "specialite": r.specialite,
+                "medecin_nom": r.medecin_nom,
+                "date_rdv": str(r.date_rdv),
+                "type_rdv": str(r.type_rdv),
+                "statut": str(r.statut),
+                "motif": r.motif,
+                "confirme_par_role": r.confirme_par_role,
+                "lien_video": r.lien_video,
+                "autre_moment_propose": r.autre_moment_propose,
+            }
+            for r in rdvs
+        ],
+        "total": len(rdvs),
+        "periode_jours": jours,
+    }
+
+
+@router.post("/rdv/initiation-physique/{rdv_id}", tags=["RDV"])
+async def initiation_rdv_physique(rdv_id: int, data: dict, request: Request,
+                                    db: Session = Depends(get_db),
+                                    current_user=Depends(get_current_user)):
+    """
+    Pour RDV physique confirmé:
+    Le caissier crée le dossier patient et encaisse le paiement.
+    Retourne l'ID patient pour que l'infirmière puisse compléter.
+    """
+    if str(current_user.role) not in ("caissier", "admin"):
+        raise HTTPException(403, "Réservé au caissier")
+
+    rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
+    if not rdv:
+        raise HTTPException(404, "RDV introuvable")
+
+    # Trouver ou créer le patient
+    patient = db.query(models.Patient).filter(
+        models.Patient.telephone == rdv.patient_telephone
+    ).first()
+
+    if not patient:
+        count = db.query(models.Patient).count()
+        patient = models.Patient(
+            numero=f"#RB-{str(count+1).zfill(4)}",
+            nom=rdv.patient_nom,
+            telephone=rdv.patient_telephone,
+            email=rdv.patient_email or "",
+            created_by=current_user.id,
+        )
+        db.add(patient)
+        db.flush()
+
+    # Créer le dossier
+    dossier = models.DossierPatient(
+        patient_id=patient.id,
+        patient_numero=patient.numero,
+        type_visite="rdv" if rdv.statut == models.StatutRDVEnum.confirme else "premiere_consultation",
+        service="clinique",
+        specialite=rdv.specialite,
+        paiement_effectue=True,
+        statut=models.StatutDossierEnum.attente_infirmier,
+        motif_consultation=rdv.motif,
+        rdv_id=rdv.id,
+        created_by=current_user.id,
+    )
+    db.add(dossier)
+    rdv.statut = models.StatutRDVEnum.termine
+    db.commit()
+
+    log_audit(db, "RDV_PHYSIQUE_INITIE",
+              actor_id=current_user.id, actor_role="caissier",
+              target_id=str(rdv_id),
+              details=f"Patient {patient.numero} — Dossier créé")
+
+    return {
+        "message": "Dossier créé — patient peut voir l'infirmière",
+        "patient_id": patient.id,
+        "patient_numero": patient.numero,
+        "dossier_id": dossier.id,
+    }
+
+
 def _seed_regles(db: Session):
     if db.query(models.ReglePartage).count() > 0: return
     regles = [

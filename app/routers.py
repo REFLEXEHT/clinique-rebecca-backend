@@ -2640,6 +2640,244 @@ async def supprimer_signature(db: Session = Depends(get_db), current_user=Depend
     return {"message": "Signature supprimée"}
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOT DE PASSE OUBLIÉ — Reset en 3 étapes
+# ══════════════════════════════════════════════════════════════════════════════
+
+import secrets
+import hashlib
+from datetime import timedelta
+
+# Stockage en mémoire des tokens (en prod: Redis ou table DB)
+_reset_tokens: dict = {}  # {token_hash: {user_id, email, expires_at}}
+
+
+@router.post("/auth/mot-de-passe-oublie", tags=["Auth"])
+async def demander_reset(data: dict, db: Session = Depends(get_db)):
+    """
+    Étape 1 : L'utilisateur soumet son email.
+    - On cherche le compte (tous rôles)
+    - On génère un token sécurisé (6 chiffres + lien)
+    - On envoie par email
+    - IMPORTANT : on répond toujours 200 même si email inconnu (sécurité anti-énumération)
+    """
+    email = data.get("email", "").strip().lower()
+    if not email:
+        raise HTTPException(422, "Email obligatoire")
+
+    user = db.query(models.User).filter(
+        models.User.email == email
+    ).first()
+
+    # Toujours répondre 200 pour éviter l'énumération des comptes
+    if not user:
+        return {"message": "Si ce compte existe, un email de réinitialisation a été envoyé."}
+
+    if not user.is_active:
+        return {"message": "Si ce compte existe, un email de réinitialisation a été envoyé."}
+
+    # Générer token sécurisé
+    token_raw = secrets.token_urlsafe(32)
+    code_6    = str(secrets.randbelow(900000) + 100000)  # Code 6 chiffres
+    token_hash = hashlib.sha256(token_raw.encode()).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    _reset_tokens[token_hash] = {
+        "user_id": user.id,
+        "email": user.email,
+        "code": code_6,
+        "expires_at": expires_at,
+        "used": False,
+    }
+
+    # Envoyer email
+    from app.services.notifications import send_email
+    reset_link = f"https://clinique-rebecca-frontend.vercel.app/reset-password?token={token_raw}"
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px;">
+      <div style="text-align:center;margin-bottom:24px;">
+        <h2 style="color:#1641C8;margin:0;">Clinique de la Rebecca</h2>
+        <p style="color:#64748b;font-size:13px;">Réinitialisation de mot de passe</p>
+      </div>
+      <p style="color:#374151;">Bonjour <strong>{user.nom}</strong>,</p>
+      <p style="color:#374151;">Vous avez demandé à réinitialiser votre mot de passe.</p>
+
+      <div style="background:#f8fafc;border-radius:12px;padding:24px;text-align:center;margin:24px 0;border:1px solid #e2e8f0;">
+        <p style="color:#64748b;font-size:13px;margin:0 0 8px;">Votre code de vérification</p>
+        <div style="font-size:36px;font-weight:900;letter-spacing:8px;color:#1641C8;font-family:monospace;">{code_6}</div>
+        <p style="color:#94a3b8;font-size:12px;margin:8px 0 0;">Valide pendant 1 heure</p>
+      </div>
+
+      <div style="text-align:center;margin:20px 0;">
+        <p style="color:#64748b;font-size:13px;">ou cliquez sur ce lien :</p>
+        <a href="{reset_link}"
+           style="display:inline-block;background:linear-gradient(135deg,#1641C8,#0d9488);color:white;text-decoration:none;border-radius:10px;padding:12px 28px;font-weight:700;font-size:14px;">
+          Réinitialiser mon mot de passe
+        </a>
+      </div>
+
+      <div style="background:#fef2f2;border-radius:8px;padding:12px 16px;margin-top:24px;">
+        <p style="color:#dc2626;font-size:12px;margin:0;">
+          ⚠️ Si vous n'avez pas fait cette demande, ignorez cet email.
+          Votre mot de passe reste inchangé.
+        </p>
+      </div>
+
+      <p style="color:#94a3b8;font-size:11px;text-align:center;margin-top:24px;">
+        Clinique de la Rebecca · #44, Rue Rebecca, Pétion-Ville · (509) 4858-5757
+      </p>
+    </div>
+    """
+
+    import asyncio
+    asyncio.create_task(send_email(
+        to=user.email,
+        subject="Réinitialisation de votre mot de passe — Clinique de la Rebecca",
+        html_body=html
+    ))
+
+    log_audit(db, "RESET_PASSWORD_DEMANDE",
+              actor_id=user.id, actor_role=str(user.role),
+              target_id=str(user.id), retention_ans=2)
+
+    return {"message": "Si ce compte existe, un email de réinitialisation a été envoyé."}
+
+
+@router.post("/auth/verifier-code-reset", tags=["Auth"])
+async def verifier_code_reset(data: dict, db: Session = Depends(get_db)):
+    """
+    Étape 2 : Vérifier le code 6 chiffres ou le token URL.
+    Retourne un token de session pour l'étape 3.
+    """
+    email = data.get("email", "").strip().lower()
+    code  = data.get("code", "").strip()
+    token_url = data.get("token", "").strip()
+
+    now = datetime.now(timezone.utc)
+
+    # Trouver le token correspondant
+    found_token_hash = None
+    found_entry = None
+
+    if token_url:
+        token_hash = hashlib.sha256(token_url.encode()).hexdigest()
+        if token_hash in _reset_tokens:
+            found_token_hash = token_hash
+            found_entry = _reset_tokens[token_hash]
+    elif email and code:
+        for h, entry in _reset_tokens.items():
+            if entry["email"] == email and entry["code"] == code:
+                found_token_hash = h
+                found_entry = entry
+                break
+
+    if not found_entry:
+        raise HTTPException(400, "Code invalide ou email incorrect. Vérifiez le code reçu par email.")
+
+    if found_entry["used"]:
+        raise HTTPException(400, "Ce code a déjà été utilisé. Faites une nouvelle demande.")
+
+    if found_entry["expires_at"] < now:
+        del _reset_tokens[found_token_hash]
+        raise HTTPException(400, "Ce code a expiré (valide 1 heure). Faites une nouvelle demande.")
+
+    # Générer un token de session pour l'étape 3 (valide 15 min)
+    session_token = secrets.token_urlsafe(32)
+    session_hash  = hashlib.sha256(session_token.encode()).hexdigest()
+
+    _reset_tokens[session_hash] = {
+        "user_id": found_entry["user_id"],
+        "email":   found_entry["email"],
+        "type":    "session_reset",
+        "expires_at": now + timedelta(minutes=15),
+        "used": False,
+    }
+
+    # Marquer le code original comme utilisé
+    _reset_tokens[found_token_hash]["used"] = True
+
+    return {
+        "valid": True,
+        "session_token": session_token,
+        "message": "Code vérifié. Vous pouvez maintenant définir un nouveau mot de passe.",
+    }
+
+
+@router.post("/auth/nouveau-mot-de-passe", tags=["Auth"])
+async def nouveau_mot_de_passe(data: dict, db: Session = Depends(get_db)):
+    """
+    Étape 3 : Définir le nouveau mot de passe.
+    Requiert le session_token de l'étape 2.
+    """
+    session_token = data.get("session_token", "").strip()
+    nouveau_mdp   = data.get("nouveau_mot_de_passe", "").strip()
+
+    if not session_token or not nouveau_mdp:
+        raise HTTPException(422, "Session token et nouveau mot de passe obligatoires")
+
+    if len(nouveau_mdp) < 6:
+        raise HTTPException(422, "Le mot de passe doit contenir au moins 6 caractères")
+
+    now = datetime.now(timezone.utc)
+    session_hash = hashlib.sha256(session_token.encode()).hexdigest()
+    entry = _reset_tokens.get(session_hash)
+
+    if not entry or entry.get("type") != "session_reset":
+        raise HTTPException(400, "Session invalide. Recommencez la procédure.")
+
+    if entry["used"]:
+        raise HTTPException(400, "Cette session a déjà été utilisée.")
+
+    if entry["expires_at"] < now:
+        del _reset_tokens[session_hash]
+        raise HTTPException(400, "Session expirée (15 minutes). Recommencez la procédure.")
+
+    user = db.query(models.User).filter(models.User.id == entry["user_id"]).first()
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+
+    # Mettre à jour le mot de passe
+    user.hashed_password = get_password_hash(nouveau_mdp)
+    entry["used"] = True
+    db.commit()
+
+    # Email de confirmation
+    from app.services.notifications import send_email
+    import asyncio
+    asyncio.create_task(send_email(
+        to=user.email,
+        subject="Mot de passe modifié — Clinique de la Rebecca",
+        html_body=f"""
+        <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px;">
+          <h2 style="color:#1641C8;">Clinique de la Rebecca</h2>
+          <p>Bonjour <strong>{user.nom}</strong>,</p>
+          <p>Votre mot de passe a été modifié avec succès le {datetime.now().strftime('%d/%m/%Y à %H:%M')}.</p>
+          <div style="background:#f0fdf4;border-radius:8px;padding:12px 16px;border-left:3px solid #16a34a;">
+            <p style="color:#16a34a;margin:0;font-size:13px;">✓ Mot de passe mis à jour</p>
+          </div>
+          <p style="color:#dc2626;font-size:12px;margin-top:16px;">
+            Si vous n'êtes pas à l'origine de cette modification, contactez-nous immédiatement au (509) 4858-5757.
+          </p>
+        </div>
+        """
+    ))
+
+    log_audit(db, "RESET_PASSWORD_COMPLETE",
+              actor_id=user.id, actor_role=str(user.role),
+              target_id=str(user.id), retention_ans=5)
+
+    # Auto-login
+    token = create_access_token({"sub": str(user.id)})
+    return {
+        "message": "Mot de passe modifié avec succès.",
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {"id": user.id, "nom": user.nom, "email": user.email, "role": str(user.role)},
+    }
+
+
 @router.post("/rdv/confirmer/{rdv_id}", tags=["RDV"])
 async def confirmer_rdv(rdv_id: int, request: Request,
                          db: Session = Depends(get_db),

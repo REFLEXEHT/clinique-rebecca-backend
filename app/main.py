@@ -41,36 +41,51 @@ def ensure_admin():
         db.close()
 
 def migrate_add_missing_columns():
-    """Add new columns to existing tables without dropping data."""
+    """Add new columns and enum values safely without losing data."""
     from sqlalchemy import text
-    from app.database import SessionLocal
-    migrations = [
-        # Users table new columns
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_updated_at TIMESTAMP WITH TIME ZONE",
-        # RDV table new columns
-        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS confirme_par INTEGER",
-        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS confirme_par_role VARCHAR(20)",
-        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS autre_moment_propose VARCHAR(50)",
-        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS autre_moment_message VARCHAR(500)",
-        # Add paiement_requis/paiement_effectue/propose_autre_moment to StatutRDVEnum if needed
+    from app.database import engine
+
+    # Step 1: Add enum values (MUST run outside transaction in PostgreSQL)
+    enum_migrations = [
         "ALTER TYPE statutrdvenum ADD VALUE IF NOT EXISTS 'paiement_requis'",
         "ALTER TYPE statutrdvenum ADD VALUE IF NOT EXISTS 'paiement_effectue'",
         "ALTER TYPE statutrdvenum ADD VALUE IF NOT EXISTS 'propose_autre_moment'",
     ]
-    db = SessionLocal()
     try:
-        for sql in migrations:
-            try:
-                db.execute(text(sql))
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                # Ignore errors for columns that already exist or enum values that exist
-                if 'already exists' not in str(e).lower() and 'duplicate' not in str(e).lower():
-                    print(f"Migration warning: {e}")
-    finally:
-        db.close()
+        with engine.connect() as conn:
+            conn.execution_options(isolation_level="AUTOCOMMIT")
+            for sql in enum_migrations:
+                try:
+                    conn.execute(text(sql))
+                    print(f"✓ Enum: {sql}")
+                except Exception as e:
+                    if "already exists" not in str(e).lower():
+                        print(f"Enum warning: {e}")
+    except Exception as e:
+        print(f"Enum migration error: {e}")
+
+    # Step 2: Add columns (can run in transaction)
+    column_migrations = [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_updated_at TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS confirme_par INTEGER",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS confirme_par_role VARCHAR(20)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS autre_moment_propose VARCHAR(50)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS autre_moment_message VARCHAR(500)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS medecin_id INTEGER",
+        "ALTER TABLE dossiers_patients ADD COLUMN IF NOT EXISTS rdv_id INTEGER",
+    ]
+    try:
+        with engine.begin() as conn:
+            for sql in column_migrations:
+                try:
+                    conn.execute(text(sql))
+                    print(f"✓ Column: {sql[:60]}")
+                except Exception as e:
+                    if "already exists" not in str(e).lower():
+                        print(f"Column warning: {e}")
+    except Exception as e:
+        print(f"Column migration error: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

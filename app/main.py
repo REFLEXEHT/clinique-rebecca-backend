@@ -40,9 +40,41 @@ def ensure_admin():
     finally:
         db.close()
 
+def migrate_add_missing_columns():
+    """Add new columns to existing tables without dropping data."""
+    from sqlalchemy import text
+    migrations = [
+        # Users table new columns
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_updated_at TIMESTAMP WITH TIME ZONE",
+        # RDV table new columns
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS confirme_par INTEGER",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS confirme_par_role VARCHAR(20)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS autre_moment_propose VARCHAR(50)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS autre_moment_message VARCHAR(500)",
+        # Add paiement_requis/paiement_effectue/propose_autre_moment to StatutRDVEnum if needed
+        "ALTER TYPE statutrdvenum ADD VALUE IF NOT EXISTS 'paiement_requis'",
+        "ALTER TYPE statutrdvenum ADD VALUE IF NOT EXISTS 'paiement_effectue'",
+        "ALTER TYPE statutrdvenum ADD VALUE IF NOT EXISTS 'propose_autre_moment'",
+    ]
+    db = SessionLocal()
+    try:
+        for sql in migrations:
+            try:
+                db.execute(text(sql))
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                # Ignore errors for columns that already exist or enum values that exist
+                if 'already exists' not in str(e).lower() and 'duplicate' not in str(e).lower():
+                    print(f"Migration warning: {e}")
+    finally:
+        db.close()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    migrate_add_missing_columns()
     seed_database()
     ensure_admin()
     start_scheduler()

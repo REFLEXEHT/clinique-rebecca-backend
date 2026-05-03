@@ -150,6 +150,34 @@ def _creer_mouvement(
 # AUTH
 # ══════════════════════════════════════════════════════════════════════════════
 
+@router.get("/debug/health", tags=["Debug"])
+async def health_check(db: Session = Depends(get_db)):
+    """Test DB connection and basic operations."""
+    try:
+        from sqlalchemy import text
+        result = db.execute(text("SELECT current_database(), version()")).fetchone()
+        
+        # Test users table
+        user_count = db.execute(text("SELECT COUNT(*) FROM users")).scalar()
+        
+        # Test column existence
+        cols = db.execute(text("""
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_name = 'users'
+            ORDER BY ordinal_position
+        """)).fetchall()
+        
+        return {
+            "status": "ok",
+            "database": result[0] if result else "unknown",
+            "user_count": user_count,
+            "users_columns": [{"name": c[0], "type": c[1]} for c in cols],
+        }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
 @router.post("/auth/login", response_model=schemas.Token, tags=["Auth"])
 async def login(data: schemas.UserLogin, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.email == data.email).first()

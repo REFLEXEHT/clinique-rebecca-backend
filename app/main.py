@@ -43,6 +43,7 @@ def ensure_admin():
 def migrate_add_missing_columns():
     """Add new columns to existing tables without dropping data."""
     from sqlalchemy import text
+    from app.database import SessionLocal
     migrations = [
         # Users table new columns
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",

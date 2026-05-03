@@ -45,7 +45,43 @@ def migrate_add_missing_columns():
     from sqlalchemy import text
     from app.database import engine
 
-    # Add new columns (enum types stored as VARCHAR - no ALTER TYPE needed)
+    # ── 1. Convertir colonnes native-enum → VARCHAR (fix critique) ──────────────
+    # Le schéma original utilisait Enum(RoleEnum) natif PostgreSQL.
+    # Le code actuel utilise native_enum=False (VARCHAR). Cette migration convertit
+    # les colonnes existantes pour que les INSERTs fonctionnent sans erreur de type.
+    enum_to_varchar = [
+        "ALTER TABLE users ALTER COLUMN role TYPE VARCHAR(50) USING role::text",
+        "ALTER TABLE users ALTER COLUMN type_medecin TYPE VARCHAR(50) USING type_medecin::text",
+        "ALTER TABLE rendez_vous ALTER COLUMN statut TYPE VARCHAR(50) USING statut::text",
+        "ALTER TABLE rendez_vous ALTER COLUMN type_rdv TYPE VARCHAR(20) USING type_rdv::text",
+        "ALTER TABLE rendez_vous ALTER COLUMN devise TYPE VARCHAR(10) USING devise::text",
+        "ALTER TABLE dossiers_patients ALTER COLUMN statut TYPE VARCHAR(50) USING statut::text",
+        "ALTER TABLE profils_medecins ALTER COLUMN type_medecin TYPE VARCHAR(50) USING type_medecin::text",
+        "ALTER TABLE mouvements ALTER COLUMN type TYPE VARCHAR(30) USING type::text",
+        "ALTER TABLE mouvements ALTER COLUMN devise TYPE VARCHAR(10) USING devise::text",
+        "ALTER TABLE mouvements ALTER COLUMN journal TYPE VARCHAR(10) USING journal::text",
+        "ALTER TABLE encaissements ALTER COLUMN devise TYPE VARCHAR(10) USING devise::text",
+        "ALTER TABLE decaissements ALTER COLUMN devise TYPE VARCHAR(10) USING devise::text",
+        "ALTER TABLE periodes_comptables ALTER COLUMN statut TYPE VARCHAR(20) USING statut::text",
+        "ALTER TABLE stocks ALTER COLUMN devise_acquisition TYPE VARCHAR(10) USING devise_acquisition::text",
+        "ALTER TABLE tarifs_medecins ALTER COLUMN type_medecin TYPE VARCHAR(50) USING type_medecin::text",
+        "ALTER TABLE tarifs_config ALTER COLUMN type_medecin TYPE VARCHAR(50) USING type_medecin::text",
+        "ALTER TABLE demandes_acces_dossier ALTER COLUMN statut TYPE VARCHAR(30) USING statut::text",
+        "ALTER TABLE labo_analyses ALTER COLUMN type_medecin TYPE VARCHAR(50) USING type_medecin::text",
+    ]
+    for sql in enum_to_varchar:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(sql))
+                conn.commit()
+            print(f"✓ enum→varchar: {sql[35:75]}")
+        except Exception as e:
+            msg = str(e).lower()
+            # "cannot be cast" means it's already varchar — safe to ignore
+            if "already exists" not in msg and "cannot be cast" not in msg and "does not exist" not in msg:
+                print(f"Enum migration note [{sql[35:55]}]: {e}")
+
+    # ── 2. Ajouter colonnes manquantes ───────────────────────────────────────
     column_migrations = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_updated_at TIMESTAMP WITH TIME ZONE",

@@ -255,7 +255,7 @@ class RendezVous(Base):
     motif              = Column(Text)
     notes_admin        = Column(Text)
     mode_paiement      = Column(String(50))
-    devise             = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    devise             = Column(Enum(DeviseEnum, native_enum=False), default=DeviseEnum.HTG)
     reference_paiement = Column(String(100))
     # Lettrage comptable : lien vers le mouvement de paiement
     mouvement_id       = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
@@ -283,7 +283,7 @@ class Mouvement(Base):
     id              = Column(Integer, primary_key=True, index=True)
     # Numérotation séquentielle PCN : VTE-2025-0001, ACH-2025-0001
     numero_piece    = Column(String(30), unique=True, index=True)
-    journal         = Column(Enum(JournalEnum), nullable=False, default=JournalEnum.VTE)
+    journal         = Column(Enum(JournalEnum, native_enum=False), nullable=False, default=JournalEnum.VTE)
 
     # Comptes PCN (partie double)
     compte_debit    = Column(String(10), nullable=False)   # ex: "511"
@@ -292,13 +292,13 @@ class Mouvement(Base):
     libelle_credit  = Column(String(100))                  # ex: "Produits consultations"
 
     # Classification
-    type            = Column(Enum(TypeMouvementEnum), nullable=False)
+    type            = Column(Enum(TypeMouvementEnum, native_enum=False), nullable=False)
     categorie       = Column(String(100), nullable=False)
     description     = Column(String(500), nullable=False)
 
     # Montants — HTG principal, USD optionnel
     montant         = Column(Float, nullable=False)         # Toujours > 0
-    devise          = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    devise          = Column(Enum(DeviseEnum, native_enum=False), default=DeviseEnum.HTG)
     montant_usd     = Column(Float, nullable=True)          # Si paiement en USD
     taux_usd_htg    = Column(Float, nullable=True)          # Taux du jour si USD
     montant_htg     = Column(Float, nullable=True)          # montant_usd × taux
@@ -341,7 +341,7 @@ class ProfilMedecin(Base):
     user_id           = Column(Integer, ForeignKey("users.id"), nullable=True)
     nom               = Column(String(255), nullable=False)
     specialite        = Column(String(255))
-    type_medecin      = Column(Enum(TypeMedecinEnum), nullable=False)
+    type_medecin      = Column(Enum(TypeMedecinEnum, native_enum=False), nullable=False)
     loyer_mensuel_htg = Column(Float, default=0.0)
     # Solde compte courant 468 (créances médecin envers la clinique)
     solde_compte_468  = Column(Float, default=0.0)
@@ -354,7 +354,7 @@ class ProfilMedecin(Base):
 class ReglePartage(Base):
     __tablename__ = "regles_partage"
     id           = Column(Integer, primary_key=True, index=True)
-    type_medecin = Column(Enum(TypeMedecinEnum), nullable=False)
+    type_medecin = Column(Enum(TypeMedecinEnum, native_enum=False), nullable=False)
     type_acte    = Column(String(50), nullable=False)
     pct_medecin  = Column(Float, nullable=False)
     pct_clinique = Column(Float, nullable=False)
@@ -382,7 +382,7 @@ class ActeFacturable(Base):
     montant_medecin     = Column(Float, default=0)
     montant_clinique    = Column(Float, default=0)
     pct_medecin         = Column(Float, default=0)
-    devise              = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    devise              = Column(Enum(DeviseEnum, native_enum=False), default=DeviseEnum.HTG)
     taux_usd_htg        = Column(Float, nullable=True)
     # Contrôle : montant_medecin + montant_clinique doit = montant_total
     balance_ok          = Column(Boolean, default=True)
@@ -410,7 +410,7 @@ class Decaissement(Base):
     montant           = Column(Float, nullable=False)
     motif             = Column(String(500))
     mode_paiement     = Column(String(50), default="especes")
-    devise            = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    devise            = Column(Enum(DeviseEnum, native_enum=False), default=DeviseEnum.HTG)
     taux_usd_htg      = Column(Float, nullable=True)
     # Liens PCN : 2 mouvements générés
     mouvement_468_id  = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
@@ -435,7 +435,7 @@ class PeriodeComptable(Base):
     id      = Column(Integer, primary_key=True)
     mois    = Column(Integer, nullable=False)
     annee   = Column(Integer, nullable=False)
-    statut  = Column(Enum(StatutPeriodeEnum), default=StatutPeriodeEnum.ouverte)
+    statut  = Column(Enum(StatutPeriodeEnum, native_enum=False), default=StatutPeriodeEnum.ouverte)
     cloture_par  = Column(Integer, ForeignKey("users.id"), nullable=True)
     cloture_at   = Column(DateTime(timezone=True), nullable=True)
     created_at   = Column(DateTime(timezone=True), server_default=func.now())
@@ -493,7 +493,7 @@ class Immobilisation(Base):
     compte_pcn       = Column(String(10), default="218")    # 218 = équipements médicaux
     # Valeurs
     valeur_acquisition  = Column(Float, nullable=False)
-    devise_acquisition  = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    devise_acquisition  = Column(Enum(DeviseEnum, native_enum=False), default=DeviseEnum.HTG)
     taux_usd_achat      = Column(Float, nullable=True)
     valeur_htg          = Column(Float, nullable=False)
     # Amortissement
@@ -531,7 +531,7 @@ class PaiementExploitant(Base):
     medecin_nom   = Column(String(255))
     patient_nom   = Column(String(255))
     montant       = Column(Float)
-    devise        = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    devise        = Column(Enum(DeviseEnum, native_enum=False), default=DeviseEnum.HTG)
     taux_usd_htg  = Column(Float, nullable=True)
     mode_paiement = Column(String(50))
     flux_direct   = Column(Boolean, default=False)
@@ -549,7 +549,7 @@ class StockItem(Base):
     quantite           = Column(Integer, default=0)
     seuil_min          = Column(Integer, default=10)
     prix_unitaire      = Column(Float, default=0)
-    devise             = Column(Enum(DeviseEnum), default=DeviseEnum.HTG)
+    devise             = Column(Enum(DeviseEnum, native_enum=False), default=DeviseEnum.HTG)
     unite              = Column(String(50), default="unité")
     proprietaire       = Column(String(255), default="Clinique")
     mode_reversement   = Column(String(20), default="clinique")
@@ -636,7 +636,7 @@ class TarifMedecin(Base):
     prix_rdv                = Column(Float, default=0)
     prix_hospitalisation_jr = Column(Float, default=0)
     prix_geste_base         = Column(Float, default=0)
-    type_medecin            = Column(Enum(TypeMedecinEnum), nullable=True)
+    type_medecin            = Column(Enum(TypeMedecinEnum, native_enum=False), nullable=True)
     actif                   = Column(Boolean, default=True)
 
 
@@ -723,7 +723,7 @@ class DemandeAccesDossier(Base):
     motif           = Column(Text, nullable=False)
     urgence         = Column(Boolean, default=False)
     # Décision admin
-    statut          = Column(Enum(StatutDemandeEnum), default=StatutDemandeEnum.en_attente)
+    statut          = Column(Enum(StatutDemandeEnum, native_enum=False), default=StatutDemandeEnum.en_attente)
     admin_id        = Column(Integer, ForeignKey("users.id"), nullable=True)
     admin_commentaire = Column(Text, nullable=True)
     # Durée d'accès si approuvé (heures)
@@ -797,7 +797,7 @@ class DossierPatient(Base):
     service         = Column(String(50), default="clinique")
     specialite      = Column(String(100), nullable=True)
     # Statut
-    statut          = Column(Enum(StatutDossierEnum), default=StatutDossierEnum.attente_infirmier)
+    statut          = Column(Enum(StatutDossierEnum, native_enum=False), default=StatutDossierEnum.attente_infirmier)
     # Paiement requis avant accès médecin
     paiement_effectue = Column(Boolean, default=False)
     mouvement_paiement_id = Column(Integer, ForeignKey("mouvements.id"), nullable=True)

@@ -211,6 +211,7 @@ class Horaire(Base):
 class Patient(Base):
     __tablename__ = "patients"
     id             = Column(Integer, primary_key=True, index=True)
+    user_id        = Column(Integer, ForeignKey("users.id"), nullable=True, unique=True, index=True)
     numero         = Column(String(20), unique=True, index=True)
     nom            = Column(String(255), nullable=False)
     prenom         = Column(String(255))

@@ -11,6 +11,9 @@ Corrections appliquées :
   - Lettrage RDV ↔ mouvement
   - Immobilisations + amortissements
 """
+import logging
+logger = logging.getLogger(__name__)
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func, extract
@@ -232,6 +235,24 @@ async def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
         )
         db.add(profil); db.commit()
     if is_active:
+        # Auto-créer le dossier Patient lié au compte User
+        try:
+            count = db.query(models.Patient).count()
+            numero = f"#RB-{str(count + 1).zfill(4)}"
+            patient = models.Patient(
+                user_id=user.id,
+                numero=numero,
+                nom=data.nom,
+                email=data.email,
+                telephone=data.telephone,
+            )
+            db.add(patient)
+            db.commit()
+        except Exception as e:
+            # Ne pas bloquer la création du compte si le dossier patient échoue
+            logger.warning(f"Patient record creation failed for user {user.id}: {e}")
+            db.rollback()
+
         token = create_access_token({"sub": str(user.id)})
         return {"access_token": token, "token_type": "bearer",
                 "user": {"id": user.id, "nom": user.nom, "email": user.email, "role": user.role}}
@@ -2015,23 +2036,49 @@ async def imprimer_resultats_labo_infirmier(patient_numero: str, request: Reques
 @router.get("/patient/mon-dossier", tags=["Patient"])
 async def mon_dossier_complet(db: Session = Depends(get_db),
                                current_user=Depends(get_current_user)):
-    """Dossier patient complet: visites, prescriptions actives, résultats labo 3 mois"""
+    """Dossier patient: visites, RDV, prescriptions, résultats labo"""
     if current_user.role != models.RoleEnum.patient:
         raise HTTPException(403, "Accès réservé aux patients")
 
+    # Cherche par user_id (nouveaux comptes) OU par email (anciens comptes)
     patient = db.query(models.Patient).filter(
         models.Patient.user_id == current_user.id
     ).first()
+    if not patient:
+        patient = db.query(models.Patient).filter(
+            models.Patient.email == current_user.email
+        ).first()
 
     if not patient:
-        return {"dossiers": [], "prescriptions_actives": [], "resultats_labo": []}
+        # Créer automatiquement le dossier patient s'il n'existe pas encore
+        try:
+            count = db.query(models.Patient).count()
+            patient = models.Patient(
+                user_id=current_user.id,
+                numero=f"#RB-{str(count + 1).zfill(4)}",
+                nom=current_user.nom,
+                email=current_user.email,
+                telephone=current_user.telephone,
+            )
+            db.add(patient)
+            db.commit()
+            db.refresh(patient)
+        except Exception as e:
+            logger.error(f"Auto-create patient failed: {e}")
+            db.rollback()
+            return {
+                "numero_patient": None,
+                "nb_visites": 0, "visites": [], "rdv_a_venir": [], "rdv_passes": [],
+                "prescriptions_actives": [], "resultats_labo": [],
+            }
 
-    from datetime import datetime, timedelta, timezone
-    trois_mois = datetime.now(timezone.utc) - timedelta(days=90)
+    from datetime import timedelta, timezone
+    now = datetime.now(timezone.utc)
+    trois_mois = now - timedelta(days=90)
 
     dossiers = db.query(models.DossierPatient).filter(
         models.DossierPatient.patient_id == patient.id
-    ).order_by(models.DossierPatient.date_visite.desc()).limit(10).all()
+    ).order_by(models.DossierPatient.date_visite.desc()).limit(20).all()
 
     prescriptions = db.query(models.Prescription).filter(
         models.Prescription.patient_id == patient.id,
@@ -2040,25 +2087,45 @@ async def mon_dossier_complet(db: Session = Depends(get_db),
 
     resultats = db.query(models.ResultatLabo).filter(
         models.ResultatLabo.patient_id == str(patient.id),
-        models.ResultatLabo.date_examen >= trois_mois.date()
-    ).order_by(models.ResultatLabo.date_examen.desc()).all()
+    ).order_by(models.ResultatLabo.date_examen.desc()).limit(20).all()
+
+    rdv_a_venir = db.query(models.RendezVous).filter(
+        models.RendezVous.patient_email == current_user.email,
+        models.RendezVous.date_rdv >= now,
+    ).order_by(models.RendezVous.date_rdv).all()
+
+    rdv_passes = db.query(models.RendezVous).filter(
+        models.RendezVous.patient_email == current_user.email,
+        models.RendezVous.date_rdv < now,
+        models.RendezVous.date_rdv >= now - timedelta(days=365),
+    ).order_by(models.RendezVous.date_rdv.desc()).limit(20).all()
+
+    def rdv_out(r):
+        return {
+            "id": r.id, "specialite": r.specialite,
+            "date_rdv": str(r.date_rdv), "statut": str(r.statut),
+            "type_rdv": str(r.type_rdv), "medecin_nom": r.medecin_nom,
+            "lien_video": r.lien_video if hasattr(r, "lien_video") else None,
+        }
 
     return {
-        "patient_numero": patient.numero,
-        "dossiers": [{"id": d.id, "date_visite": str(d.date_visite),
-                       "type_visite": d.type_visite, "specialite": d.specialite,
-                       "diagnostic": d.diagnostic, "statut": str(d.statut)} for d in dossiers],
+        "numero_patient": patient.numero,
+        "nb_visites": len(dossiers),
+        "visites": [{"id": d.id, "date_visite": str(d.date_visite),
+                     "specialite": d.specialite or d.type_visite,
+                     "statut": str(d.statut), "service": d.service,
+                     "contexte_visite": f"{d.specialite or 'Consultation'} — {d.service or 'Clinique'}"}
+                    for d in dossiers],
+        "rdv_a_venir": [rdv_out(r) for r in rdv_a_venir],
+        "rdv_passes": [rdv_out(r) for r in rdv_passes],
         "prescriptions_actives": [{"id": p.id, "medicaments": p.medicaments,
                                     "medecin_nom": p.medecin_nom,
-                                    "date_prescription": str(p.date_prescription),
-                                    "valide_jusqu_au": str(p.valide_jusqu_au) if p.valide_jusqu_au else None} for p in prescriptions],
+                                    "date": str(p.date_prescription)} for p in prescriptions],
         "resultats_labo": [{"id": r.id, "type_examen": r.type_examen,
-                             "resultats": r.resultats, "notes": r.notes,
-                             "date_examen": str(r.date_examen), "status": r.status} for r in resultats],
+                             "resultats": r.resultats, "date_examen": str(r.date_examen),
+                             "alerte_critique": getattr(r, "alerte_critique", False)} for r in resultats],
     }
 
-
-@router.post("/patient/avis", tags=["Patient"])
 async def soumettre_avis(data: dict, db: Session = Depends(get_db),
                           current_user=Depends(get_current_user)):
     """Patient soumet une note et un avis post-consultation"""
@@ -3551,110 +3618,6 @@ async def modifier_resultat(rid: int, data: dict, request: Request,
 # ══════════════════════════════════════════════════════════════════════════════
 # PATIENT — SON PROPRE DOSSIER
 # ══════════════════════════════════════════════════════════════════════════════
-
-@router.get("/patient/mon-dossier", tags=["Patient"])
-async def mon_dossier(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    """
-    CONFIDENTIALITÉ STRICTE — Le dossier appartient à la clinique.
-    Le patient voit UNIQUEMENT :
-    - Son identité et numéro patient
-    - Ses RDV (passés et à venir) avec statut et lien vidéo
-    - Ses résultats de laboratoire (type + résultats bruts, sans interprétation)
-    - Ses prescriptions actives (liste de médicaments uniquement)
-    - Un TRÈS BREF résumé de visite généré par IA (pas de diagnostic précis)
-    PAS de diagnostic complet, pas de notes médecin, pas d'examen clinique détaillé.
-    """
-    patient = db.query(models.Patient).filter(
-        models.Patient.email == current_user.email
-    ).first()
-    if not patient:
-        return {"message": "Aucun dossier trouvé", "visites": [], "rdv_a_venir": [], "rdv_passes": []}
-
-    # Résumé des visites — SEULEMENT date + spécialité + statut + nb prescriptions
-    # PAS de diagnostic précis, PAS d'examen clinique, PAS de notes médecin
-    dossiers_raw = db.query(models.DossierPatient).filter(
-        models.DossierPatient.patient_id == patient.id
-    ).order_by(models.DossierPatient.date_visite.desc()).all()
-
-    visites_resumees = [
-        {
-            "id": d.id,
-            "date_visite": str(d.date_visite),
-            "specialite": d.specialite or d.type_visite,
-            "statut": str(d.statut),
-            "service": d.service,
-            # Résumé IA très court (1 phrase, sans diagnostic précis)
-            # Généré côté frontend via Anthropic API
-            # On envoie SEULEMENT la spécialité et le service, pas le diagnostic
-            "contexte_visite": f"{d.specialite or 'Consultation'} — {d.service or 'Clinique'}",
-        }
-        for d in dossiers_raw
-    ]
-
-    # Prescriptions actives : liste des médicaments uniquement (90 jours)
-    from datetime import timedelta
-    seuil = datetime.now(timezone.utc) - timedelta(days=90)
-    prescriptions_raw = db.query(models.Prescription).filter(
-        models.Prescription.patient_id == patient.id,
-        models.Prescription.date_prescription >= seuil,
-    ).order_by(models.Prescription.date_prescription.desc()).all()
-
-    prescriptions_patient = [
-        {
-            "date": str(p.date_prescription),
-            "medicaments": p.medicaments,  # Liste de médicaments seulement
-            "medecin_nom": p.medecin_nom,
-            # PAS d'examens_requis ni de notes_prescription
-        }
-        for p in prescriptions_raw
-    ]
-
-    # Résultats labo : type d'examen + résultats bruts (sans interprétation médicale)
-    resultats_raw = db.query(models.ResultatLabo).filter(
-        models.ResultatLabo.patient_id == str(patient.id)
-    ).order_by(models.ResultatLabo.date_examen.desc()).limit(20).all()
-
-    resultats_patient = [
-        {
-            "date_examen": str(r.date_examen),
-            "type_examen": r.type_examen,
-            "resultats": r.resultats,  # Valeurs brutes uniquement
-            # PAS de notes médicales, PAS d'interprétation
-            "alerte_critique": r.alerte_critique,  # Booléen — alerte si critique
-        }
-        for r in resultats_raw
-    ]
-
-    # RDV à venir
-    rdv_a_venir = db.query(models.RendezVous).filter(
-        models.RendezVous.patient_email == current_user.email,
-        models.RendezVous.date_rdv >= datetime.now(timezone.utc),
-    ).order_by(models.RendezVous.date_rdv).all()
-
-    # RDV passés (résumé — 12 derniers mois seulement)
-    rdv_passes = db.query(models.RendezVous).filter(
-        models.RendezVous.patient_email == current_user.email,
-        models.RendezVous.date_rdv < datetime.now(timezone.utc),
-        models.RendezVous.date_rdv >= datetime.now(timezone.utc) - timedelta(days=365),
-    ).order_by(models.RendezVous.date_rdv.desc()).limit(20).all()
-
-    return {
-        "patient": {
-            "nom": patient.nom,
-            "email": patient.email,
-            "telephone": patient.telephone,
-            "numero": patient.numero,
-            "created_at": str(patient.created_at) if hasattr(patient, 'created_at') else None,
-        },
-        "numero_patient": patient.numero,
-        "nb_visites": len(dossiers_raw),
-        "visites": visites_resumees,           # Résumé sans données médicales précises
-        "prescriptions_actives": prescriptions_patient,  # Médicaments seulement (90j)
-        "resultats_labo": resultats_patient,   # Valeurs brutes sans interprétation
-        "rdv_a_venir": rdv_a_venir,
-        "rdv_passes": rdv_passes,
-    }
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HOSPITALISATION

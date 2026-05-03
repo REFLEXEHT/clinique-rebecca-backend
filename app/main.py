@@ -91,6 +91,7 @@ def migrate_add_missing_columns():
         "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS autre_moment_message VARCHAR(500)",
         "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS medecin_id INTEGER",
         "ALTER TABLE dossiers_patients ADD COLUMN IF NOT EXISTS rdv_id INTEGER",
+        "ALTER TABLE patients ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)",
     ]
     # Each migration in its own connection to avoid transaction interference
     for sql in column_migrations:

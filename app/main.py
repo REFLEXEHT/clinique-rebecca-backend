@@ -45,26 +45,7 @@ def migrate_add_missing_columns():
     from sqlalchemy import text
     from app.database import engine
 
-    # Step 1: Add enum values (MUST run outside transaction in PostgreSQL)
-    enum_migrations = [
-        "ALTER TYPE statutrdvenum ADD VALUE IF NOT EXISTS 'paiement_requis'",
-        "ALTER TYPE statutrdvenum ADD VALUE IF NOT EXISTS 'paiement_effectue'",
-        "ALTER TYPE statutrdvenum ADD VALUE IF NOT EXISTS 'propose_autre_moment'",
-    ]
-    try:
-        with engine.connect() as conn:
-            conn.execution_options(isolation_level="AUTOCOMMIT")
-            for sql in enum_migrations:
-                try:
-                    conn.execute(text(sql))
-                    print(f"✓ Enum: {sql}")
-                except Exception as e:
-                    if "already exists" not in str(e).lower():
-                        print(f"Enum warning: {e}")
-    except Exception as e:
-        print(f"Enum migration error: {e}")
-
-    # Step 2: Add columns (can run in transaction)
+    # Add new columns (enum types stored as VARCHAR - no ALTER TYPE needed)
     column_migrations = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_updated_at TIMESTAMP WITH TIME ZONE",

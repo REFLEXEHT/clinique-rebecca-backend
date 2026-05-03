@@ -56,17 +56,17 @@ def migrate_add_missing_columns():
         "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS medecin_id INTEGER",
         "ALTER TABLE dossiers_patients ADD COLUMN IF NOT EXISTS rdv_id INTEGER",
     ]
-    try:
-        with engine.begin() as conn:
-            for sql in column_migrations:
-                try:
-                    conn.execute(text(sql))
-                    print(f"✓ Column: {sql[:60]}")
-                except Exception as e:
-                    if "already exists" not in str(e).lower():
-                        print(f"Column warning: {e}")
-    except Exception as e:
-        print(f"Column migration error: {e}")
+    # Each migration in its own connection to avoid transaction interference
+    for sql in column_migrations:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(sql))
+                conn.commit()
+            print(f"✓ {sql[:70]}")
+        except Exception as e:
+            msg = str(e).lower()
+            if "already exists" not in msg and "duplicate" not in msg:
+                print(f"Migration warning [{sql[:40]}]: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

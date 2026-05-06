@@ -3967,6 +3967,22 @@ async def queue_infirmier(db: Session = Depends(get_db), current_user=Depends(ge
         ])
     ).order_by(models.RendezVous.date_rdv).all()
 
+    # Enrichit chaque patient avec son statut de paiement
+    def get_paiement_statut(rdv):
+        statut_str = str(rdv.statut).split(".")[-1] if "." in str(rdv.statut) else str(rdv.statut)
+        # Vérifier autorisation admin
+        auth = db.query(models.AutorisationPaiement).filter(
+            models.AutorisationPaiement.actif == True,
+            (models.AutorisationPaiement.patient_nom == rdv.patient_nom) |
+            (models.AutorisationPaiement.patient_id == rdv.patient_id),
+        ).first() if rdv.patient_id else None
+
+        if auth:
+            return {"statut_paiement": "autorise", "couleur": "#d97706", "libelle": f"✓ Autorisé — {auth.motif}"}
+        if statut_str in ("paiement_effectue", "confirme"):
+            return {"statut_paiement": "paye", "couleur": "#16a34a", "libelle": "✅ Payé"}
+        return {"statut_paiement": "non_paye", "couleur": "#dc2626", "libelle": "⚠️ Non payé"}
+
     return {
         "total": len(en_attente),
         "patients": [{
@@ -3974,11 +3990,13 @@ async def queue_infirmier(db: Session = Depends(get_db), current_user=Depends(ge
             "ticket": r.code_patient,
             "patient_nom": r.patient_nom,
             "patient_telephone": r.patient_telephone,
+            "patient_id": r.patient_id,
             "service": r.specialite,
             "statut": str(r.statut),
             "heure": str(r.date_rdv),
             "priorite": "urgent" if "urgent" in (r.notes_admin or "").lower() else "normal",
             "notes": r.notes_admin,
+            **get_paiement_statut(r),
         } for r in en_attente],
     }
 
@@ -4170,4 +4188,95 @@ async def verifier_paiement(
         "a_paye": a_paye,
         "message": "✅ Paiement confirmé" if a_paye else "⚠️ Paiement non confirmé",
         "paiements": paiements,
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTORISATIONS DE PAIEMENT (Admin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/admin/autorisation-paiement", status_code=201, tags=["Admin - Autorisations"])
+async def creer_autorisation(data: dict, db: Session = Depends(get_db),
+                              current_user=Depends(require_admin)):
+    """Admin crée une autorisation de service sans paiement (employé, cas social, partenaire)"""
+    auth = models.AutorisationPaiement(
+        patient_nom=data.get("patient_nom", ""),
+        patient_numero=data.get("patient_numero"),
+        motif=data.get("motif", "Autorisation admin"),
+        service=data.get("service"),
+        date_validite=data.get("date_validite"),
+        actif=True,
+        created_by=current_user.id,
+    )
+    if data.get("patient_id"):
+        auth.patient_id = int(data["patient_id"])
+    db.add(auth); db.commit(); db.refresh(auth)
+    return {"message": f"Autorisation créée pour {auth.patient_nom}", "id": auth.id}
+
+
+@router.get("/admin/autorisations-paiement", tags=["Admin - Autorisations"])
+async def list_autorisations(db: Session = Depends(get_db), _=Depends(require_admin)):
+    return db.query(models.AutorisationPaiement).filter(
+        models.AutorisationPaiement.actif == True
+    ).order_by(models.AutorisationPaiement.created_at.desc()).all()
+
+
+@router.delete("/admin/autorisation-paiement/{aid}", tags=["Admin - Autorisations"])
+async def supprimer_autorisation(aid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
+    auth = db.query(models.AutorisationPaiement).filter(models.AutorisationPaiement.id == aid).first()
+    if not auth: raise HTTPException(404)
+    auth.actif = False
+    db.commit()
+    return {"message": "Autorisation révoquée"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FILE D'ATTENTE MÉDECIN avec statut paiement
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/medecin/queue-patients", tags=["Médecin - Queue"])
+async def queue_patients_medecin(db: Session = Depends(get_db),
+                                  current_user=Depends(get_current_user)):
+    """File d'attente du médecin — patients avec signes vitaux enregistrés + statut paiement"""
+    from sqlalchemy import cast, Date as SADate
+    aujourd_hui = datetime.now(timezone.utc).date()
+
+    en_attente = db.query(models.RendezVous).filter(
+        cast(models.RendezVous.date_rdv, SADate) == aujourd_hui,
+        models.RendezVous.statut == models.StatutRDVEnum.confirme,
+    ).order_by(models.RendezVous.date_rdv).all()
+
+    def get_paiement_statut(rdv):
+        statut_str = str(rdv.statut).split(".")[-1] if "." in str(rdv.statut) else str(rdv.statut)
+        auth = db.query(models.AutorisationPaiement).filter(
+            models.AutorisationPaiement.actif == True,
+            models.AutorisationPaiement.patient_nom == rdv.patient_nom,
+        ).first()
+        if auth:
+            return {"statut_paiement": "autorise", "couleur": "#d97706", "libelle": f"✓ Autorisé — {auth.motif}"}
+        if statut_str in ("paiement_effectue", "confirme"):
+            return {"statut_paiement": "paye", "couleur": "#16a34a", "libelle": "✅ Payé"}
+        return {"statut_paiement": "non_paye", "couleur": "#dc2626", "libelle": "⚠️ Non payé"}
+
+    # Extraire les signes vitaux des notes
+    def parse_sv(notes):
+        sv = {}
+        if notes and "[Signes vitaux]" in notes:
+            sv_text = notes.split("[Signes vitaux]")[-1].strip()
+            sv["resume"] = sv_text[:200]
+        return sv
+
+    return {
+        "total": len(en_attente),
+        "patients": [{
+            "rdv_id": r.id,
+            "ticket": r.code_patient,
+            "patient_nom": r.patient_nom,
+            "patient_telephone": r.patient_telephone,
+            "patient_id": r.patient_id,
+            "service": r.specialite,
+            "heure": str(r.date_rdv),
+            "priorite": "urgent" if "urgent" in (r.notes_admin or "").lower() else "normal",
+            "signes_vitaux": parse_sv(r.notes_admin),
+            **get_paiement_statut(r),
+        } for r in en_attente],
     }

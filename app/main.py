@@ -92,6 +92,7 @@ def migrate_add_missing_columns():
         "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS medecin_id INTEGER",
         "ALTER TABLE dossiers_patients ADD COLUMN IF NOT EXISTS rdv_id INTEGER",
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)",
+        "CREATE TABLE IF NOT EXISTS autorisations_paiement (id SERIAL PRIMARY KEY, patient_id INTEGER REFERENCES patients(id), patient_nom VARCHAR(255), patient_numero VARCHAR(20), motif VARCHAR(255), service VARCHAR(255), date_validite TIMESTAMP WITH TIME ZONE, actif BOOLEAN DEFAULT TRUE, created_by INTEGER REFERENCES users(id), created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW())",
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS age INTEGER",
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS contact_urgence VARCHAR(255)",
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS is_premiere_visite BOOLEAN DEFAULT TRUE",

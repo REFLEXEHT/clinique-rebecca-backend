@@ -767,6 +767,27 @@ class AuditLog(Base):
     retention_ans = Column(Integer, default=5)
 
 
+
+
+# ─── Autorisation de paiement (admin) ────────────────────────────────────────
+class AutorisationPaiement(Base):
+    """
+    L'admin peut autoriser un patient à recevoir un service sans payer
+    (employé, cas social, partenaire). Le statut s'affiche en jaune pour
+    l'infirmier et le médecin.
+    """
+    __tablename__ = "autorisations_paiement"
+    id            = Column(Integer, primary_key=True)
+    patient_id    = Column(Integer, ForeignKey("patients.id"), nullable=True)
+    patient_nom   = Column(String(255))
+    patient_numero = Column(String(20))
+    motif         = Column(String(255))  # "Employé", "Cas social", "Partenaire", etc.
+    service       = Column(String(255), nullable=True)  # None = tous les services
+    date_validite = Column(DateTime(timezone=True), nullable=True)  # None = indéfini
+    actif         = Column(Boolean, default=True)
+    created_by    = Column(Integer, ForeignKey("users.id"))
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DOSSIER PATIENT MÉDICAL
 # ══════════════════════════════════════════════════════════════════════════════

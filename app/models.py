@@ -611,23 +611,26 @@ class ContratOptometrie(Base):
 # ─── Tarifs Laboratoire ──────────────────────────────────────────────────────
 class TarifLabo(Base):
     __tablename__ = "tarifs_labo"
-    id      = Column(Integer, primary_key=True)
-    code    = Column(String(50), unique=True, nullable=False)
-    libelle = Column(String(500), nullable=False)
-    montant = Column(Float, default=0)
-    devise  = Column(String(10), default="HTG")
-    actif   = Column(Boolean, default=True)
+    id          = Column(Integer, primary_key=True)
+    code        = Column(String(50), unique=True, nullable=False)
+    libelle     = Column(String(500), nullable=False)
+    montant     = Column(Float, default=0)       # HTG (legacy)
+    montant_usd = Column(Float, nullable=True)   # USD (référence)
+    devise      = Column(String(10), default="USD")
+    actif       = Column(Boolean, default=True)
 
 
 # ─── Tarifs Dentisterie ──────────────────────────────────────────────────────
 class TarifDentiste(Base):
     __tablename__ = "tarifs_dentiste"
-    id      = Column(Integer, primary_key=True)
-    code    = Column(String(50), unique=True, nullable=False)
-    libelle = Column(String(500), nullable=False)
-    montant = Column(Float, default=0)
-    devise  = Column(String(10), default="HTG")
-    actif   = Column(Boolean, default=True)
+    id          = Column(Integer, primary_key=True)
+    code        = Column(String(50), unique=True, nullable=False)
+    libelle     = Column(String(500), nullable=False)
+    montant     = Column(Float, default=0)       # HTG (legacy)
+    montant_usd = Column(Float, nullable=True)   # USD (référence)
+    categorie   = Column(String(255), nullable=True)
+    devise      = Column(String(10), default="USD")
+    actif       = Column(Boolean, default=True)
 
 
 # ─── Tarifs Médecin (prix par médecin) ───────────────────────────────────────
@@ -649,27 +652,43 @@ class TarifMedecin(Base):
 # ─── Gestes Médicaux par Spécialité ─────────────────────────────────────────
 class GesteMedical(Base):
     """
-    Catalogue des gestes médicaux par spécialité.
-    - Dentisterie : liste fixe avec prix prédéfinis (depuis TarifDentiste)
-    - Autres spécialités : gestes libres, prix saisi par le caissier à l'acte
-    
-    Le caissier voit la liste suggérée pour la spécialité du médecin
-    et peut saisir le prix exact au moment de l'acte.
+    Catalogue des gestes médicaux par spécialité — prix de référence en USD.
+    Sources: AHC (Chirurgie), SHOG (Gynécologie), SHP (Pédiatrie), SHA (Anesthésie).
+    Le prix affiché est en USD. Le caissier entre le taux du jour → calcul HTG automatique.
+    Le médecin/admin peut saisir un prix différent du barème si nécessaire.
+    Ces données ne sont pas publiques.
     """
     __tablename__ = "gestes_medicaux"
     
     id              = Column(Integer, primary_key=True)
-    specialite      = Column(String(255), nullable=False, index=True)  # Ex: "Orthopédie"
-    libelle         = Column(String(500), nullable=False)               # Ex: "Pose de plâtre"
-    prix_suggere    = Column(Float, default=0)                          # Prix indicatif (modifiable)
-    prix_min        = Column(Float, nullable=True)                      # Fourchette min
-    prix_max        = Column(Float, nullable=True)                      # Fourchette max
-    devise          = Column(String(10), default="HTG")
-    # Si True = prix fixe (ex: dentisterie), si False = prix libre saisi à l'acte
+    specialite      = Column(String(255), nullable=False, index=True)
+    categorie       = Column(String(255), nullable=True)   # Ex: "Foie", "Abdomen", "Urgences"
+    libelle         = Column(String(500), nullable=False)
+    # Prix en USD — référence principale
+    prix_usd        = Column(Float, default=0)
+    prix_usd_min    = Column(Float, nullable=True)         # Fourchette basse si applicable
+    prix_usd_max    = Column(Float, nullable=True)         # Fourchette haute
+    # Prix clinique (peut différer du barème)
+    prix_clinique_usd = Column(Float, nullable=True)       # Prix appliqué par la clinique
+    # Source du barème
+    source_bareme   = Column(String(50), nullable=True)    # "AHC", "SHOG", "SHP", "SHA", "CLINIQUE"
+    # Prix HTG de référence (du barème original)
+    prix_htg_ref    = Column(Float, nullable=True)
+    # Si True = prix fixe non négociable, si False = prix libre saisi à l'acte
     prix_fixe       = Column(Boolean, default=False)
     actif           = Column(Boolean, default=True)
     ordre           = Column(Integer, default=0)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at      = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class TauxChange(Base):
+    """Taux de change HTG/USD du jour — saisi par la caisse."""
+    __tablename__ = "taux_change"
+    id          = Column(Integer, primary_key=True)
+    taux_htg    = Column(Float, nullable=False)   # Ex: 130.0 signifie 1 USD = 130 HTG
+    date        = Column(DateTime(timezone=True), server_default=func.now())
+    saisi_par   = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 class BilanOptometrieMensuel(Base):
     __tablename__ = "bilans_optometrie"

@@ -4280,3 +4280,167 @@ async def queue_patients_medecin(db: Session = Depends(get_db),
             **get_paiement_statut(r),
         } for r in en_attente],
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BARÈMES DES GESTES MÉDICAUX — Prix en USD, calcul HTG au taux du jour
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/tarifs/gestes", tags=["Tarifs - Gestes"])
+async def list_gestes(
+    specialite: Optional[str] = None,
+    categorie:  Optional[str] = None,
+    search:     Optional[str] = None,
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user)   # Données non publiques — personnel uniquement
+):
+    """Catalogue des gestes médicaux avec prix de référence en USD. Non public."""
+    q = db.query(models.GesteMedical).filter(models.GesteMedical.actif == True)
+    if specialite:
+        q = q.filter(models.GesteMedical.specialite.ilike(f"%{specialite}%"))
+    if categorie:
+        q = q.filter(models.GesteMedical.categorie.ilike(f"%{categorie}%"))
+    if search:
+        q = q.filter(models.GesteMedical.libelle.ilike(f"%{search}%"))
+    gestes = q.order_by(models.GesteMedical.specialite, models.GesteMedical.categorie, models.GesteMedical.libelle).all()
+
+    # Taux du jour
+    taux = db.query(models.TauxChange).order_by(models.TauxChange.date.desc()).first()
+    taux_htg = taux.taux_htg if taux else 130.0
+
+    return {
+        "taux_htg": taux_htg,
+        "total": len(gestes),
+        "gestes": [{
+            "id": g.id,
+            "specialite": g.specialite,
+            "categorie": g.categorie,
+            "libelle": g.libelle,
+            "prix_usd": g.prix_clinique_usd or g.prix_usd,  # Prix clinique prioritaire
+            "prix_usd_bareme": g.prix_usd,                   # Barème de référence
+            "prix_usd_min": g.prix_usd_min,
+            "prix_usd_max": g.prix_usd_max,
+            "prix_clinique_usd": g.prix_clinique_usd,
+            "prix_htg_calcule": round((g.prix_clinique_usd or g.prix_usd or 0) * taux_htg),
+            "prix_htg_ref": g.prix_htg_ref,
+            "source_bareme": g.source_bareme,
+            "prix_fixe": g.prix_fixe,
+        } for g in gestes],
+        "specialites": sorted(list(set(g.specialite for g in db.query(models.GesteMedical).filter(models.GesteMedical.actif==True).all()))),
+    }
+
+
+@router.get("/tarifs/specialites", tags=["Tarifs - Gestes"])
+async def list_specialites_gestes(db: Session = Depends(get_db), _=Depends(get_current_user)):
+    """Liste des spécialités disponibles dans le catalogue."""
+    specs = db.query(models.GesteMedical.specialite).filter(
+        models.GesteMedical.actif == True
+    ).distinct().order_by(models.GesteMedical.specialite).all()
+    return [s[0] for s in specs]
+
+
+@router.post("/admin/tarifs/geste", status_code=201, tags=["Admin - Tarifs"])
+async def creer_geste(data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+    """Admin crée un nouveau geste dans le catalogue."""
+    geste = models.GesteMedical(
+        specialite=data.get("specialite", ""),
+        categorie=data.get("categorie"),
+        libelle=data.get("libelle", ""),
+        prix_usd=float(data.get("prix_usd", 0)),
+        prix_usd_min=float(data["prix_usd_min"]) if data.get("prix_usd_min") else None,
+        prix_usd_max=float(data["prix_usd_max"]) if data.get("prix_usd_max") else None,
+        prix_clinique_usd=float(data["prix_clinique_usd"]) if data.get("prix_clinique_usd") else None,
+        prix_htg_ref=float(data["prix_htg_ref"]) if data.get("prix_htg_ref") else None,
+        source_bareme=data.get("source_bareme", "CLINIQUE"),
+        prix_fixe=bool(data.get("prix_fixe", False)),
+        actif=True,
+    )
+    db.add(geste); db.commit(); db.refresh(geste)
+    return {"message": "Geste créé", "id": geste.id}
+
+
+@router.put("/admin/tarifs/geste/{gid}", tags=["Admin - Tarifs"])
+async def modifier_geste(gid: int, data: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
+    """Admin modifie un geste — notamment le prix clinique (différent du barème)."""
+    g = db.query(models.GesteMedical).filter(models.GesteMedical.id == gid).first()
+    if not g: raise HTTPException(404)
+    if "libelle" in data: g.libelle = data["libelle"]
+    if "categorie" in data: g.categorie = data["categorie"]
+    if "prix_usd" in data: g.prix_usd = float(data["prix_usd"])
+    if "prix_usd_min" in data: g.prix_usd_min = float(data["prix_usd_min"]) if data["prix_usd_min"] else None
+    if "prix_usd_max" in data: g.prix_usd_max = float(data["prix_usd_max"]) if data["prix_usd_max"] else None
+    if "prix_clinique_usd" in data:
+        g.prix_clinique_usd = float(data["prix_clinique_usd"]) if data["prix_clinique_usd"] else None
+    if "actif" in data: g.actif = bool(data["actif"])
+    if "prix_fixe" in data: g.prix_fixe = bool(data["prix_fixe"])
+    db.commit()
+    return {"message": "Geste mis à jour"}
+
+
+@router.delete("/admin/tarifs/geste/{gid}", tags=["Admin - Tarifs"])
+async def supprimer_geste(gid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
+    g = db.query(models.GesteMedical).filter(models.GesteMedical.id == gid).first()
+    if not g: raise HTTPException(404)
+    g.actif = False; db.commit()
+    return {"message": "Geste désactivé"}
+
+
+# ── Taux de change ────────────────────────────────────────────────────────────
+
+@router.post("/caissier/taux-change", status_code=201, tags=["Caissier - Taux"])
+async def saisir_taux_change(data: dict, db: Session = Depends(get_db),
+                              current_user=Depends(get_current_user)):
+    """Caissier saisit le taux de change HTG/USD du jour."""
+    taux_htg = float(data.get("taux_htg", 0))
+    if taux_htg <= 0:
+        raise HTTPException(422, "Taux invalide — doit être > 0")
+    t = models.TauxChange(taux_htg=taux_htg, saisi_par=current_user.id)
+    db.add(t); db.commit()
+    return {"message": f"Taux mis à jour: 1 USD = {taux_htg} HTG", "taux_htg": taux_htg}
+
+
+@router.get("/caissier/taux-change", tags=["Caissier - Taux"])
+async def get_taux_change(db: Session = Depends(get_db), _=Depends(get_current_user)):
+    """Taux de change HTG/USD en vigueur."""
+    t = db.query(models.TauxChange).order_by(models.TauxChange.date.desc()).first()
+    return {
+        "taux_htg": t.taux_htg if t else 130.0,
+        "date": str(t.date) if t else None,
+        "is_default": t is None,
+    }
+
+
+# ── Seed admin (initialisation depuis les barèmes) ───────────────────────────
+
+@router.post("/admin/seed-tarifs", tags=["Admin - Tarifs"])
+async def seed_baremes(db: Session = Depends(get_db), _=Depends(require_admin)):
+    """
+    Initialise le catalogue avec les barèmes de référence.
+    À n'exécuter qu'une fois. N'écrase pas les prix clinique déjà saisis.
+    """
+    from app.seed_tarifs import GESTES
+    created = 0
+    skipped = 0
+    for (spec, cat, lib, prix_usd, prix_min, prix_max, source, prix_htg) in GESTES:
+        existing = db.query(models.GesteMedical).filter(
+            models.GesteMedical.specialite == spec,
+            models.GesteMedical.libelle == lib,
+        ).first()
+        if existing:
+            skipped += 1
+            continue
+        g = models.GesteMedical(
+            specialite=spec, categorie=cat, libelle=lib,
+            prix_usd=float(prix_usd) if prix_usd else 0,
+            prix_usd_min=float(prix_min) if prix_min else None,
+            prix_usd_max=float(prix_max) if prix_max else None,
+            prix_htg_ref=float(prix_htg) if prix_htg else None,
+            source_bareme=source,
+            actif=True,
+        )
+        db.add(g)
+        created += 1
+    db.commit()
+    return {
+        "message": f"{created} gestes importés, {skipped} déjà existants",
+        "created": created, "skipped": skipped
+    }

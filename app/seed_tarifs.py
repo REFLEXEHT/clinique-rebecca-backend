@@ -1,0 +1,361 @@
+"""
+Seed des barèmes de référence — Clinique de la Rebecca
+Sources:
+  AHC  = Association Haïtienne de Chirurgie (2017) — USD
+  SHOG = Société Haïtienne d'Obstétrique et Gynécologie (2021) — USD
+  SHP  = Société Haïtienne de Pédiatrie (2023) — HTG
+  SHA  = Société Haïtienne d'Anesthésie (via SHA docx) — HTG + USD
+
+POLITIQUE: Prix affichés en USD. Taux du jour saisi par la caisse → calcul HTG.
+Données non publiques — accès admin uniquement.
+"""
+
+GESTES = [
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHIRURGIE GÉNÉRALE (AHC 2017 — USD)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Abcès
+    ("Chirurgie Générale","Abcès","Abcès sous cutané — Incision/Drainage AL",100,None,None,"AHC",None),
+    ("Chirurgie Générale","Abcès","Abcès sous cutané — Débridement",900,None,None,"AHC",None),
+    ("Chirurgie Générale","Abcès","Abcès intra musculaire — Incision/Drainage AG",400,None,None,"AHC",None),
+    ("Chirurgie Générale","Abcès","Adéno phlegmon diffus — Incision/Drainage AL",400,None,None,"AHC",None),
+    ("Chirurgie Générale","Abcès","Anthrax — Incision",400,None,None,"AHC",None),
+    ("Chirurgie Générale","Abcès","Phlegmon gaine digitale — Incision/Drainage",400,None,None,"AHC",None),
+    ("Chirurgie Générale","Abcès","Phlegmon gaine digito carpienne — Incision/Drainage",400,None,None,"AHC",None),
+    # Brûlures
+    ("Chirurgie Générale","Brûlures","Brûlure <10% SC — 1er Pansement",120,None,None,"AHC",None),
+    ("Chirurgie Générale","Brûlures","Brûlure 10-20% SC — 1er Pansement",200,None,None,"AHC",None),
+    ("Chirurgie Générale","Brûlures","Brûlure >20% SC — 1er Pansement",400,None,None,"AHC",None),
+    ("Chirurgie Générale","Brûlures","Pansement de Brûlure sous AG",300,None,None,"AHC",None),
+    # Peau / Greffes
+    ("Chirurgie Générale","Peau","Greffe dermo épidermique <50cm²",400,None,None,"AHC",None),
+    ("Chirurgie Générale","Peau","Greffe dermo épidermique 50-200cm²",600,None,None,"AHC",None),
+    ("Chirurgie Générale","Peau","Greffe dermo épidermique >200cm²",1300,None,None,"AHC",None),
+    ("Chirurgie Générale","Peau","Greffe de peau épaisse",500,None,None,"AHC",None),
+    ("Chirurgie Générale","Peau","Plastie en Z",700,None,None,"AHC",None),
+    ("Chirurgie Générale","Peau","Lambeau fascio cutané pédiculé",800,None,None,"AHC",None),
+    ("Chirurgie Générale","Peau","Lambeau musculo cutané pédiculé",900,None,None,"AHC",None),
+    # Plaies
+    ("Chirurgie Générale","Plaies & Sutures","Suture plaie superficielle",200,None,None,"AHC",None),
+    ("Chirurgie Générale","Plaies & Sutures","Suture plaie étendue/profonde",300,None,None,"AHC",None),
+    ("Chirurgie Générale","Plaies & Sutures","Suture secondaire AL",200,None,None,"AHC",None),
+    ("Chirurgie Générale","Plaies & Sutures","Suture secondaire AG",700,None,None,"AHC",None),
+    # Tumeurs
+    ("Chirurgie Générale","Tumeurs","Sinus pilonidal — Excision",1600,None,None,"AHC",None),
+    ("Chirurgie Générale","Tumeurs","Ablation tumeur cutanée/sous cutanée + plastie",700,None,None,"AHC",None),
+    ("Chirurgie Générale","Tumeurs","Ablation tumeur cutanée/sous cutanée AG",700,None,None,"AHC",None),
+    ("Chirurgie Générale","Tumeurs","Ablation tumeur cutanée/sous cutanée AL",300,None,None,"AHC",None),
+    ("Chirurgie Générale","Tumeurs","Biopsie ganglionnaire AL",400,None,None,"AHC",None),
+    ("Chirurgie Générale","Tumeurs","Biopsie ganglionnaire AG",800,None,None,"AHC",None),
+    ("Chirurgie Générale","Tumeurs","Kyste sébacé — Exérèse",300,None,None,"AHC",None),
+    ("Chirurgie Générale","Tumeurs","Kyste téno synovial AG",600,None,None,"AHC",None),
+    # Thyroïde / Cou
+    ("Chirurgie Générale","Cou & Thyroïde","Parotidectomie superficielle",2000,None,None,"AHC",None),
+    ("Chirurgie Générale","Cou & Thyroïde","Exérèse glande sous maxillaire",1300,None,None,"AHC",None),
+    ("Chirurgie Générale","Cou & Thyroïde","Exérèse Kyste thyréo-glossal",1400,None,None,"AHC",None),
+    ("Chirurgie Générale","Cou & Thyroïde","Lobectomie thyroïdienne",1800,None,None,"AHC",None),
+    ("Chirurgie Générale","Cou & Thyroïde","Thyroïdectomie subtotale",1950,None,None,"AHC",None),
+    ("Chirurgie Générale","Cou & Thyroïde","Thyroïdectomie totale",2300,None,None,"AHC",None),
+    ("Chirurgie Générale","Cou & Thyroïde","Trachéotomie en sélectif",1000,None,None,"AHC",None),
+    ("Chirurgie Générale","Cou & Thyroïde","Trachéotomie en urgence",1500,None,None,"AHC",None),
+    # Seins
+    ("Chirurgie Générale","Seins","Biopsie incisionnelle du sein",400,None,None,"AHC",None),
+    ("Chirurgie Générale","Seins","Excision tumeur sein sous cutanée AL",300,None,None,"AHC",None),
+    ("Chirurgie Générale","Seins","Excision tumeur sein sous cutanée AG",700,None,None,"AHC",None),
+    ("Chirurgie Générale","Seins","Abcès du sein — Incision/Drainage AG",400,None,None,"AHC",None),
+    ("Chirurgie Générale","Seins","Quadrantectomie mammaire",1200,None,None,"AHC",None),
+    ("Chirurgie Générale","Seins","Mastectomie radicale modifiée (Patey)",2400,None,None,"AHC",None),
+    ("Chirurgie Générale","Seins","Mastectomie totale",1400,None,None,"AHC",None),
+    ("Chirurgie Générale","Seins","Mastectomie bilatérale",2200,None,None,"AHC",None),
+    # Thorax
+    ("Chirurgie Générale","Thorax","Drainage thoracique/pleural",1200,None,None,"AHC",None),
+    ("Chirurgie Générale","Thorax","Drainage thoracique bilatéral",2800,None,None,"AHC",None),
+    ("Chirurgie Générale","Thorax","Thoracotomie pour trauma",1500,None,None,"AHC",None),
+    ("Chirurgie Générale","Thorax","Lobectomie pulmonaire",2400,None,None,"AHC",None),
+    ("Chirurgie Générale","Thorax","Pneumonectomie",4000,None,None,"AHC",None),
+    ("Chirurgie Générale","Thorax","Drainage péricardique",1500,None,None,"AHC",None),
+    # Abdomen / Hernies
+    ("Chirurgie Générale","Abdomen & Hernies","Hernie inguinale — Herniorraphie",1000,None,None,"AHC",None),
+    ("Chirurgie Générale","Abdomen & Hernies","Hernie inguinale — Hernioplastie",1200,None,None,"AHC",None),
+    ("Chirurgie Générale","Abdomen & Hernies","Hernie ombilicale — Herniorraphie",1000,None,None,"AHC",None),
+    ("Chirurgie Générale","Abdomen & Hernies","Hernie incisionnelle — Herniorraphie",1100,None,None,"AHC",None),
+    ("Chirurgie Générale","Abdomen & Hernies","Hernie incisionnelle — Hernioplastie",1500,None,None,"AHC",None),
+    ("Chirurgie Générale","Abdomen & Hernies","Hernie étranglée sans résection",1400,None,None,"AHC",None),
+    ("Chirurgie Générale","Abdomen & Hernies","Hernie étranglée avec résection",1800,None,None,"AHC",None),
+    ("Chirurgie Générale","Abdomen & Hernies","Hernie fémorale/crurale",1000,None,None,"AHC",None),
+    ("Chirurgie Générale","Abdomen & Hernies","Hernie bilatérale — Hernioplastie",1800,None,None,"AHC",None),
+    ("Chirurgie Générale","Abdomen & Hernies","Laparotomie exploratrice avec/sans biopsie",1000,None,None,"AHC",None),
+    # Estomac
+    ("Chirurgie Générale","Estomac","Gastrectomie des 2/3",2600,None,None,"AHC",None),
+    ("Chirurgie Générale","Estomac","Gastrectomie totale",3300,None,None,"AHC",None),
+    ("Chirurgie Générale","Estomac","Gastrostomie",1200,None,None,"AHC",None),
+    ("Chirurgie Générale","Estomac","Ulcus perforé — Suture/Patching",1900,None,None,"AHC",None),
+    ("Chirurgie Générale","Estomac","Vagotomie tronculaire + antrectomie",2300,None,None,"AHC",None),
+    ("Chirurgie Générale","Estomac","Vagotomie + dérivation",1900,None,None,"AHC",None),
+    # Foie / Voies biliaires
+    ("Chirurgie Générale","Foie & Voies Biliaires","Cholécystectomie simple",1800,None,None,"AHC",None),
+    ("Chirurgie Générale","Foie & Voies Biliaires","Cholécystectomie laparoscopique",4000,None,None,"AHC",None),
+    ("Chirurgie Générale","Foie & Voies Biliaires","Cholécystectomie + exploration cholédoque",2400,None,None,"AHC",None),
+    ("Chirurgie Générale","Foie & Voies Biliaires","Abcès hépatique — Incision/Drainage",1600,None,None,"AHC",None),
+    ("Chirurgie Générale","Foie & Voies Biliaires","Hépatectomie droite réglée",4000,None,None,"AHC",None),
+    ("Chirurgie Générale","Foie & Voies Biliaires","Hépatectomie gauche réglée",2800,None,None,"AHC",None),
+    # Pancréas
+    ("Chirurgie Générale","Pancréas","Biopsie pancréatique",1100,None,None,"AHC",None),
+    ("Chirurgie Générale","Pancréas","Duodéno-pancréatectomie céphalique (Whipple)",5000,None,None,"AHC",None),
+    ("Chirurgie Générale","Pancréas","Nécrosectomie du pancréas",2000,None,None,"AHC",None),
+    ("Chirurgie Générale","Pancréas","Pancréatectomie caudale",2600,None,None,"AHC",None),
+    ("Chirurgie Générale","Pancréas","Pancréatectomie totale",4500,None,None,"AHC",None),
+    # Intestins / Appendice
+    ("Chirurgie Générale","Intestins & Appendice","Appendicectomie",2400,None,None,"AHC",None),
+    ("Chirurgie Générale","Intestins & Appendice","Abcès appendiculaire",1500,None,None,"AHC",None),
+    ("Chirurgie Générale","Intestins & Appendice","Péritonite appendiculaire",1700,None,None,"AHC",None),
+    ("Chirurgie Générale","Intestins & Appendice","Résection anastomose iléo-iléale",1400,None,None,"AHC",None),
+    ("Chirurgie Générale","Intestins & Appendice","Colostomie",1300,None,None,"AHC",None),
+    ("Chirurgie Générale","Intestins & Appendice","Fermeture/réintégration colostomie",1600,None,None,"AHC",None),
+    ("Chirurgie Générale","Intestins & Appendice","Résection anastomose colique",1500,None,None,"AHC",None),
+    ("Chirurgie Générale","Intestins & Appendice","Colectomie totale",3900,None,None,"AHC",None),
+    ("Chirurgie Générale","Intestins & Appendice","Hémi colectomie droite",2400,None,None,"AHC",None),
+    ("Chirurgie Générale","Intestins & Appendice","Hémi colectomie gauche",2500,None,None,"AHC",None),
+    # Rectum / Anus
+    ("Chirurgie Générale","Rectum & Anus","Abcès marge anale — Incision/Drainage AL",600,None,None,"AHC",None),
+    ("Chirurgie Générale","Rectum & Anus","Abcès ischio rectal",800,None,None,"AHC",None),
+    ("Chirurgie Générale","Rectum & Anus","Fistule anale",2000,None,None,"AHC",None),
+    ("Chirurgie Générale","Rectum & Anus","Sphinctérotomie latérale interne — Fissure anale",1000,None,None,"AHC",None),
+    ("Chirurgie Générale","Rectum & Anus","Hémorroïdectomie",1200,None,None,"AHC",None),
+    ("Chirurgie Générale","Rectum & Anus","Thrombose hémorroïdaire — Évacuation AL",400,None,None,"AHC",None),
+    ("Chirurgie Générale","Rectum & Anus","Prolapsus rectal — Fixation abdominale",1800,None,None,"AHC",None),
+    ("Chirurgie Générale","Rectum & Anus","Amputation abdominopérinéale (Miles)",4000,None,None,"AHC",None),
+    # Vasculaire
+    ("Chirurgie Générale","Vasculaire","Stripping veineux unilatéral",2000,None,None,"AHC",None),
+    ("Chirurgie Générale","Vasculaire","Fistule artério-veineuse pour dialyse",2000,None,None,"AHC",None),
+    ("Chirurgie Générale","Vasculaire","Anévrysme aorte abdominale infra rénal",8000,None,None,"AHC",None),
+    ("Chirurgie Générale","Vasculaire","Pontage veineux ilio fémoral",4000,None,None,"AHC",None),
+    ("Chirurgie Générale","Vasculaire","Désobstruction artérielle (embolectomie) + fasciotomie",3000,None,None,"AHC",None),
+    # Divers Chir
+    ("Chirurgie Générale","Divers","Amputation doigt ou orteil",500,None,None,"AHC",None),
+    ("Chirurgie Générale","Divers","Amputation trans métatarsienne",1000,None,None,"AHC",None),
+    ("Chirurgie Générale","Divers","Amputation sous condylienne (BK)",1600,None,None,"AHC",None),
+    ("Chirurgie Générale","Divers","Amputation supra condylienne (AK)",1600,None,None,"AHC",None),
+    ("Chirurgie Générale","Divers","Circoncision",500,None,None,"AHC",None),
+    ("Chirurgie Générale","Divers","Hydrocèle unilatérale — Cure chirurgicale",600,None,None,"AHC",None),
+    ("Chirurgie Générale","Divers","Hydrocèle bilatérale — Cure chirurgicale",1000,None,None,"AHC",None),
+    ("Chirurgie Générale","Divers","Pose cathéter voie veineuse centrale",500,None,None,"AHC",None),
+    ("Chirurgie Générale","Divers","Pose cathéter tunélisé voie veineuse centrale",700,None,None,"AHC",None),
+    ("Chirurgie Générale","Divers","Adrénalectomie unilatérale",3000,None,None,"AHC",None),
+    ("Chirurgie Générale","Divers","Adrénalectomie bilatérale",4500,None,None,"AHC",None),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # GYNÉCOLOGIE / OBSTÉTRIQUE (SHOG 2021 — USD)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Consultations
+    ("Gynécologie/Obstétrique","Consultations","Consultation en cabinet",36,None,None,"SHOG",3500),
+    ("Gynécologie/Obstétrique","Consultations","Visite à l'hôpital",41,None,None,"SHOG",4000),
+    ("Gynécologie/Obstétrique","Consultations","Consultation spécialisée à l'hôpital — jour",46,None,None,"SHOG",4500),
+    ("Gynécologie/Obstétrique","Consultations","Consultation spécialisée à l'hôpital — nuit",51,None,None,"SHOG",5000),
+    ("Gynécologie/Obstétrique","Consultations","Visite à domicile — jour",81,None,None,"SHOG",8000),
+    ("Gynécologie/Obstétrique","Consultations","Visite à domicile — nuit",102,None,None,"SHOG",10000),
+    # Rapports médicaux
+    ("Gynécologie/Obstétrique","Rapports Médicaux","Certificat médical",36,None,None,"SHOG",3500),
+    ("Gynécologie/Obstétrique","Rapports Médicaux","Résumé suivi prénatal en français",71,None,None,"SHOG",7000),
+    ("Gynécologie/Obstétrique","Rapports Médicaux","Résumé dossier médical à l'hôpital",76,None,None,"SHOG",7500),
+    # Échographies
+    ("Gynécologie/Obstétrique","Échographie","Échographie pelvienne/gynécologique",41,None,None,"SHOG",4000),
+    ("Gynécologie/Obstétrique","Échographie","Échographie T1 (grossesse mono/multiple)",41,None,None,"SHOG",4000),
+    ("Gynécologie/Obstétrique","Échographie","Échographie T2 (mono fœtale)",41,None,None,"SHOG",4000),
+    ("Gynécologie/Obstétrique","Échographie","Échographie T2 (grossesse multiple)",82,None,None,"SHOG",8000),
+    ("Gynécologie/Obstétrique","Échographie","Échographie T3 (mono fœtale)",41,None,None,"SHOG",4000),
+    ("Gynécologie/Obstétrique","Échographie","Échographie T3 (grossesse multiple)",82,None,None,"SHOG",8000),
+    ("Gynécologie/Obstétrique","Échographie","Échographie mammaire",81,None,None,"SHOG",8000),
+    ("Gynécologie/Obstétrique","Échographie","Échographie 3D/4D",122,None,None,"SHOG",12000),
+    ("Gynécologie/Obstétrique","Échographie","Échographie obstétricale avec Doppler",82,None,None,"SHOG",8000),
+    ("Gynécologie/Obstétrique","Échographie","Hystéro-sonographie",61,None,None,"SHOG",6000),
+    ("Gynécologie/Obstétrique","Échographie","Non Stress Test (NST)",102,None,None,"SHOG",10000),
+    ("Gynécologie/Obstétrique","Échographie","Profil biophysique (PBP)",71,None,None,"SHOG",7000),
+    # Planification familiale
+    ("Gynécologie/Obstétrique","Planification Familiale","Pose DIU inerte",41,None,None,"SHOG",4000),
+    ("Gynécologie/Obstétrique","Planification Familiale","Pose DIU hormonal",254,None,None,"SHOG",25000),
+    ("Gynécologie/Obstétrique","Planification Familiale","Retrait simple de DIU",36,None,None,"SHOG",3500),
+    ("Gynécologie/Obstétrique","Planification Familiale","Retrait compliqué de DIU (perte du fil)",51,None,None,"SHOG",5000),
+    ("Gynécologie/Obstétrique","Planification Familiale","Retrait de DIU incrusté dans le myomètre",153,None,None,"SHOG",15000),
+    ("Gynécologie/Obstétrique","Planification Familiale","Pose d'implant",36,None,None,"SHOG",3500),
+    ("Gynécologie/Obstétrique","Planification Familiale","Retrait d'implant",36,None,None,"SHOG",3500),
+    ("Gynécologie/Obstétrique","Planification Familiale","Ligature des trompes isolée",254,None,None,"SHOG",25000),
+    ("Gynécologie/Obstétrique","Planification Familiale","Ligature des trompes au cours d'une césarienne",102,None,None,"SHOG",10000),
+    # Gestes obstétricaux
+    ("Gynécologie/Obstétrique","Obstétrique","Accouchement vaginal — Travail spontané (1 fœtus)",610,None,None,"SHOG",60000),
+    ("Gynécologie/Obstétrique","Obstétrique","Accouchement vaginal — Induction du travail (1 fœtus)",660,None,None,"SHOG",65000),
+    ("Gynécologie/Obstétrique","Obstétrique","Accouchement vaginal de jumeaux",761,None,None,"SHOG",75000),
+    ("Gynécologie/Obstétrique","Obstétrique","Accouchement AVAC (ancienne césarisée)",813,None,None,"SHOG",80000),
+    ("Gynécologie/Obstétrique","Obstétrique","Section césarienne simple (CPD–SFA)",863,None,None,"SHOG",85000),
+    ("Gynécologie/Obstétrique","Obstétrique","Section césarienne à faibles risques",1015,None,None,"SHOG",100000),
+    ("Gynécologie/Obstétrique","Obstétrique","Section césarienne à haut risque (UC3+)",1219,None,None,"SHOG",120000),
+    ("Gynécologie/Obstétrique","Obstétrique","Cerclage cervical trans vaginal",508,None,None,"SHOG",50000),
+    ("Gynécologie/Obstétrique","Obstétrique","Amniocentèse",407,None,None,"SHOG",40000),
+    ("Gynécologie/Obstétrique","Obstétrique","Amnio-infusion",254,None,None,"SHOG",25000),
+    ("Gynécologie/Obstétrique","Obstétrique","Version céphalique — Manœuvre externe",203,None,None,"SHOG",20000),
+    ("Gynécologie/Obstétrique","Obstétrique","Césarienne-hystérectomie",1219,None,None,"SHOG",120000),
+    # Gestes gynécologiques
+    ("Gynécologie/Obstétrique","Gynécologie","Biopsie du col utérin (hors colposcopie)",51,None,None,"SHOG",5000),
+    ("Gynécologie/Obstétrique","Gynécologie","Biopsie endométriale au cabinet",51,None,None,"SHOG",5000),
+    ("Gynécologie/Obstétrique","Gynécologie","Colposcopie + Biopsie dirigée (ECC)",102,None,None,"SHOG",10000),
+    ("Gynécologie/Obstétrique","Gynécologie","Colposcopie avec exérèse de polype",153,None,None,"SHOG",15000),
+    ("Gynécologie/Obstétrique","Gynécologie","Conisation à chaud (LEEP/LLETZ)",508,None,None,"SHOG",50000),
+    ("Gynécologie/Obstétrique","Gynécologie","Conisation à froid",457,None,None,"SHOG",45000),
+    ("Gynécologie/Obstétrique","Gynécologie","Cryothérapie",205,None,None,"SHOG",20000),
+    ("Gynécologie/Obstétrique","Gynécologie","Curetage utérin (évacuation utérine)",407,None,None,"SHOG",40000),
+    ("Gynécologie/Obstétrique","Gynécologie","Glande de Bartholin — Marsupialisation/Drainage",254,None,None,"SHOG",25000),
+    ("Gynécologie/Obstétrique","Gynécologie","Hystéroscopie diagnostique",305,None,None,"SHOG",30000),
+    ("Gynécologie/Obstétrique","Gynécologie","Hystéroscopie opératoire (polype)",410,None,None,"SHOG",40000),
+    ("Gynécologie/Obstétrique","Gynécologie","Hystéroscopie opératoire (myome)",800,None,None,"SHOG",80000),
+    ("Gynécologie/Obstétrique","Gynécologie","Hystérectomie totale trans-annexielle",1523,None,None,"SHOG",150000),
+    ("Gynécologie/Obstétrique","Gynécologie","Hystérectomie totale + annexectomie",2060,None,None,"SHOG",200000),
+    ("Gynécologie/Obstétrique","Gynécologie","Hystérectomie radicale (Wertheim)",2540,None,None,"SHOG",250000),
+    ("Gynécologie/Obstétrique","Gynécologie","Laparoscopie diagnostique",800,None,None,"SHOG",80000),
+    ("Gynécologie/Obstétrique","Gynécologie","Laparoscopie opératoire simple",1523,None,None,"SHOG",150000),
+    ("Gynécologie/Obstétrique","Gynécologie","Laparotomie pour GEU rompue",1016,None,None,"SHOG",100000),
+    ("Gynécologie/Obstétrique","Gynécologie","Myomectomie simple (<5 fibromes)",1016,None,None,"SHOG",100000),
+    ("Gynécologie/Obstétrique","Gynécologie","Myomectomie multiple (5-15 fibromes)",1523,None,None,"SHOG",150000),
+    ("Gynécologie/Obstétrique","Gynécologie","Myomectomie multiple (>15 fibromes)",2031,None,None,"SHOG",200000),
+    ("Gynécologie/Obstétrique","Gynécologie","Ovariectomie/Annexectomie/Kystectomie en sélectif",1016,None,None,"SHOG",100000),
+    ("Gynécologie/Obstétrique","Gynécologie","Pap test sur lame",31,None,None,"SHOG",3000),
+    ("Gynécologie/Obstétrique","Gynécologie","Pap test en milieu liquide",91,None,None,"SHOG",9000),
+    ("Gynécologie/Obstétrique","Gynécologie","HPV DNA Testing (sérotypes oncogènes)",102,None,None,"SHOG",10000),
+    ("Gynécologie/Obstétrique","Gynécologie","IVA — Inspection visuelle à l'acide acétique",51,None,None,"SHOG",5000),
+    ("Gynécologie/Obstétrique","Gynécologie","Périnéoplastie / Labioplastie",356,None,None,"SHOG",35000),
+    ("Gynécologie/Obstétrique","Gynécologie","Cure de cystocèle ou rectocèle",813,None,None,"SHOG",80000),
+    ("Gynécologie/Obstétrique","Gynécologie","Cure de fistule vésico-vaginale",1523,None,None,"SHOG",150000),
+    ("Gynécologie/Obstétrique","Gynécologie","Seins — Biopsie à l'aiguille fine (BAF)",152,None,None,"SHOG",15000),
+    ("Gynécologie/Obstétrique","Gynécologie","Seins — Exérèse adénofibrome (tumorectomie)",508,None,None,"SHOG",50000),
+    ("Gynécologie/Obstétrique","Gynécologie","Vulvectomie simple",1523,None,None,"SHOG",150000),
+    ("Gynécologie/Obstétrique","Gynécologie","Vulvectomie radicale",2030,None,None,"SHOG",200000),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PÉDIATRIE (SHP 2023 — HTG → converti en USD approximatif à 130 HTG/USD)
+    # ══════════════════════════════════════════════════════════════════════════
+    ("Pédiatrie","Consultations","Consultation pédiatrique en cabinet",23,None,None,"SHP",3000),
+    ("Pédiatrie","Consultations","Abonnement pédiatrique",31,None,None,"SHP",4000),
+    ("Pédiatrie","Consultations","Certificat médical pédiatrique",7,None,None,"SHP",1000),
+    ("Pédiatrie","Consultations","Rapport médical pédiatrique",23,None,None,"SHP",3000),
+    ("Pédiatrie","Consultations","Remplacement carnet vaccinal",23,None,None,"SHP",3000),
+    ("Pédiatrie","À l'Hôpital","Assistance accouchement physiologique (pédiatre)",231,None,None,"SHP",30000),
+    ("Pédiatrie","À l'Hôpital","Assistance section césarienne (pédiatre)",308,None,None,"SHP",40000),
+    ("Pédiatrie","À l'Hôpital","Déplacement nocturne A/P ou S/C",77,None,None,"SHP",10000),
+    ("Pédiatrie","À l'Hôpital","Hospitalisation + 1ère visite pédiatrique",96,None,None,"SHP",12500),
+    ("Pédiatrie","À l'Hôpital","Visite hospitalière pédiatrique",58,None,None,"SHP",7500),
+    ("Pédiatrie","Urgences","Déplacement urgence de jour (non hospitalisé)",77,None,None,"SHP",10000),
+    ("Pédiatrie","Urgences","Déplacement urgence de nuit (visite comprise)",115,None,None,"SHP",15000),
+    ("Pédiatrie","Procédures","Cathéter ombilical",58,None,None,"SHP",7500),
+    ("Pédiatrie","Procédures","Exsanguino-transfusion",577,None,None,"SHP",75000),
+    ("Pédiatrie","Procédures","Intubation pédiatrique",38,None,None,"SHP",5000),
+    ("Pédiatrie","Procédures","Nébulisation",12,None,None,"SHP",1500),
+    ("Pédiatrie","Procédures","Mise en place d'une perfusion",15,None,None,"SHP",2000),
+    ("Pédiatrie","Procédures","Ponction artérielle",15,None,None,"SHP",2000),
+    ("Pédiatrie","Procédures","Ponction veineuse",12,None,None,"SHP",1500),
+    ("Pédiatrie","Procédures","Ponction lombaire",38,None,None,"SHP",5000),
+    ("Pédiatrie","Procédures","Thoracentèse / Paracentèse",46,None,None,"SHP",6000),
+    ("Pédiatrie","Procédures","Tubage gastrique / Pose Levine",8,None,None,"SHP",1000),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHIRURGIE PÉDIATRIQUE (AHC 2017 — USD)
+    # ══════════════════════════════════════════════════════════════════════════
+    ("Chirurgie Pédiatrique","Face & Cou","Fente labiale unilatérale — Chéilotomie",1800,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Face & Cou","Fente labiale bilatérale",2200,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Face & Cou","Fente palatine",1800,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Face & Cou","Trachéotomie pédiatrique sans intubation",1100,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Face & Cou","Kyste et fistule préauriculaire — Exérèse",900,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Thorax","Canal artériel — Ligature ou section",4000,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Thorax","Drainage thoracique pédiatrique unilatéral",1200,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Thorax","Lobectomie pulmonaire pédiatrique",3000,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Œsophage","Atrésie de l'œsophage type 1 (reconstruction)",3000,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Œsophage","Atrésie de l'œsophage type 3",4000,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Œsophage","Fistule trachéo-œsophagienne",4000,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Abdomen","Sténose hypertrophique du pylore (pyloromyotomie)",1200,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Abdomen","Atrésie duodénale — Cure",1600,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Abdomen","Invagination intestinale avec résection",2000,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Abdomen","Invagination intestinale sans résection",1700,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Abdomen","Hernie inguino-scrotale pédiatrique",1000,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Colo-rectal","Maladie de Hirschprung — Cure après colostomie",2300,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Colo-rectal","Atrésie rectum — Cure",2000,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Colo-rectal","Malformation ano-rectale haute",3600,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Foie & Biliaire","Atrésie voies biliaires (Kasai)",3600,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Appareil génital","Orchidopexie (cryptorchidie) unilatérale",1200,None,None,"AHC",None),
+    ("Chirurgie Pédiatrique","Appareil génital","Torsion de testicule",3000,None,None,"AHC",None),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ANESTHÉSIOLOGIE (SHA — USD extrait du docx)
+    # ══════════════════════════════════════════════════════════════════════════
+    ("Anesthésiologie","Consultations & Assistance","Demande de consultation anesthésique",50,None,None,"SHA",2200),
+    ("Anesthésiologie","Consultations & Assistance","Visite/consultation anesthésique",50,None,None,"SHA",2200),
+    ("Anesthésiologie","Consultations & Assistance","Sédation",300,250,350,"SHA",None),
+    ("Anesthésiologie","Consultations & Assistance","Assistance anesthésique",165,150,180,"SHA",None),
+    ("Anesthésiologie","Réanimation","Prise en charge réanimation",500,None,None,"SHA",22500),
+    ("Anesthésiologie","Réanimation","Heure supplémentaire réanimation",50,None,None,"SHA",2200),
+    ("Anesthésiologie","Réanimation","Journée en réanimation",100,None,None,"SHA",4400),
+    ("Anesthésiologie","Réanimation","Nuit en réanimation",150,None,None,"SHA",6600),
+    # Critères d'ajustement
+    ("Anesthésiologie","Critères d'Ajustement","Nouveau-né 0-3 mois (supplément)",150,None,None,"SHA",6600),
+    ("Anesthésiologie","Critères d'Ajustement","Enfant 3 mois à 2 ans (supplément)",120,None,None,"SHA",5300),
+    ("Anesthésiologie","Critères d'Ajustement","Adulte >70 ans (supplément)",120,None,None,"SHA",5300),
+    ("Anesthésiologie","Critères d'Ajustement","Heure supplémentaire (supplément)",50,None,None,"SHA",2200),
+    ("Anesthésiologie","Critères d'Ajustement","Facteurs de risque HTA/Diabète (supplément)",75,50,100,"SHA",None),
+    ("Anesthésiologie","Critères d'Ajustement","Reprise chirurgicale (supplément)",100,None,None,"SHA",4400),
+    ("Anesthésiologie","Critères d'Ajustement","Urgence (supplément)",100,None,None,"SHA",4400),
+    ("Anesthésiologie","Critères d'Ajustement","Risque technique (supplément)",150,None,None,"SHA",6600),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # UROLOGIE (SHA docx — USD)
+    # ══════════════════════════════════════════════════════════════════════════
+    ("Urologie","Urologie","Circoncision adulte",300,None,None,"SHA",15000),
+    ("Urologie","Urologie","Circoncision enfant",400,None,None,"SHA",17500),
+    ("Urologie","Urologie","Plastie de la verge",800,None,None,"SHA",35000),
+    ("Urologie","Urologie","Néphrectomie",1000,None,None,"SHA",45000),
+    ("Urologie","Urologie","Cancer rénal — Néphrectomie",1200,None,None,"SHA",52500),
+    ("Urologie","Urologie","Résection trans-urétral de la prostate (TURP)",800,None,None,"SHA",35000),
+    ("Urologie","Urologie","Adénomectomie prostatique ouverte (ATV)",800,None,None,"SHA",35000),
+    ("Urologie","Urologie","Prostatectomie radicale",1750,1500,2000,"SHA",None),
+    ("Urologie","Urologie","Cystoscopie",350,None,None,"SHA",16000),
+    ("Urologie","Urologie","Cystostomie",500,None,None,"SHA",22500),
+    ("Urologie","Urologie","Cystectomie",1750,1500,2000,"SHA",None),
+    ("Urologie","Urologie","Varicocèle unilatérale",400,None,None,"SHA",17500),
+    ("Urologie","Urologie","Varicocèle bilatérale",600,None,None,"SHA",27500),
+    ("Urologie","Urologie","Hydrocèle unilatérale",300,None,None,"SHA",15000),
+    ("Urologie","Urologie","Hydrocèle bilatérale",450,None,None,"SHA",20000),
+    ("Urologie","Urologie","Orchidectomie",500,None,None,"SHA",22500),
+    ("Urologie","Urologie","Torsion de testicule avec orchidectomie",550,None,None,"SHA",25000),
+    ("Urologie","Urologie","Fistule vésico-vaginale",1250,1000,1500,"SHA",None),
+    ("Urologie","Urologie","Extraction calcul par urétéroscopie",900,600,1200,"SHA",None),
+    ("Urologie","Urologie","Biopsie de la prostate",350,None,None,"SHA",16000),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ORTHOPÉDIE (SHA docx — USD)
+    # ══════════════════════════════════════════════════════════════════════════
+    ("Orthopédie","Rachis","Hernie discale — Laminectomie",1200,None,None,"SHA",52500),
+    ("Orthopédie","Rachis","Discoidectomie",1200,None,None,"SHA",52500),
+    ("Orthopédie","Rachis","Greffe cervicale antérieure/postérieure",1500,None,None,"SHA",67500),
+    ("Orthopédie","Hanche","Enclouage hanche",1250,1000,1500,"SHA",None),
+    ("Orthopédie","Hanche","Prothèse de hanche partielle",1250,1000,1500,"SHA",None),
+    ("Orthopédie","Hanche","Prothèse de hanche totale",2000,None,None,"SHA",90000),
+    ("Orthopédie","Hanche","Arthrodèse hanche",1200,None,None,"SHA",52500),
+    ("Orthopédie","Membres inférieurs","Fracture fémur — Enclouage (Küntscher)",1000,None,None,"SHA",45000),
+    ("Orthopédie","Membres inférieurs","Fracture fémur — Plaque vissée",1200,None,None,"SHA",52500),
+    ("Orthopédie","Membres inférieurs","Prothèse totale de genou",2000,None,None,"SHA",90000),
+    ("Orthopédie","Membres inférieurs","Arthroscopie unilatérale genou",850,None,None,"SHA",37500),
+    ("Orthopédie","Membres inférieurs","Fracture 2 os jambe — Réduction ouverte",1000,None,None,"SHA",45000),
+    ("Orthopédie","Membres inférieurs","Fracture bimalléolaire — Réduction ouverte",850,None,None,"SHA",37500),
+    ("Orthopédie","Membres inférieurs","Réparation tendon d'Achille",800,None,None,"SHA",35000),
+    ("Orthopédie","Membres inférieurs","Amputation jambe unilatérale",700,None,None,"SHA",30000),
+    ("Orthopédie","Membres supérieurs","Fracture 2 os avant-bras — Réduction ouverte",800,None,None,"SHA",35000),
+    ("Orthopédie","Membres supérieurs","Fracture col chirurgicale de l'humérus — Plaque",900,800,1000,"SHA",None),
+    ("Orthopédie","Divers Ortho","Saucérisation — Séquestrectomie",600,None,None,"SHA",27500),
+    ("Orthopédie","Divers Ortho","Exostose",600,None,None,"SHA",27500),
+    ("Orthopédie","Divers Ortho","Ongle incarné (1 pied)",400,None,None,"SHA",17500),
+    ("Orthopédie","Divers Ortho","Hygroma kystique",500,None,None,"SHA",22500),
+    ("Orthopédie","Divers Ortho","Prise de greffon iliaque",300,None,None,"SHA",15000),
+]
+
+print(f"Total gestes: {len(GESTES)}")
+# Count by specialite
+from collections import Counter
+c = Counter(g[0] for g in GESTES)
+for k, v in sorted(c.items()):
+    print(f"  {k}: {v}")

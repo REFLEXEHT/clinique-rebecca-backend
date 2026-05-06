@@ -4419,14 +4419,20 @@ async def seed_baremes(db: Session = Depends(get_db), _=Depends(require_admin)):
     """
     from app.seed_tarifs import GESTES
     created = 0
-    skipped = 0
+    updated = 0
     for (spec, cat, lib, prix_usd, prix_min, prix_max, source, prix_htg) in GESTES:
         existing = db.query(models.GesteMedical).filter(
             models.GesteMedical.specialite == spec,
             models.GesteMedical.libelle == lib,
         ).first()
         if existing:
-            skipped += 1
+            # Mettre à jour prix_htg_ref et corriger prix_usd si SHP (ne pas écraser prix_clinique_usd)
+            existing.prix_htg_ref = float(prix_htg) if prix_htg else existing.prix_htg_ref
+            existing.source_bareme = source
+            if source == "SHP":
+                existing.prix_usd = 0  # SHP = HTG uniquement, pas de conversion approximative
+            existing.categorie = cat
+            updated += 1
             continue
         g = models.GesteMedical(
             specialite=spec, categorie=cat, libelle=lib,
@@ -4441,6 +4447,6 @@ async def seed_baremes(db: Session = Depends(get_db), _=Depends(require_admin)):
         created += 1
     db.commit()
     return {
-        "message": f"{created} gestes importés, {skipped} déjà existants",
-        "created": created, "skipped": skipped
+        "message": f"{created} gestes importés, {updated} mis à jour",
+        "created": created, "updated": updated
     }

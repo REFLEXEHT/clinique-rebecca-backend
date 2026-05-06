@@ -230,30 +230,32 @@ GESTES = [
     ("Gynécologie/Obstétrique","Gynécologie","Vulvectomie radicale",2030,None,None,"SHOG",200000),
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PÉDIATRIE (SHP 2023 — HTG → converti en USD approximatif à 130 HTG/USD)
+    # PÉDIATRIE (SHP 2023 — Prix officiels en GOURDES uniquement)
+    # prix_usd=0 → à définir par la clinique dans l'interface admin
+    # prix_htg_ref = prix du barème SHP 2023 en HTG
     # ══════════════════════════════════════════════════════════════════════════
-    ("Pédiatrie","Consultations","Consultation pédiatrique en cabinet",23,None,None,"SHP",3000),
-    ("Pédiatrie","Consultations","Abonnement pédiatrique",31,None,None,"SHP",4000),
-    ("Pédiatrie","Consultations","Certificat médical pédiatrique",7,None,None,"SHP",1000),
-    ("Pédiatrie","Consultations","Rapport médical pédiatrique",23,None,None,"SHP",3000),
-    ("Pédiatrie","Consultations","Remplacement carnet vaccinal",23,None,None,"SHP",3000),
-    ("Pédiatrie","À l'Hôpital","Assistance accouchement physiologique (pédiatre)",231,None,None,"SHP",30000),
-    ("Pédiatrie","À l'Hôpital","Assistance section césarienne (pédiatre)",308,None,None,"SHP",40000),
-    ("Pédiatrie","À l'Hôpital","Déplacement nocturne A/P ou S/C",77,None,None,"SHP",10000),
-    ("Pédiatrie","À l'Hôpital","Hospitalisation + 1ère visite pédiatrique",96,None,None,"SHP",12500),
-    ("Pédiatrie","À l'Hôpital","Visite hospitalière pédiatrique",58,None,None,"SHP",7500),
-    ("Pédiatrie","Urgences","Déplacement urgence de jour (non hospitalisé)",77,None,None,"SHP",10000),
-    ("Pédiatrie","Urgences","Déplacement urgence de nuit (visite comprise)",115,None,None,"SHP",15000),
-    ("Pédiatrie","Procédures","Cathéter ombilical",58,None,None,"SHP",7500),
-    ("Pédiatrie","Procédures","Exsanguino-transfusion",577,None,None,"SHP",75000),
-    ("Pédiatrie","Procédures","Intubation pédiatrique",38,None,None,"SHP",5000),
-    ("Pédiatrie","Procédures","Nébulisation",12,None,None,"SHP",1500),
-    ("Pédiatrie","Procédures","Mise en place d'une perfusion",15,None,None,"SHP",2000),
-    ("Pédiatrie","Procédures","Ponction artérielle",15,None,None,"SHP",2000),
-    ("Pédiatrie","Procédures","Ponction veineuse",12,None,None,"SHP",1500),
-    ("Pédiatrie","Procédures","Ponction lombaire",38,None,None,"SHP",5000),
-    ("Pédiatrie","Procédures","Thoracentèse / Paracentèse",46,None,None,"SHP",6000),
-    ("Pédiatrie","Procédures","Tubage gastrique / Pose Levine",8,None,None,"SHP",1000),
+    ("Pédiatrie","Consultations","Consultation pédiatrique en cabinet",0,None,None,"SHP",3000),
+    ("Pédiatrie","Consultations","Abonnement pédiatrique",0,None,None,"SHP",4000),
+    ("Pédiatrie","Consultations","Certificat médical pédiatrique",0,None,None,"SHP",500),
+    ("Pédiatrie","Consultations","Rapport médical pédiatrique",0,None,None,"SHP",3000),
+    ("Pédiatrie","Consultations","Remplacement carnet vaccinal",0,None,None,"SHP",3000),
+    ("Pédiatrie","À l'Hôpital","Assistance accouchement physiologique (pédiatre)",0,None,None,"SHP",30000),
+    ("Pédiatrie","À l'Hôpital","Assistance section césarienne (pédiatre)",0,None,None,"SHP",40000),
+    ("Pédiatrie","À l'Hôpital","Déplacement nocturne A/P ou S/C (supplément)",0,None,None,"SHP",10000),
+    ("Pédiatrie","À l'Hôpital","Hospitalisation + 1ère visite pédiatrique",0,None,None,"SHP",12500),
+    ("Pédiatrie","À l'Hôpital","Visite hospitalière pédiatrique",0,None,None,"SHP",7500),
+    ("Pédiatrie","Urgences","Déplacement urgence de jour (non hospitalisé)",0,None,None,"SHP",10000),
+    ("Pédiatrie","Urgences","Déplacement urgence de nuit (visite comprise)",0,None,None,"SHP",15000),
+    ("Pédiatrie","Procédures","Cathéter ombilical",0,None,None,"SHP",7500),
+    ("Pédiatrie","Procédures","Exsanguino-transfusion",0,None,None,"SHP",75000),
+    ("Pédiatrie","Procédures","Intubation pédiatrique",0,None,None,"SHP",5000),
+    ("Pédiatrie","Procédures","Nébulisation",0,None,None,"SHP",1500),
+    ("Pédiatrie","Procédures","Mise en place d'une perfusion",0,None,None,"SHP",2000),
+    ("Pédiatrie","Procédures","Ponction artérielle",0,None,None,"SHP",2000),
+    ("Pédiatrie","Procédures","Ponction veineuse",0,None,None,"SHP",1500),
+    ("Pédiatrie","Procédures","Ponction lombaire",0,None,None,"SHP",5000),
+    ("Pédiatrie","Procédures","Thoracentèse / Paracentèse",0,None,None,"SHP",6000),
+    ("Pédiatrie","Procédures","Tubage gastrique / Pose Levine",0,None,None,"SHP",1000),
 
     # ══════════════════════════════════════════════════════════════════════════
     # CHIRURGIE PÉDIATRIQUE (AHC 2017 — USD)

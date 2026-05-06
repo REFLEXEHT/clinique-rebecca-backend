@@ -4074,3 +4074,100 @@ async def rechercher_patient_caisse(q: str = "", db: Session = Depends(get_db),
             "created_at": str(p.created_at),
         } for p in patients]
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VÉRIFICATION DE PAIEMENT — Utilisé par infirmier, médecin, tout le personnel
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/verification-paiement", tags=["Vérification Paiement"])
+async def verifier_paiement(
+    q: str = "",
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    """
+    Vérifie si un patient a payé aujourd'hui.
+    Cherche par: ticket (#XXXXXXXX), numéro patient (#RB-XXXX), téléphone, ou nom.
+    Accessible à tout le personnel authentifié (infirmier, médecin, labo, caissier, admin).
+    """
+    if not q or len(q.strip()) < 2:
+        raise HTTPException(400, "Fournir un ticket, numéro patient, téléphone ou nom")
+
+    q = q.strip()
+    from sqlalchemy import cast, Date as SADate
+    aujourd_hui = datetime.now(timezone.utc).date()
+
+    # Cherche dans les RDV du jour (ticket ou patient_email ou patient_nom)
+    rdvs = db.query(models.RendezVous).filter(
+        cast(models.RendezVous.date_rdv, SADate) == aujourd_hui,
+    ).filter(
+        models.RendezVous.code_patient.ilike(f"%{q}%") |
+        models.RendezVous.patient_nom.ilike(f"%{q}%") |
+        models.RendezVous.patient_telephone.ilike(f"%{q}%") |
+        models.RendezVous.patient_email.ilike(f"%{q}%")
+    ).order_by(models.RendezVous.date_rdv.desc()).all()
+
+    # Si rien trouvé via RDV, cherche via Patient.numero
+    if not rdvs:
+        patient = db.query(models.Patient).filter(
+            models.Patient.numero.ilike(f"%{q.upper()}%") |
+            models.Patient.telephone.ilike(f"%{q}%") |
+            models.Patient.nom.ilike(f"%{q}%")
+        ).first()
+        if patient:
+            rdvs = db.query(models.RendezVous).filter(
+                cast(models.RendezVous.date_rdv, SADate) == aujourd_hui,
+                models.RendezVous.patient_email == patient.email,
+            ).order_by(models.RendezVous.date_rdv.desc()).all()
+
+    if not rdvs:
+        return {
+            "trouve": False,
+            "message": "Aucun enregistrement trouvé pour ce patient aujourd'hui",
+            "paiements": []
+        }
+
+    # Construire la réponse avec statut clair pour chaque service
+    STATUTS = {
+        "paiement_effectue": {"libelle": "✅ PAYÉ", "couleur": "#16a34a", "ok": True},
+        "confirme":          {"libelle": "✅ PAYÉ & CONFIRMÉ", "couleur": "#16a34a", "ok": True},
+        "en_attente":        {"libelle": "⏳ EN ATTENTE DE PAIEMENT", "couleur": "#d97706", "ok": False},
+        "paiement_requis":   {"libelle": "💳 PAIEMENT REQUIS", "couleur": "#dc2626", "ok": False},
+    }
+
+    paiements = []
+    for r in rdvs:
+        statut_str = str(r.statut).split(".")[-1] if "." in str(r.statut) else str(r.statut)
+        info_statut = STATUTS.get(statut_str, {"libelle": statut_str, "couleur": "#64748b", "ok": False})
+
+        # Chercher le mouvement de paiement lié
+        mouvement = None
+        if r.mouvement_id:
+            mouvement = db.query(models.Mouvement).filter(models.Mouvement.id == r.mouvement_id).first()
+
+        paiements.append({
+            "rdv_id": r.id,
+            "ticket": r.code_patient,
+            "patient_nom": r.patient_nom,
+            "patient_telephone": r.patient_telephone,
+            "service": r.specialite,
+            "heure": str(r.date_rdv),
+            "statut": statut_str,
+            "statut_libelle": info_statut["libelle"],
+            "statut_couleur": info_statut["couleur"],
+            "paiement_ok": info_statut["ok"],
+            "recu_numero": mouvement.numero_piece if mouvement else None,
+            "montant": mouvement.montant if mouvement else None,
+            "mode_paiement": mouvement.mode_paiement if mouvement else None,
+            "notes": r.notes_admin,
+        })
+
+    # Le patient a-t-il payé au moins un service aujourd'hui?
+    a_paye = any(p["paiement_ok"] for p in paiements)
+
+    return {
+        "trouve": True,
+        "a_paye": a_paye,
+        "message": "✅ Paiement confirmé" if a_paye else "⚠️ Paiement non confirmé",
+        "paiements": paiements,
+    }

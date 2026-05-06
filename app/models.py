@@ -182,6 +182,7 @@ class Specialiste(Base):
     __tablename__ = "specialistes"
     id          = Column(Integer, primary_key=True, index=True)
     nom         = Column(String(255), nullable=False)
+    titre       = Column(String(20), default="Dr")   # Dr, Mr, Mme, etc.
     specialite  = Column(String(255), nullable=False)
     description = Column(Text)
     emoji       = Column(String(10), default="👨‍⚕️")
@@ -224,6 +225,9 @@ class Patient(Base):
     allergies      = Column(Text)
     antecedents    = Column(Text)
     notes          = Column(Text)
+    age            = Column(Integer, nullable=True)
+    contact_urgence = Column(String(255), nullable=True)
+    is_premiere_visite = Column(Boolean, default=True)
     created_by     = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
     # Deux identifiants distincts

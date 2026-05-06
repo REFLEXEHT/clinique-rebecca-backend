@@ -108,6 +108,7 @@ class ServiceOut(BaseModel):
 # ─── Specialistes ────────────────────────────────────────────────────────────
 class SpecialisteCreate(BaseModel):
     nom: str
+    titre: str = "Dr"
     specialite: str
     description: Optional[str] = None
     emoji: str = "👨‍⚕️"
@@ -119,6 +120,7 @@ class SpecialisteCreate(BaseModel):
 
 class SpecialisteUpdate(BaseModel):
     nom: Optional[str] = None
+    titre: Optional[str] = None
     specialite: Optional[str] = None
     description: Optional[str] = None
     emoji: Optional[str] = None
@@ -132,6 +134,7 @@ class SpecialisteUpdate(BaseModel):
 class SpecialisteOut(BaseModel):
     id: int
     nom: str
+    titre: str = "Dr"
     specialite: str
     description: Optional[str]
     emoji: str

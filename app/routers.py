@@ -2517,13 +2517,26 @@ async def enregistrer_depense(data: dict, request: Request,
                                current_user=Depends(get_current_user)):
     """Enregistre une dépense/décaissement journalier"""
     import uuid as uid2
-    num = f"DEP-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(uid2.uuid4())[:6].upper()}"
+    now = datetime.now(timezone.utc)
+    num = f"DEP-{now.strftime('%Y%m%d')}-{str(uid2.uuid4())[:6].upper()}"
+    montant = float(data.get('montant', 0))
+    categorie = data.get('categorie', 'Dépense')
     
     mouvement = models.Mouvement(
         numero_piece=num,
-        description=f"[{data.get('categorie','')}] {data.get('description','')}",
-        montant_credit=float(data.get('montant', 0)),
-        mode_paiement=data.get('mode','especes'),
+        journal=models.JournalEnum.ACH,
+        type=models.TypeMouvementEnum.depense,
+        categorie=categorie,
+        description=f"[{categorie}] {data.get('description', '')}",
+        montant=montant,
+        compte_debit="6",    # Charges
+        compte_credit="511", # Caisse
+        libelle_debit=categorie,
+        libelle_credit="Caisse HTG",
+        mode_paiement=data.get('mode', 'especes'),
+        periode_mois=now.month,
+        periode_annee=now.year,
+        created_by=current_user.id,
     )
     db.add(mouvement); db.commit()
     
@@ -2535,7 +2548,7 @@ async def enregistrer_depense(data: dict, request: Request,
     return {
         "id": mouvement.id, "numero_piece": num,
         "categorie": data.get('categorie'), "description": data.get('description'),
-        "montant": float(data.get('montant',0)), "mode": data.get('mode')
+        "montant": montant, "mode": data.get('mode')
     }
 
 
@@ -2547,11 +2560,11 @@ async def depenses_du_jour(db: Session = Depends(get_db),
     aujourd_hui = datetime.now(timezone.utc).date()
     
     depenses = db.query(models.Mouvement).filter(
-        cast(models.Mouvement.date, SADate) == aujourd_hui,
-        models.Mouvement.montant_credit > 0
-    ).order_by(models.Mouvement.date.desc()).all()
+        cast(models.Mouvement.created_at, SADate) == aujourd_hui,
+        models.Mouvement.type == models.TypeMouvementEnum.depense,
+    ).order_by(models.Mouvement.created_at.desc()).all()
     
-    total = sum(float(d.montant_credit or 0) for d in depenses)
+    total = sum(float(d.montant or 0) for d in depenses)
     
     return {
         "depenses": [
@@ -3806,3 +3819,258 @@ def migrate_db_v2(db: Session = Depends(get_db)):
         errors.append(str(e))
 
     return {"message": "Migration v2 terminée", "errors": errors}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QUEUE / FILE D'ATTENTE CLINIQUE — Système temps réel
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/caissier/enregistrer-visite", status_code=201, tags=["Caissier - Queue"])
+async def enregistrer_visite_avec_paiement(data: dict, request: Request,
+                                             db: Session = Depends(get_db),
+                                             current_user=Depends(get_current_user)):
+    """
+    Caissier enregistre un nouveau patient OU un retour, choisit le service,
+    encaisse le paiement, et envoie le patient dans la queue infirmière.
+    """
+    import uuid as uuid_q
+    nom    = data.get("nom", "").upper().strip()
+    prenom = data.get("prenom", "").strip()
+    if not nom or not prenom:
+        raise HTTPException(422, "Nom et prénom requis")
+
+    # Créer ou retrouver patient
+    patient = db.query(models.Patient).filter(
+        models.Patient.telephone == data.get("telephone", "")
+    ).first() if data.get("telephone") else None
+
+    if not patient:
+        count = db.query(models.Patient).count()
+        patient = models.Patient(
+            nom=nom, prenom=prenom,
+            age=data.get("age"),
+            telephone=data.get("telephone", ""),
+            email=data.get("email", ""),
+            adresse=data.get("adresse", ""),
+            contact_urgence=data.get("contact_urgence", ""),
+            numero=f"#RB-{(count + 1):04d}",
+            is_premiere_visite=True,
+            service=data.get("service", "clinique"),
+            created_by=current_user.id,
+        )
+        db.add(patient); db.flush()
+    else:
+        patient.is_premiere_visite = False
+
+    # Enregistrer le paiement
+    service = data.get("service", "Consultation")
+    montant = float(data.get("montant", 0))
+    mode    = data.get("mode_paiement", "especes")
+    now     = datetime.now(timezone.utc)
+
+    if montant > 0:
+        num_piece = _next_numero_piece("VTE", now.year, db)
+        mouvement = models.Mouvement(
+            numero_piece=num_piece,
+            journal=models.JournalEnum.VTE,
+            type=models.TypeMouvementEnum.recette,
+            categorie="Consultation",
+            description=f"Consultation — {prenom} {nom} — {service}",
+            montant=montant,
+            compte_debit="511",  # Caisse
+            compte_credit="701", # Recettes consultations
+            libelle_debit="Caisse HTG",
+            libelle_credit="Recettes consultations",
+            mode_paiement=mode,
+            periode_mois=now.month,
+            periode_annee=now.year,
+            created_by=current_user.id,
+        )
+        db.add(mouvement); db.flush()
+
+    # Créer une entrée dans la queue infirmière
+    ticket_id = str(uuid_q.uuid4())[:8].upper()
+    queue_entry = {
+        "ticket": ticket_id,
+        "patient_id": patient.id,
+        "patient_numero": patient.numero,
+        "patient_nom": f"{prenom} {nom}",
+        "patient_telephone": patient.telephone,
+        "service": service,
+        "priorite": data.get("priorite", "normal"),  # urgent, normal
+        "created_at": now.isoformat(),
+        "statut": "en_attente_infirmier",
+    }
+    # Stocker dans un RDV simplifié pour que l'infirmier puisse voir
+    rdv = models.RendezVous(
+        patient_id=patient.id,
+        patient_nom=f"{prenom} {nom}",
+        patient_telephone=patient.telephone or "",
+        patient_email=patient.email or "",
+        code_patient=ticket_id,
+        specialite=service,
+        date_rdv=now,
+        type_rdv=models.TypeRDVEnum.presentiel,
+        statut=models.StatutRDVEnum.paiement_effectue if montant > 0 else models.StatutRDVEnum.en_attente,
+        notes_admin=f"Queue caisse #{ticket_id} | Priorité: {data.get('priorite','normal')}",
+        created_by=current_user.id,
+    )
+    db.add(rdv); db.commit(); db.refresh(patient); db.refresh(rdv)
+
+    log_audit(db, "VISITE_ENREGISTREE", actor_id=current_user.id, actor_role="caissier",
+              target_id=patient.numero, target_type="patient",
+              details=f"{service} | {montant} HTG | ticket #{ticket_id}")
+
+    return {
+        "patient": {
+            "id": patient.id, "numero": patient.numero,
+            "nom": f"{prenom} {nom}", "telephone": patient.telephone,
+            "is_premiere_visite": patient.is_premiere_visite,
+        },
+        "ticket": ticket_id,
+        "rdv_id": rdv.id,
+        "service": service,
+        "montant": montant,
+        "message": f"Patient {patient.numero} enregistré — ticket #{ticket_id} envoyé à l'infirmière",
+    }
+
+
+@router.get("/caissier/dernier-patient", tags=["Caissier - Queue"])
+async def dernier_patient_enregistre(db: Session = Depends(get_db),
+                                      current_user=Depends(get_current_user)):
+    """Retourne le dernier patient enregistré par la caisse (pour retrouver un ID oublié)"""
+    dernier = db.query(models.Patient).order_by(
+        models.Patient.created_at.desc()
+    ).first()
+    if not dernier:
+        return {"patient": None}
+    return {
+        "patient": {
+            "id": dernier.id, "numero": dernier.numero,
+            "nom": dernier.nom, "prenom": dernier.prenom,
+            "telephone": dernier.telephone,
+            "created_at": str(dernier.created_at),
+        }
+    }
+
+
+@router.get("/infirmier/queue", tags=["Infirmier - Queue"])
+async def queue_infirmier(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """File d'attente de l'infirmier — patients en attente de signes vitaux"""
+    aujourd_hui = datetime.now(timezone.utc).date()
+    from sqlalchemy import cast, Date as SADate
+
+    en_attente = db.query(models.RendezVous).filter(
+        cast(models.RendezVous.date_rdv, SADate) == aujourd_hui,
+        models.RendezVous.statut.in_([
+            models.StatutRDVEnum.paiement_effectue.value,
+            models.StatutRDVEnum.en_attente.value,
+        ])
+    ).order_by(models.RendezVous.date_rdv).all()
+
+    return {
+        "total": len(en_attente),
+        "patients": [{
+            "rdv_id": r.id,
+            "ticket": r.code_patient,
+            "patient_nom": r.patient_nom,
+            "patient_telephone": r.patient_telephone,
+            "service": r.specialite,
+            "statut": str(r.statut),
+            "heure": str(r.date_rdv),
+            "priorite": "urgent" if "urgent" in (r.notes_admin or "").lower() else "normal",
+            "notes": r.notes_admin,
+        } for r in en_attente],
+    }
+
+
+@router.put("/infirmier/signes-vitaux/{rdv_id}", tags=["Infirmier - Queue"])
+async def enregistrer_signes_vitaux(rdv_id: int, data: dict,
+                                     db: Session = Depends(get_db),
+                                     current_user=Depends(get_current_user)):
+    """Infirmier enregistre les signes vitaux et envoie vers le médecin"""
+    rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
+    if not rdv:
+        raise HTTPException(404, "RDV introuvable")
+
+    notes_sv = (f"TA: {data.get('tension','—')} | "
+                f"Pouls: {data.get('pouls','—')} | "
+                f"Temp: {data.get('temperature','—')}°C | "
+                f"Poids: {data.get('poids','—')} kg | "
+                f"SpO2: {data.get('spo2','—')}%")
+
+    rdv.statut = models.StatutRDVEnum.confirme  # → médecin peut voir
+    rdv.notes_admin = f"{rdv.notes_admin or ''}\n[Signes vitaux] {notes_sv}"
+    db.commit()
+
+    return {"message": "Signes vitaux enregistrés — patient envoyé vers le médecin", "rdv_id": rdv_id}
+
+
+@router.get("/infirmier/alertes-prescriptions", tags=["Infirmier - Alertes"])
+async def alertes_prescriptions_infirmier(db: Session = Depends(get_db),
+                                           current_user=Depends(get_current_user)):
+    """Alertes: prescriptions labo ou pharmacie en attente de suivi"""
+    from sqlalchemy import cast, Date as SADate
+    aujourd_hui = datetime.now(timezone.utc).date()
+    seuil = datetime.now(timezone.utc) - timedelta(hours=4)
+
+    prescriptions = db.query(models.Prescription).filter(
+        models.Prescription.date_prescription >= seuil,
+    ).order_by(models.Prescription.date_prescription.desc()).limit(20).all()
+
+    return {
+        "alertes": [{
+            "id": p.id,
+            "patient_id": p.patient_id,
+            "medecin_nom": p.medecin_nom,
+            "medicaments": p.medicaments,
+            "examens_requis": p.examens_requis if hasattr(p, 'examens_requis') else None,
+            "date": str(p.date_prescription),
+            "type": "labo" if (hasattr(p, 'examens_requis') and p.examens_requis) else "pharmacie",
+        } for p in prescriptions]
+    }
+
+
+@router.get("/labo/queue", tags=["Labo - Queue"])
+async def queue_laboratoire(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """File d'attente laboratoire — examens à réaliser aujourd'hui"""
+    from sqlalchemy import cast, Date as SADate
+    aujourd_hui = datetime.now(timezone.utc).date()
+
+    examens = db.query(models.ResultatLabo).filter(
+        cast(models.ResultatLabo.date_examen, SADate) == aujourd_hui,
+        models.ResultatLabo.status.in_(["en_attente", "prescrit"]),
+    ).order_by(models.ResultatLabo.date_examen).all()
+
+    return {
+        "total": len(examens),
+        "examens": [{
+            "id": e.id,
+            "patient_id": e.patient_id,
+            "type_examen": e.type_examen,
+            "statut": e.status,
+            "date": str(e.date_examen),
+            "notes": e.notes,
+        } for e in examens]
+    }
+
+
+@router.get("/caissier/recherche-patient", tags=["Caissier - Queue"])
+async def rechercher_patient_caisse(q: str = "", db: Session = Depends(get_db),
+                                     current_user=Depends(get_current_user)):
+    """Recherche patient par nom, téléphone ou numéro #RB-XXXX"""
+    if len(q) < 2:
+        return {"patients": []}
+    patients = db.query(models.Patient).filter(
+        models.Patient.nom.ilike(f"%{q}%") |
+        models.Patient.prenom.ilike(f"%{q}%") |
+        models.Patient.telephone.ilike(f"%{q}%") |
+        models.Patient.numero.ilike(f"%{q}%")
+    ).limit(10).all()
+    return {
+        "patients": [{
+            "id": p.id, "numero": p.numero,
+            "nom": p.nom, "prenom": p.prenom,
+            "telephone": p.telephone,
+            "created_at": str(p.created_at),
+        } for p in patients]
+    }

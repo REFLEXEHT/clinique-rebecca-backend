@@ -116,6 +116,10 @@ class SpecialisteCreate(BaseModel):
     email: Optional[str] = None
     telephone: Optional[str] = None
     ordre: int = 0
+    # Champs tarif — stockés dans TarifMedecin après création
+    prix_consultation: Optional[float] = None
+    prix_rdv: Optional[float] = None
+    type_medecin: Optional[str] = None
 
 
 class SpecialisteUpdate(BaseModel):
@@ -129,6 +133,10 @@ class SpecialisteUpdate(BaseModel):
     telephone: Optional[str] = None
     actif: Optional[bool] = None
     ordre: Optional[int] = None
+    # Champs tarif
+    prix_consultation: Optional[float] = None
+    prix_rdv: Optional[float] = None
+    type_medecin: Optional[str] = None
 
 
 class SpecialisteOut(BaseModel):
@@ -142,6 +150,10 @@ class SpecialisteOut(BaseModel):
     email: Optional[str]
     telephone: Optional[str]
     actif: bool
+    # Champs tarif (joints depuis TarifMedecin si disponibles)
+    prix_consultation: Optional[float] = None
+    prix_rdv: Optional[float] = None
+    type_medecin: Optional[str] = None
 
     class Config:
         from_attributes = True

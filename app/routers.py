@@ -291,11 +291,23 @@ async def delete_service(sid: int, db: Session = Depends(get_db), _=Depends(requ
     svc.actif = False; db.commit(); return {"message": "Supprimé"}
 
 @router.get("/admin/specialistes", response_model=List[schemas.SpecialisteOut], tags=["Spécialistes"])
-async def list_specialistes(categorie: Optional[str] = None, db: Session = Depends(get_db)):
+async def list_specialistes_admin(categorie: Optional[str] = None, db: Session = Depends(get_db)):
     q = db.query(models.Specialiste).filter(models.Specialiste.actif == True)
     if categorie and categorie != "tous":
         q = q.filter(models.Specialiste.categorie.in_([categorie, "tous"]))
-    return q.order_by(models.Specialiste.ordre).all()
+    specs = q.order_by(models.Specialiste.ordre).all()
+    results = []
+    for s in specs:
+        tarif = db.query(models.TarifMedecin).filter(
+            models.TarifMedecin.specialiste_id == s.id
+        ).first()
+        item = schemas.SpecialisteOut.model_validate(s)
+        if tarif:
+            item.prix_consultation = tarif.prix_consultation
+            item.prix_rdv = tarif.prix_rdv
+            item.type_medecin = str(tarif.type_medecin.value) if tarif.type_medecin else None
+        results.append(item)
+    return results
 
 @router.get("/specialistes/{spec_id}", response_model=schemas.SpecialisteOut, tags=["Spécialistes"])
 async def get_specialiste(spec_id: int, db: Session = Depends(get_db)):
@@ -304,37 +316,110 @@ async def get_specialiste(spec_id: int, db: Session = Depends(get_db)):
 
 @router.post("/admin/specialistes", response_model=schemas.SpecialisteOut, tags=["Admin"])
 async def create_specialiste(data: schemas.SpecialisteCreate, db: Session = Depends(get_db), _=Depends(require_admin)):
-    s = models.Specialiste(**data.model_dump()); db.add(s); db.commit(); db.refresh(s); return s
+    # Extraire les champs tarif avant de créer le Specialiste
+    prix_consultation = data.prix_consultation
+    prix_rdv = data.prix_rdv
+    type_medecin_val = data.type_medecin
+
+    spec_data = data.model_dump(exclude={"prix_consultation", "prix_rdv", "type_medecin"})
+    s = models.Specialiste(**spec_data)
+    db.add(s)
+    db.flush()
+
+    # Créer ou mettre à jour le TarifMedecin associé
+    tarif = db.query(models.TarifMedecin).filter(
+        models.TarifMedecin.specialiste_id == s.id
+    ).first()
+    if tarif:
+        if prix_consultation is not None: tarif.prix_consultation = prix_consultation
+        if prix_rdv is not None: tarif.prix_rdv = prix_rdv
+        if type_medecin_val: tarif.type_medecin = type_medecin_val
+    else:
+        from app.models import TypeMedecinEnum
+        tm_enum = None
+        if type_medecin_val:
+            try: tm_enum = TypeMedecinEnum(type_medecin_val)
+            except: pass
+        tarif = models.TarifMedecin(
+            specialiste_id=s.id,
+            medecin_nom=f"{s.titre} {s.nom}",
+            specialite=s.specialite,
+            prix_consultation=prix_consultation or 0,
+            prix_rdv=prix_rdv or 0,
+            type_medecin=tm_enum,
+            actif=True,
+        )
+        db.add(tarif)
+
+    db.commit()
+    db.refresh(s)
+
+    # Construire la réponse avec les champs tarif
+    result = schemas.SpecialisteOut.model_validate(s)
+    result.prix_consultation = prix_consultation
+    result.prix_rdv = prix_rdv
+    result.type_medecin = type_medecin_val
+    return result
 
 @router.put("/admin/specialistes/{sid}", response_model=schemas.SpecialisteOut, tags=["Admin"])
 async def update_specialiste(sid: int, data: schemas.SpecialisteUpdate, db: Session = Depends(get_db), _=Depends(require_admin)):
     s = db.query(models.Specialiste).filter(models.Specialiste.id == sid).first()
     if not s: raise HTTPException(404)
-    
+
     old_nom = s.nom
     update_data = data.model_dump(exclude_none=True)
+
+    # Extraire champs tarif avant mise à jour Specialiste
+    prix_consultation = update_data.pop("prix_consultation", None)
+    prix_rdv = update_data.pop("prix_rdv", None)
+    type_medecin_val = update_data.pop("type_medecin", None)
+
     for k, v in update_data.items(): setattr(s, k, v)
     db.commit(); db.refresh(s)
-    
-    # ── PROPAGATION: sync TarifMedecin if name changed ──────────────────
-    if 'nom' in update_data and update_data['nom'] != old_nom:
+
+    # Mettre à jour TarifMedecin si champs tarif fournis
+    if prix_consultation is not None or prix_rdv is not None or type_medecin_val is not None:
         tarif = db.query(models.TarifMedecin).filter(
-            models.TarifMedecin.nom_medecin == old_nom
+            models.TarifMedecin.specialiste_id == sid
         ).first()
         if tarif:
-            tarif.nom_medecin = update_data['nom']
+            if prix_consultation is not None: tarif.prix_consultation = prix_consultation
+            if prix_rdv is not None: tarif.prix_rdv = prix_rdv
+            if type_medecin_val:
+                from app.models import TypeMedecinEnum
+                try: tarif.type_medecin = TypeMedecinEnum(type_medecin_val)
+                except: pass
+            db.commit()
+
+    # ── PROPAGATION: sync TarifMedecin name if name changed ─────────────
+    if 'nom' in update_data and update_data['nom'] != old_nom:
+        tarif = db.query(models.TarifMedecin).filter(
+            models.TarifMedecin.medecin_nom.contains(old_nom)
+        ).first()
+        if tarif:
+            tarif.medecin_nom = f"{s.titre} {update_data['nom']}"
             if 'specialite' in update_data:
                 tarif.specialite = update_data['specialite']
             db.commit()
-    
+
     # ── PROPAGATION: sync User table if email or specialite changed ─────
     if 'email' in update_data or 'specialite' in update_data:
         user = db.query(models.User).filter(models.User.email == s.email).first()
         if user:
             if 'specialite' in update_data: user.specialite = update_data['specialite']
             db.commit()
-    
-    return s
+
+    # Récupérer le tarif pour retourner les prix dans la réponse
+    tarif_final = db.query(models.TarifMedecin).filter(
+        models.TarifMedecin.specialiste_id == sid
+    ).first()
+
+    result = schemas.SpecialisteOut.model_validate(s)
+    if tarif_final:
+        result.prix_consultation = tarif_final.prix_consultation
+        result.prix_rdv = tarif_final.prix_rdv
+        result.type_medecin = str(tarif_final.type_medecin.value) if tarif_final.type_medecin else None
+    return result
 
 @router.delete("/admin/specialistes/{sid}", tags=["Admin"])
 async def delete_specialiste(sid: int, db: Session = Depends(get_db), _=Depends(require_admin)):
@@ -2536,6 +2621,9 @@ async def enregistrer_depense(data: dict, request: Request,
     
     if montant <= 0:
         raise HTTPException(422, "Montant invalide — doit être supérieur à 0")
+
+    if not categorie or categorie.strip() == "":
+        raise HTTPException(422, "Catégorie requise")
     
     try:
         mouvement = _creer_mouvement(
@@ -2594,7 +2682,7 @@ async def depenses_du_jour(db: Session = Depends(get_db),
     
     return {
         "depenses": [
-            {"id":d.id, "description":d.description, "montant":float(d.montant_credit or 0),
+            {"id":d.id, "description":d.description, "montant":float(d.montant or 0),
              "mode":d.mode_paiement or 'especes', "categorie": (d.description or '').split(']')[0].replace('[','')}
             for d in depenses
         ],
@@ -3859,7 +3947,18 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
     ).first() if data.get("telephone") else None
 
     if not patient:
-        count = db.query(models.Patient).count()
+        # Générer un numéro séquentiel basé sur le MAX existant (évite les collisions)
+        from sqlalchemy import func as sqlfunc
+        last_numero = db.query(sqlfunc.max(models.Patient.numero)).scalar()
+        if last_numero and last_numero.startswith("#RB-"):
+            try:
+                last_n = int(last_numero.replace("#RB-", ""))
+            except:
+                last_n = db.query(models.Patient).count()
+        else:
+            last_n = db.query(models.Patient).count()
+        new_numero = f"#RB-{(last_n + 1):04d}"
+
         patient = models.Patient(
             nom=nom, prenom=prenom,
             age=data.get("age"),
@@ -3867,7 +3966,7 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
             email=data.get("email", ""),
             adresse=data.get("adresse", ""),
             contact_urgence=data.get("contact_urgence", ""),
-            numero=f"#RB-{(count + 1):04d}",
+            numero=new_numero,
             is_premiere_visite=True,
             service=data.get("service", "clinique"),
             created_by=current_user.id,
@@ -3919,6 +4018,8 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
         "statut": "en_attente_infirmier",
     }
     # Stocker dans un RDV simplifié pour que l'infirmier puisse voir
+    medecin_nom_val = data.get("medecin_nom", "") or ""
+    praticien_val   = data.get("praticien", "") or medecin_nom_val  # compatibilité double champ
     rdv = models.RendezVous(
         patient_id=patient.id,
         patient_nom=f"{prenom} {nom}",
@@ -3926,10 +4027,11 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
         patient_email=patient.email or "",
         code_patient=ticket_id,
         specialite=service,
+        medecin_nom=praticien_val or medecin_nom_val or None,
         date_rdv=now,
         type_rdv=models.TypeRDVEnum.presentiel,
         statut=models.StatutRDVEnum.paiement_effectue if montant > 0 else models.StatutRDVEnum.en_attente,
-        notes_admin=f"Queue caisse #{ticket_id} | Priorité: {data.get('priorite','normal')}",
+        notes_admin=f"Queue caisse #{ticket_id} | Priorité: {data.get('priorite','normal')}" + (f" | Praticien: {praticien_val}" if praticien_val else ""),
         created_by=current_user.id,
     )
     db.add(rdv); db.commit(); db.refresh(patient); db.refresh(rdv)
@@ -3948,6 +4050,8 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
         "rdv_id": rdv.id,
         "service": service,
         "montant": montant,
+        "mode_paiement": mode,
+        "medecin_nom": praticien_val or medecin_nom_val or "",
         "message": f"Patient {patient.numero} enregistré — ticket #{ticket_id} envoyé à l'infirmière",
     }
 

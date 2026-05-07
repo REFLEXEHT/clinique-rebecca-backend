@@ -2820,9 +2820,9 @@ async def dashboard_analytics(db: Session = Depends(get_db),
 
     # Paiements du mois
     paiements_mois = db.query(
-        func.sum(models.Mouvement.montant_debit)
+        func.sum(models.Mouvement.montant)
     ).filter(
-        models.Mouvement.date >= debut_mois
+        models.Mouvement.created_at >= debut_mois
     ).scalar() or 0
 
     # Nouveaux patients (mois)
@@ -3118,7 +3118,14 @@ async def verifier_carte(data: dict, db: Session = Depends(get_db),
         raise HTTPException(422, "Nom du titulaire requis")
 
     # Détection type carte (Visa/MC/Amex)
-    carte_type = "Visa" if numero.startswith("4") else                  "Mastercard" if numero[:2] in ["51","52","53","54","55"] else                  "Amex" if numero[:2] in ["34","37"] else "Autre"
+    if numero.startswith("4"):
+        carte_type = "Visa"
+    elif numero[:2] in ["51","52","53","54","55"]:
+        carte_type = "Mastercard"
+    elif numero[:2] in ["34","37"]:
+        carte_type = "Amex"
+    else:
+        carte_type = "Autre"
 
     # Masquer le numéro pour l'audit
     numero_masque = f"**** **** **** {numero[-4:]}"

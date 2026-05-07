@@ -4393,6 +4393,43 @@ async def file_attente_medecin(db: Session = Depends(get_db), current_user=Depen
 
     return {"total": len(patients), "patients": patients}
 
+@router.get("/medecin/dossier-patient/{patient_id}", tags=["Médecin"])
+async def get_dossier_by_patient(patient_id: int, request: Request,
+                                  db: Session = Depends(get_db),
+                                  current_user=Depends(get_current_user)):
+    """Accès au dossier via patient_id (depuis queue infirmier → medecin)."""
+    dossier = db.query(models.DossierPatient).filter(
+        models.DossierPatient.patient_id == patient_id
+    ).order_by(models.DossierPatient.id.desc()).first()
+
+    if dossier:
+        from fastapi import Request as FastReq
+        return await get_dossier_medecin(dossier.id, request, db, current_user)
+
+    # Pas de dossier formel: construire une réponse minimale depuis le patient
+    patient = db.query(models.Patient).filter(models.Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(404, "Patient introuvable")
+
+    # Retourner un dossier minimal pour permettre la consultation
+    return {
+        "dossier": {
+            "id": None, "patient_id": patient.id,
+            "patient_nom": patient.nom, "patient_prenom": patient.prenom,
+            "patient_numero": patient.numero,
+            "patient_age": patient.age, "patient_telephone": patient.telephone,
+            "paiement_effectue": True,  # paiement fait à la caisse
+        },
+        "patient": {
+            "id": patient.id, "numero": patient.numero,
+            "nom": patient.nom, "prenom": patient.prenom,
+            "age": patient.age, "telephone": patient.telephone,
+        },
+        "signes_vitaux": None,
+        "prescriptions": [], "resultats_labo": [],
+    }
+
+
 @router.get("/medecin/dossier/{dossier_id}", tags=["Médecin"])
 async def get_dossier_medecin(dossier_id: int, request: Request,
                                db: Session = Depends(get_db),
@@ -4787,28 +4824,71 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
         try:
             # Mapping service → catégorie + compte PCN produit
             SERVICE_TO_CAT = {
-                "labo": ("Laboratoire", "705"),
-                "pharmacie": ("Pharmacie", "706"),
-                "dentisterie": ("Dentisterie", "707"),
-                "physio": ("Physiothérapie", "708"),
-                "optometrie": ("Optométrie", "709"),
-                "maternite": ("Chirurgies", "703"),   # Accouchements
-                "sop": ("Chirurgies", "703"),
-                "observation": ("Hospitalisations", "704"),
-                "geste": ("Gestes médicaux", "702"),
-                "clinique": ("Consultations", "701"),
+                "labo":        ("Laboratoire",     "705"),
+                "pharmacie":   ("Pharmacie",       "706"),
+                "dentisterie": ("Dentisterie",     "707"),
+                "physio":      ("Physiothérapie",  "708"),
+                "optometrie":  ("Optométrie",      "709"),
+                "maternite":   ("Chirurgies",      "703"),
+                "sop":         ("Chirurgies",      "703"),
+                "observation": ("Hospitalisations","704"),
+                "geste":       ("Gestes médicaux", "702"),
+                "clinique":    ("Consultations",   "701"),
             }
             svc_key = (data.get("serviceType") or service or "").lower().split()[0]
             cat_svc, cpte_produit = SERVICE_TO_CAT.get(svc_key, ("Consultations", "701"))
-
             compte_tresor = models.get_compte_tresorerie(mode, "HTG")
+
+            # ── Répartition par type de praticien ───────────────────────
+            praticien_nom = (data.get("praticien") or data.get("medecin_nom") or "").strip()
+            tarif_med = None
+            if praticien_nom:
+                nom_court = praticien_nom.replace("Dr ", "").replace("Dre ", "").strip()
+                tarif_med = db.query(models.TarifMedecin).filter(
+                    models.TarifMedecin.actif == True,
+                    models.TarifMedecin.medecin_nom.ilike(f"%{nom_court}%"),
+                ).first()
+
+            type_med = str(tarif_med.type_medecin.value) if tarif_med and tarif_med.type_medecin else None
+
+            # Règles de répartition par défaut (configurables dans ReglePartage)
+            DEFAUTS_PCT = {
+                "investisseur":            {"consultation": 70, "geste": 80, "chirurgie": 65, "default": 70},
+                "affilie":                 {"consultation": 60, "geste": 70, "chirurgie": 55, "default": 60},
+                "exploitant":              {"consultation":  0, "geste":  0, "chirurgie":  0, "default":  0},
+                "investisseur_exploitant": {"consultation":  0, "geste":  0, "chirurgie":  0, "default":  0},
+            }
+
+            if type_med in ("exploitant", "investisseur_exploitant"):
+                # Exploitant: recette TOTALE va à la clinique — le praticien paie un loyer mensuel séparé
+                montant_clinique = montant
+                montant_medecin  = 0
+                pct_medecin      = 0
+            elif type_med in ("investisseur", "affilie"):
+                # Chercher règle personnalisée dans ReglePartage
+                type_acte_map = {"clinique":"consultation","geste":"geste","sop":"chirurgie","maternite":"chirurgie"}
+                type_acte = type_acte_map.get(svc_key, "consultation")
+                regle = db.query(models.ReglePartage).filter(
+                    models.ReglePartage.type_medecin == models.TypeMedecinEnum(type_med),
+                    models.ReglePartage.type_acte == type_acte,
+                ).first()
+                pct_medecin = regle.pct_medecin if regle else DEFAUTS_PCT[type_med].get(type_acte, DEFAUTS_PCT[type_med]["default"])
+                montant_medecin  = round(montant * pct_medecin / 100, 2)
+                montant_clinique = round(montant - montant_medecin, 2)
+            else:
+                # Pas de praticien identifié: recette 100% clinique
+                montant_clinique = montant
+                montant_medecin  = 0
+                pct_medecin      = 0
+
+            # ── Écriture 1: Recette clinique (511/521 → 701..709) ────────
             mouvement = _creer_mouvement(
                 db=db,
                 journal=models.JournalEnum.VTE,
                 type_mouv=models.TypeMouvementEnum.recette,
                 categorie=cat_svc,
-                description=f"{cat_svc} — {prenom} {nom} — {service}",
-                montant=montant,
+                description=f"{cat_svc} — {prenom} {nom}" + (f" — {praticien_nom}" if praticien_nom else ""),
+                montant=montant_clinique if montant_medecin > 0 else montant,
                 compte_debit=compte_tresor,
                 compte_credit=cpte_produit,
                 libelle_debit=f"Trésorerie {mode} ({compte_tresor})",
@@ -4817,6 +4897,27 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
                 created_by=current_user.id,
             )
             db.flush()
+
+            # ── Écriture 2: Honoraires praticien (651 → 468) ─────────────
+            if montant_medecin > 0 and tarif_med:
+                _creer_mouvement(
+                    db=db,
+                    journal=models.JournalEnum.OD,
+                    type_mouv=models.TypeMouvementEnum.depense,
+                    categorie="Honoraires médecins",
+                    description=f"Honoraires {praticien_nom} — {prenom} {nom} — {cat_svc} ({pct_medecin:.0f}%)",
+                    montant=montant_medecin,
+                    compte_debit="651",
+                    compte_credit="468",
+                    libelle_debit=f"Honoraires médecins (651)",
+                    libelle_credit=f"C/C {praticien_nom} (468)",
+                    mode_paiement="virement_interne",
+                    created_by=current_user.id,
+                )
+                # Mettre à jour solde C/C 468 du médecin
+                tarif_med.solde_compte_468 = round((getattr(tarif_med, "solde_compte_468", 0) or 0) + montant_medecin, 2)
+                db.flush()
+
         except HTTPException:
             raise
         except Exception as e:
@@ -4978,31 +5079,44 @@ async def enregistrer_signes_vitaux(rdv_id: int, data: dict,
     rdv.statut = models.StatutRDVEnum.confirme  # → médecin peut voir
     rdv.notes_admin = f"{rdv.notes_admin or ''}\n[Signes vitaux] {notes_sv}"
 
-    # Identifier le médecin destinataire depuis le dossier
-    medecin_nom_rdv = rdv.medecin_nom or ""
-    medecin_email_rdv = rdv.medecin_email or ""
+    # Priorité 1: médecin fourni par le frontend (nom envoyé depuis la queue infirmier)
+    medecin_nom_payload  = data.get("medecin_nom", "").strip()
+    medecin_email_payload = data.get("medecin_email", "").strip()
 
-    # Chercher le User médecin correspondant pour routing précis
+    # Priorité 2: médecin déjà dans le RDV (créé à la caisse)
+    medecin_nom_rdv   = medecin_nom_payload or rdv.medecin_nom or ""
+    medecin_email_rdv = medecin_email_payload or rdv.medecin_email or ""
+
+    # Chercher le User médecin par email (direct) ou par nom (fallback)
     medecin_user = None
-    if medecin_nom_rdv:
-        # Chercher par nom exact dans les users
+    if medecin_email_rdv:
+        medecin_user = db.query(models.User).filter(
+            models.User.email == medecin_email_rdv,
+            models.User.role  == models.RoleEnum.medecin,
+        ).first()
+    if not medecin_user and medecin_nom_rdv:
+        nom_court = medecin_nom_rdv.replace("Dr ","").replace("Dre ","").strip()
         medecin_user = db.query(models.User).filter(
             models.User.role == models.RoleEnum.medecin,
-            models.User.nom.ilike(f"%{medecin_nom_rdv.replace('Dr ','').strip()}%")
+            models.User.nom.ilike(f"%{nom_court}%"),
         ).first()
 
-    # Stocker l'ID du médecin destinataire dans le RDV pour le filtrage côté médecin
+    # Stocker routing dans le RDV
     if medecin_user:
         rdv.medecin_email = medecin_user.email
-        rdv.confirme_par  = medecin_user.id  # re-utilisé pour router vers ce médecin
+        rdv.medecin_nom   = medecin_user.nom
+        rdv.confirme_par  = medecin_user.id
+    elif medecin_nom_rdv:
+        rdv.medecin_nom = medecin_nom_rdv
 
     db.commit()
 
     return {
-        "message": "Signes vitaux enregistrés — patient envoyé vers le médecin",
+        "message": f"Signes vitaux enregistrés — patient envoyé vers {medecin_nom_rdv or 'le médecin'}",
         "rdv_id": rdv_id,
-        "medecin_nom":  medecin_nom_rdv,
-        "medecin_email": medecin_user.email if medecin_user else None,
+        "medecin_nom":   rdv.medecin_nom,
+        "medecin_email": rdv.medecin_email,
+        "medecin_identifie": medecin_user is not None,
     }
 
 

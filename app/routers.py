@@ -195,20 +195,19 @@ async def health_check(db: Session = Depends(get_db)):
 
 
 @router.post("/auth/verify-password", tags=["Auth"])
-async def verify_password(data: dict, db: Session = Depends(get_db),
-                           current_user=Depends(get_current_user)):
+async def endpoint_verifier_mdp(data: dict, db: Session = Depends(get_db),
+                                 current_user=Depends(get_current_user)):
     """
-    Vérifie le mot de passe du caissier connecté — pour débloquer les sections protégées.
-    Ne retourne PAS de token — uniquement confirmation OK/KO.
+    Vérifie le mot de passe du user connecté (caissier, médecin...) sans émettre de token.
+    Utilisé pour débloquer les sections financières protégées.
     """
-    from passlib.context import CryptContext
-    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
     password = data.get("password", "")
     if not password:
         raise HTTPException(422, "Mot de passe requis")
     if not current_user.hashed_password:
         raise HTTPException(400, "Impossible de vérifier")
-    if not pwd_context.verify(password, current_user.hashed_password):
+    # Utilise la fonction utilitaire importée (pas récursion)
+    if not verify_password(password, current_user.hashed_password):
         raise HTTPException(401, "Mot de passe incorrect")
     return {"ok": True, "message": "Mot de passe vérifié"}
 

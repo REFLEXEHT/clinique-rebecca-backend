@@ -1231,7 +1231,7 @@ async def assistant_comptable_ai(data: dict, db: Session = Depends(get_db),
         func.extract("year",  models.Patient.created_at) == annee,
     ).scalar() or 0
 
-    # Recettes depuis les visites caisse (enregistrer-visite) — complément
+    # Recettes depuis les visites caisse ET les RDV payés — collecte exhaustive
     from sqlalchemy import cast, Integer as SAInt
     visites_mois = db.query(models.RendezVous).filter(
         func.extract("month", models.RendezVous.created_at) == mois,
@@ -1239,13 +1239,20 @@ async def assistant_comptable_ai(data: dict, db: Session = Depends(get_db),
         models.RendezVous.statut.in_(["paiement_effectue", "confirme", "consulte"]),
     ).all()
 
-    # Recettes par spécialité/service depuis les RDV
-    recettes_rdv: dict = {}
-    for r in visites_mois:
-        svc = r.specialite or "Clinique Ext."
-        recettes_rdv[svc] = recettes_rdv.get(svc, 0) + 1
+    # Enrichir les recettes par service en croisant avec les visites caisse
+    # (les visites créent un Mouvement MAIS la description contient le service)
+    for m in mouvements:
+        if str(m.type) == "recette" and m.description:
+            # Extraire service depuis la description
+            # Format: "Service — Prénom NOM — Clinique Ext."
+            parts = m.description.split("—")
+            if len(parts) >= 1:
+                svc_raw = parts[0].strip()
+                # Mapper vers catégorie PCN si différent
+                if svc_raw and svc_raw not in recettes:
+                    recettes[svc_raw] = recettes.get(svc_raw, 0)  # déjà compté par m.categorie
 
-    # Actes par service (tous RDV du mois)
+    # Compter actes par service depuis les RDV
     rdvs_all = db.query(models.RendezVous).filter(
         func.extract("month", models.RendezVous.date_rdv) == mois,
         func.extract("year",  models.RendezVous.date_rdv) == annee,
@@ -1254,6 +1261,11 @@ async def assistant_comptable_ai(data: dict, db: Session = Depends(get_db),
     for r in rdvs_all:
         svc = r.specialite or "Autres"
         actes_par_service[svc] = actes_par_service.get(svc, 0) + 1
+
+    # Compte les RDV payés vs total pour le taux de recouvrement
+    nb_rdv_payes   = sum(1 for r in rdvs_all if str(r.statut) in ["paiement_effectue","confirme","consulte"])
+    nb_rdv_total   = len(rdvs_all)
+    taux_recouvrement = round(nb_rdv_payes / nb_rdv_total * 100, 1) if nb_rdv_total > 0 else 0
 
     # Soldes par compte PCN (classe 5 Trésorerie)
     # Cumul depuis le début sur tous les mouvements (pas seulement ce mois)
@@ -1428,6 +1440,9 @@ MISSION:
             "tresorerie_sorties":   tresorerie_sorties,
             "treso_pcn":            treso_pcn,
             "actes_par_service":    actes_par_service,
+            "nb_rdv_payes":         nb_rdv_payes,
+            "nb_rdv_total":         nb_rdv_total,
+            "taux_recouvrement":    taux_recouvrement,
             "anomalies_count":      len(anomalies),
         },
     }

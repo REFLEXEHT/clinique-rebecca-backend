@@ -1326,7 +1326,7 @@ CHARGES (Classe 6 PCN) — TOTAL: {total_dep:,.0f} HTG
 {chr(10).join(f"  [{models.COMPTE_PCN.get(cat,'6XX')}] {cat}: {montant:,.2f} HTG" for cat, montant in sorted(charges.items(), key=lambda x: -x[1]))}
 
 RÉSULTAT NET: {resultat:,.0f} HTG ({'✅ BÉNÉFICE' if resultat >= 0 else '❌ DÉFICIT'})
-Ratio marge nette: {(resultat/total_rec*100):.1f}% ({"normal" if resultat/total_rec > 0.15 if total_rec > 0 else False else "à surveiller"})
+Ratio marge nette: {(resultat/total_rec*100):.1f}% ({"normal" if total_rec > 0 and resultat/total_rec > 0.15 else "à surveiller"})
 Ratio charges/produits: {(total_dep/total_rec*100):.1f}% ({("sain" if total_dep/total_rec < 0.85 else "élevé") if total_rec > 0 else "N/A"})
 
 TRÉSORERIE PAR MODE DE PAIEMENT

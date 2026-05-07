@@ -123,6 +123,20 @@ def migrate_add_missing_columns():
         # Mouvements enrichis
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS date_mouvement TIMESTAMP WITH TIME ZONE",
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS reference VARCHAR(100)",
+        # RendezVous — colonnes critiques pour l'enregistrement caissier
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS code_patient VARCHAR(20)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS medecin_nom VARCHAR(255)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS medecin_email VARCHAR(255)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS confirme_par INTEGER",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS confirme_par_role VARCHAR(20)",
+        "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS mouvement_id INTEGER",
+        # Autres colonnes critiques
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",
+        "ALTER TABLE patients ADD COLUMN IF NOT EXISTS service VARCHAR(100)",
+        "ALTER TABLE specialistes ADD COLUMN IF NOT EXISTS categorie VARCHAR(100) DEFAULT \'tous\'",
+        "ALTER TABLE tarifs_medecins ADD COLUMN IF NOT EXISTS type_medecin VARCHAR(50)",
+        "ALTER TABLE tarifs_medecins ADD COLUMN IF NOT EXISTS prix_consultation FLOAT DEFAULT 0",
+        "ALTER TABLE tarifs_medecins ADD COLUMN IF NOT EXISTS prix_rdv FLOAT DEFAULT 0",
     ]
     # Each migration in its own connection to avoid transaction interference
     for sql in column_migrations:

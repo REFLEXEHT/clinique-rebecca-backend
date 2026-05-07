@@ -3343,6 +3343,65 @@ async def proposer_autre_moment(rdv_id: int, data: dict,
     return {"message": "Proposition envoyée au patient", "nouveau_moment": data.get("nouveau_moment")}
 
 
+@router.post("/rdv/paiement-presentiel/{rdv_id}", tags=["RDV"])
+async def confirmer_paiement_presentiel(rdv_id: int, data: dict,
+                                         db: Session = Depends(get_db),
+                                         current_user=Depends(get_current_user)):
+    """
+    Enregistre le paiement d'un RDV présentiel (caissier ou secrétaire).
+    Modes: especes | moncash | natcash | carte | zelle
+    Crée aussi le mouvement comptable.
+    """
+    rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
+    if not rdv:
+        raise HTTPException(404, "RDV introuvable")
+
+    mode      = data.get("mode", "especes")
+    reference = data.get("reference", "")
+    montant   = float(data.get("montant", 0))
+
+    if montant <= 0:
+        raise HTTPException(422, "Montant invalide")
+
+    # Passer le statut à paiement_effectue
+    rdv.statut            = models.StatutRDVEnum.paiement_effectue
+    rdv.mode_paiement     = mode
+    rdv.reference_paiement = reference
+
+    # Créer l'écriture comptable
+    if montant > 0:
+        try:
+            _creer_mouvement(
+                db=db, journal=models.JournalEnum.VTE,
+                type_mouv=models.TypeMouvementEnum.recette,
+                categorie="Consultations",
+                description=f"RDV {rdv.specialite} — {rdv.patient_nom}",
+                montant=montant,
+                compte_debit=models.get_compte_tresorerie(mode, "HTG"),
+                compte_credit="701",
+                libelle_debit="Trésorerie", libelle_credit="Produits consultations",
+                mode_paiement=mode, reference=reference,
+                created_by=current_user.id,
+            )
+        except Exception:
+            pass  # Paiement enregistré même si écriture comptable échoue
+
+    db.commit()
+
+    log_audit(db, "PAIEMENT_RDV_PRESENTIEL",
+              actor_id=current_user.id, actor_role=str(current_user.role),
+              target_id=str(rdv_id),
+              details=f"RDV {rdv.patient_nom} — {mode} — {montant} HTG — ref:{reference}")
+
+    return {
+        "message": "Paiement RDV enregistré",
+        "statut": "paiement_effectue",
+        "rdv_id": rdv_id,
+        "mode": mode,
+        "montant": montant,
+    }
+
+
 @router.post("/rdv/paiement-video/{rdv_id}", tags=["RDV"])
 async def confirmer_paiement_video(rdv_id: int, data: dict,
                                     db: Session = Depends(get_db),
@@ -3358,18 +3417,41 @@ async def confirmer_paiement_video(rdv_id: int, data: dict,
     if str(rdv.type_rdv) != "video":
         raise HTTPException(400, "Réservé aux consultations vidéo")
 
-    rdv.statut = models.StatutRDVEnum.paiement_effectue
-    rdv.reference_paiement = data.get("reference", "")
-    rdv.mode_paiement = data.get("mode", "moncash")
+    mode      = data.get("mode", "moncash")
+    reference = data.get("reference", "")
+    montant   = float(data.get("montant", 0))
+
+    rdv.statut             = models.StatutRDVEnum.paiement_effectue
+    rdv.reference_paiement = reference
+    rdv.mode_paiement      = mode
+
+    # Écriture comptable si montant fourni
+    if montant > 0:
+        try:
+            _creer_mouvement(
+                db=db, journal=models.JournalEnum.VTE,
+                type_mouv=models.TypeMouvementEnum.recette,
+                categorie="Consultations",
+                description=f"RDV vidéo {rdv.specialite} — {rdv.patient_nom}",
+                montant=montant,
+                compte_debit=models.get_compte_tresorerie(mode, "HTG"),
+                compte_credit="701",
+                libelle_debit="Trésorerie", libelle_credit="Produits consultations",
+                mode_paiement=mode, reference=reference,
+                created_by=current_user.id if current_user else None,
+            )
+        except Exception:
+            pass
+
     db.commit()
 
     log_audit(db, "PAIEMENT_VIDEO_CONFIRME",
               actor_id=current_user.id if current_user else 0,
               actor_role="patient",
               target_id=str(rdv_id),
-              details=f"Paiement vidéo: {data.get('mode')} — ref: {data.get('reference')}")
+              details=f"Paiement vidéo: {mode} — ref: {reference} — {montant} HTG")
 
-    return {"message": "Paiement enregistré — confirmation en attente", "statut": "paiement_effectue"}
+    return {"message": "Paiement enregistré — confirmation en attente", "statut": "paiement_effectue", "mode": mode}
 
 
 @router.get("/registre-rdv", tags=["RDV"])

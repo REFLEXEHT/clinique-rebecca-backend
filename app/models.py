@@ -14,6 +14,7 @@ Corrections appliquées :
  10. TCA/TVA Haïti (exonération médicale tracée)
 """
 from sqlalchemy import (
+    Date,
     Column, Integer, String, Text, Boolean, DateTime,
     Float, ForeignKey, Enum, UniqueConstraint
 )
@@ -159,6 +160,7 @@ class User(Base):
     type_medecin    = Column(Enum(TypeMedecinEnum, native_enum=False), nullable=True)
     is_active       = Column(Boolean, default=True)
     signature_image = Column(Text, nullable=True)  # base64 PNG — médecin uniquement
+    photo_profil    = Column(Text, nullable=True)  # base64 JPEG — photo de profil
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -184,6 +186,7 @@ class Specialiste(Base):
     nom         = Column(String(255), nullable=False)
     titre       = Column(String(20), default="Dr")   # Dr, Mr, Mme, etc.
     specialite  = Column(String(255), nullable=False)
+    photo_profil = Column(Text, nullable=True)        # base64 JPEG
     description = Column(Text)
     emoji       = Column(String(10), default="👨‍⚕️")
     categorie   = Column(String(50), default="tous")
@@ -226,6 +229,7 @@ class Patient(Base):
     antecedents    = Column(Text)
     notes          = Column(Text)
     age            = Column(Integer, nullable=True)
+    date_naissance = Column(Date, nullable=True)
     contact_urgence = Column(String(255), nullable=True)
     is_premiere_visite = Column(Boolean, default=True)
     created_by     = Column(Integer, ForeignKey("users.id"), nullable=True)

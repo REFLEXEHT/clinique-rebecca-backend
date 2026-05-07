@@ -2522,23 +2522,26 @@ async def enregistrer_depense(data: dict, request: Request,
     montant = float(data.get('montant', 0))
     categorie = data.get('categorie', 'Dépense')
     
-    mouvement = models.Mouvement(
-        numero_piece=num,
-        journal=models.JournalEnum.ACH,
-        type=models.TypeMouvementEnum.depense,
-        categorie=categorie,
-        description=f"[{categorie}] {data.get('description', '')}",
-        montant=montant,
-        compte_debit="6",    # Charges
-        compte_credit="511", # Caisse
-        libelle_debit=categorie,
-        libelle_credit="Caisse HTG",
-        mode_paiement=data.get('mode', 'especes'),
-        periode_mois=now.month,
-        periode_annee=now.year,
-        created_by=current_user.id,
-    )
-    db.add(mouvement); db.commit()
+    try:
+        mouvement = _creer_mouvement(
+            db=db,
+            journal="ACH",
+            type_mouv=models.TypeMouvementEnum.depense,
+            categorie=categorie,
+            description=f"[{categorie}] {data.get('description', '')}",
+            montant=montant,
+            compte_debit="6",
+            compte_credit="511",
+            libelle_debit=categorie,
+            libelle_credit="Caisse HTG",
+            mode_paiement=data.get('mode', 'especes'),
+            created_by=current_user.id,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur création dépense: {e}")
+        raise HTTPException(500, f"Erreur enregistrement dépense: {str(e)}")
     
     log_audit(db, "DEPENSE_ENREGISTREE",
               actor_id=current_user.id, actor_role="caissier",
@@ -3237,36 +3240,25 @@ async def get_dossier_par_patient_numero(patient_numero: str, request: Request,
     if not patient:
         raise HTTPException(404, f"Patient {patient_numero} introuvable")
 
-    # Chercher dossier actif (payé + signes vitaux saisis + attente médecin)
+    # Accès direct par ID patient — pas de restriction de statut ni de spécialité
+    # Le médecin qui a l'ID peut toujours consulter le dossier (audit tracé)
     dossier = db.query(models.DossierPatient).filter(
         models.DossierPatient.patient_id == patient.id,
-        models.DossierPatient.paiement_effectue == True,
-        models.DossierPatient.statut == models.StatutDossierEnum.attente_medecin
     ).order_by(models.DossierPatient.date_visite.desc()).first()
 
+    # Si pas de dossier dans le système, retourner le profil patient vide
     if not dossier:
-        # Check if dossier exists but not ready yet
-        dossier_any = db.query(models.DossierPatient).filter(
-            models.DossierPatient.patient_id == patient.id,
-            models.DossierPatient.paiement_effectue == True,
-        ).order_by(models.DossierPatient.date_visite.desc()).first()
-
-        if dossier_any:
-            statut = str(dossier_any.statut)
-            if statut == 'attente_infirmier':
-                raise HTTPException(403, f"Dossier {patient_numero} en attente de signes vitaux (infirmière)")
-            elif statut == 'termine':
-                raise HTTPException(404, f"Aucun dossier actif pour {patient_numero} — dernière consultation terminée")
-            else:
-                raise HTTPException(404, f"Dossier {patient_numero} non disponible (statut: {statut})")
-        else:
-            raise HTTPException(404, f"Aucun dossier actif pour {patient_numero}. Le patient doit d'abord payer à la caisse.")
-
-    # Vérifier restrictions spécialités
-    SPECIALITES_SANS_ACCES = ['dentisterie', 'dentiste', 'optometrie', 'optométrie', 'physiotherapie', 'physiothérapie']
-    user_spec = (current_user.specialite or '').lower()
-    if any(s in user_spec for s in SPECIALITES_SANS_ACCES):
-        raise HTTPException(403, f"Les {current_user.specialite}s n'ont pas accès au dossier médical complet")
+        return {
+            "patient": {
+                "id": patient.id, "numero": patient.numero,
+                "nom": patient.nom, "prenom": patient.prenom,
+                "age": patient.age, "telephone": patient.telephone,
+                "email": patient.email, "adresse": patient.adresse,
+            },
+            "dossier": None,
+            "message": "Patient enregistré — aucun dossier médical disponible",
+            "signes_vitaux": None, "prescriptions": [], "resultats_labo": []
+        }
 
     sv = db.query(models.SignesVitaux).filter(
         models.SignesVitaux.dossier_id == dossier.id
@@ -3868,24 +3860,27 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
     now     = datetime.now(timezone.utc)
 
     if montant > 0:
-        num_piece = _next_numero_piece("VTE", now.year, db)
-        mouvement = models.Mouvement(
-            numero_piece=num_piece,
-            journal=models.JournalEnum.VTE,
-            type=models.TypeMouvementEnum.recette,
-            categorie="Consultation",
-            description=f"Consultation — {prenom} {nom} — {service}",
-            montant=montant,
-            compte_debit="511",  # Caisse
-            compte_credit="701", # Recettes consultations
-            libelle_debit="Caisse HTG",
-            libelle_credit="Recettes consultations",
-            mode_paiement=mode,
-            periode_mois=now.month,
-            periode_annee=now.year,
-            created_by=current_user.id,
-        )
-        db.add(mouvement); db.flush()
+        try:
+            mouvement = _creer_mouvement(
+                db=db,
+                journal="VTE",
+                type_mouv=models.TypeMouvementEnum.recette,
+                categorie="Consultation",
+                description=f"Consultation — {prenom} {nom} — {service}",
+                montant=montant,
+                compte_debit="511",
+                compte_credit="701",
+                libelle_debit="Caisse HTG",
+                libelle_credit="Recettes consultations",
+                mode_paiement=mode,
+                created_by=current_user.id,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Erreur paiement visite: {e}")
+            # Ne pas bloquer l'enregistrement du patient si le paiement échoue
+            mouvement = None
 
     # Créer une entrée dans la queue infirmière
     ticket_id = str(uuid_q.uuid4())[:8].upper()
@@ -4450,3 +4445,112 @@ async def seed_baremes(db: Session = Depends(get_db), _=Depends(require_admin)):
         "message": f"{created} gestes importés, {updated} mis à jour",
         "created": created, "updated": updated
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RECHERCHE DOSSIER PAR NOM COMPLET + DATE DE NAISSANCE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/medecin/recherche-patient", tags=["Médecin"])
+async def medecin_recherche_patient(
+    nom: str = "", prenom: str = "", date_naissance: Optional[str] = None,
+    db: Session = Depends(get_db), current_user=Depends(get_current_user)
+):
+    """
+    Médecin cherche un patient par NOM COMPLET + date de naissance.
+    Les deux sont requis pour la recherche par nom (sécurité).
+    Pour la recherche par #RB-XXXX, utiliser /medecin/dossier/{numero}.
+    """
+    if str(current_user.role) not in ('medecin', 'admin', 'infirmier'):
+        raise HTTPException(403, "Accès réservé au personnel médical")
+
+    if not nom or not prenom:
+        raise HTTPException(422, "Le nom ET le prénom complets sont requis")
+
+    q = db.query(models.Patient).filter(
+        models.Patient.nom.ilike(nom.strip().upper()),
+        models.Patient.prenom.ilike(prenom.strip()),
+    )
+
+    # Date de naissance requise pour la recherche par nom (identification sûre)
+    if date_naissance:
+        from datetime import date as dt_date
+        try:
+            dob = dt_date.fromisoformat(date_naissance)
+            q = q.filter(models.Patient.date_naissance == dob)
+        except ValueError:
+            raise HTTPException(422, "Format date invalide — utiliser YYYY-MM-DD")
+    else:
+        raise HTTPException(422, "La date de naissance est requise pour une recherche par nom (identification sûre)")
+
+    patients = q.limit(5).all()
+
+    if not patients:
+        return {"patients": [], "message": "Aucun patient trouvé avec ces informations"}
+
+    results = []
+    for p in patients:
+        dossier = db.query(models.DossierPatient).filter(
+            models.DossierPatient.patient_id == p.id
+        ).order_by(models.DossierPatient.date_visite.desc()).first()
+
+        results.append({
+            "id": p.id, "numero": p.numero,
+            "nom": p.nom, "prenom": p.prenom,
+            "date_naissance": str(p.date_naissance) if p.date_naissance else None,
+            "telephone": p.telephone,
+            "nb_dossiers": db.query(models.DossierPatient).filter(models.DossierPatient.patient_id == p.id).count(),
+            "derniere_visite": str(dossier.date_visite) if dossier else None,
+        })
+
+    log_audit(db, "RECHERCHE_PAR_NOM_DOB",
+              actor_id=current_user.id, actor_role=str(current_user.role),
+              target_id=f"{nom} {prenom} {date_naissance}", target_type="patient",
+              details="Recherche par nom complet + date de naissance")
+
+    return {"patients": results}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHOTO DE PROFIL — Médecin
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/medecin/photo-profil", tags=["Médecin"])
+async def upload_photo_profil(data: dict, db: Session = Depends(get_db),
+                               current_user=Depends(get_current_user)):
+    """Médecin télécharge sa photo de profil (base64 JPEG/PNG, max 2MB)."""
+    photo = data.get("photo_base64", "")
+    if not photo:
+        raise HTTPException(422, "Photo manquante")
+
+    # Validation taille approximative (base64 ~4/3 de l'original)
+    if len(photo) > 3_000_000:  # ~2.2MB décodé
+        raise HTTPException(413, "Photo trop lourde — maximum 2MB")
+
+    if not photo.startswith(("data:image/jpeg", "data:image/jpg", "data:image/png", "data:image/webp")):
+        raise HTTPException(422, "Format invalide — utiliser JPEG, PNG ou WebP")
+
+    # Mettre à jour le User
+    current_user.photo_profil = photo
+    db.commit()
+
+    # Si le médecin a un Specialiste lié, mettre à jour aussi
+    spec = db.query(models.Specialiste).filter(
+        models.Specialiste.medecin_email == current_user.email
+    ).first()
+    if not spec:
+        spec = db.query(models.Specialiste).filter(
+            models.Specialiste.nom.ilike(f"%{current_user.nom.split()[-1]}%")
+        ).first()
+    if spec:
+        spec.photo_profil = photo
+        db.commit()
+
+    return {"message": "Photo de profil mise à jour avec succès"}
+
+
+@router.delete("/medecin/photo-profil", tags=["Médecin"])
+async def supprimer_photo_profil(db: Session = Depends(get_db),
+                                  current_user=Depends(get_current_user)):
+    """Médecin supprime sa photo de profil."""
+    current_user.photo_profil = None
+    db.commit()
+    return {"message": "Photo supprimée"}

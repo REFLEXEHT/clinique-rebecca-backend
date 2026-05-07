@@ -1343,8 +1343,18 @@ ACTIVITÉ CLINIQUE
 Nouveaux patients enregistrés: {nb_patients}
 Total mouvements comptables: {len(mouvements)}
 Consultations payées ce mois: {len(visites_mois)}
+RDV payés / total: {nb_rdv_payes} / {nb_rdv_total} → Taux recouvrement: {taux_recouvrement}%
 Actes par spécialité:
 {chr(10).join((f"  {svc}: {nb} actes ({nb/len(rdvs_all)*100:.1f}%)" if rdvs_all else f"  {svc}: {nb} actes") for svc, nb in sorted(actes_par_service.items(), key=lambda x: -x[1])[:10])}
+
+RÉPARTITION DES RECETTES PAR TYPE DE PRATICIEN
+{"=" * 40}
+Investisseur (70% médecin / 30% clinique pour consultations):
+  Honoraires à verser aux médecins investisseurs: {round(sum(float(m.montant or 0) for m in mouvements if m.categorie == "Honoraires médecins"), 2):,.0f} HTG (Compte 651 / 468)
+Exploitant (paie loyer mensuel fixe — recette totale à la clinique):
+  Loyers perçus: {round(sum(float(m.montant or 0) for m in mouvements if m.categorie == "Loyer exploitant"), 2):,.0f} HTG (Compte 711)
+Affilié (60% médecin / 40% clinique pour consultations):
+  Note: vérifier les règles ReglePartage configurées dans le backend
 
 ANOMALIES COMPTABLES DÉTECTÉES ({len(anomalies)})
 {"=" * 40}
@@ -3473,6 +3483,7 @@ async def get_recommandation_specialiste(dossier_id: int,
 # SIGNATURE MÉDECIN — accès strictement réservé au médecin lui-même
 # ══════════════════════════════════════════════════════════════════════════════
 
+@router.post("/medecin/enregistrer-signature", tags=["Médecin"])
 @router.put("/medecin/ma-signature", tags=["Médecin"])
 async def enregistrer_signature(data: dict, request: Request,
                                  db: Session = Depends(get_db),
@@ -4320,10 +4331,67 @@ async def saisir_signes_vitaux(data: dict, request: Request, db: Session = Depen
 
 @router.get("/medecin/file-attente", tags=["Médecin"])
 async def file_attente_medecin(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    """Liste des patients en attente pour ce médecin."""
-    return db.query(models.FileAttente).filter(
-        models.FileAttente.statut == "en_attente"
-    ).order_by(models.FileAttente.priorite, models.FileAttente.heure_entree).all()
+    """
+    File d'attente du médecin connecté — filtrée strictement sur ses patients.
+    Combine FileAttente (ancienne) + RendezVous statut=confirme (nouvelle queue).
+    """
+    from sqlalchemy import cast, Date as SADate, or_
+    aujourd_hui = datetime.now(timezone.utc).date()
+
+    # Queue principale (RendezVous statut confirme + signes vitaux faits)
+    nom_court = current_user.nom.replace("Dr ", "").replace("Dre ", "").strip()
+    rdvs = db.query(models.RendezVous).filter(
+        cast(models.RendezVous.date_rdv, SADate) == aujourd_hui,
+        models.RendezVous.statut == models.StatutRDVEnum.confirme,
+        or_(
+            models.RendezVous.medecin_email == current_user.email,
+            models.RendezVous.confirme_par  == current_user.id,
+            models.RendezVous.medecin_nom.ilike(f"%{nom_court}%"),
+        )
+    ).order_by(models.RendezVous.date_rdv).all()
+
+    def parse_sv(notes):
+        if notes and "[Signes vitaux]" in notes:
+            return notes.split("[Signes vitaux]")[-1].strip()[:300]
+        return None
+
+    patients = [{
+        "id":              r.id,
+        "rdv_id":          r.id,
+        "ticket":          r.code_patient,
+        "patient_nom":     r.patient_nom,
+        "patient_tel":     r.patient_telephone,
+        "patient_id":      r.patient_id,
+        "service":         r.specialite,
+        "medecin_nom":     r.medecin_nom or current_user.nom,
+        "heure":           str(r.date_rdv),
+        "priorite":        "urgent" if "urgent" in (r.notes_admin or "").lower() else "normal",
+        "signes_vitaux":   parse_sv(r.notes_admin),
+        "statut":          "en_attente",
+        "paiement_ok":     True,
+    } for r in rdvs]
+
+    # Ancienne file d'attente (FileAttente) — fallback
+    try:
+        old_queue = db.query(models.FileAttente).filter(
+            models.FileAttente.statut == "en_attente"
+        ).order_by(models.FileAttente.priorite, models.FileAttente.heure_entree).all()
+        # Ajouter seulement si pas déjà dans patients
+        rdv_ids = {p["patient_id"] for p in patients if p["patient_id"]}
+        for fa in old_queue:
+            if fa.patient_id not in rdv_ids:
+                patients.append({
+                    "id": fa.id, "rdv_id": None, "ticket": fa.ticket or "—",
+                    "patient_nom": fa.patient_nom, "patient_tel": fa.patient_telephone,
+                    "patient_id": fa.patient_id, "service": fa.service,
+                    "medecin_nom": "", "heure": str(fa.heure_entree),
+                    "priorite": "urgent" if fa.priorite == 1 else "normal",
+                    "signes_vitaux": fa.signes_vitaux, "statut": fa.statut, "paiement_ok": True,
+                })
+    except Exception:
+        pass
+
+    return {"total": len(patients), "patients": patients}
 
 @router.get("/medecin/dossier/{dossier_id}", tags=["Médecin"])
 async def get_dossier_medecin(dossier_id: int, request: Request,
@@ -4885,6 +4953,8 @@ async def queue_infirmier(db: Session = Depends(get_db), current_user=Depends(ge
             "heure": str(r.date_rdv),
             "priorite": "urgent" if "urgent" in (r.notes_admin or "").lower() else "normal",
             "notes": r.notes_admin,
+            "medecin_nom": r.medecin_nom or "",
+            "medecin_email": r.medecin_email or "",
             **get_paiement_statut(r),
         } for r in en_attente],
     }
@@ -4907,9 +4977,33 @@ async def enregistrer_signes_vitaux(rdv_id: int, data: dict,
 
     rdv.statut = models.StatutRDVEnum.confirme  # → médecin peut voir
     rdv.notes_admin = f"{rdv.notes_admin or ''}\n[Signes vitaux] {notes_sv}"
+
+    # Identifier le médecin destinataire depuis le dossier
+    medecin_nom_rdv = rdv.medecin_nom or ""
+    medecin_email_rdv = rdv.medecin_email or ""
+
+    # Chercher le User médecin correspondant pour routing précis
+    medecin_user = None
+    if medecin_nom_rdv:
+        # Chercher par nom exact dans les users
+        medecin_user = db.query(models.User).filter(
+            models.User.role == models.RoleEnum.medecin,
+            models.User.nom.ilike(f"%{medecin_nom_rdv.replace('Dr ','').strip()}%")
+        ).first()
+
+    # Stocker l'ID du médecin destinataire dans le RDV pour le filtrage côté médecin
+    if medecin_user:
+        rdv.medecin_email = medecin_user.email
+        rdv.confirme_par  = medecin_user.id  # re-utilisé pour router vers ce médecin
+
     db.commit()
 
-    return {"message": "Signes vitaux enregistrés — patient envoyé vers le médecin", "rdv_id": rdv_id}
+    return {
+        "message": "Signes vitaux enregistrés — patient envoyé vers le médecin",
+        "rdv_id": rdv_id,
+        "medecin_nom":  medecin_nom_rdv,
+        "medecin_email": medecin_user.email if medecin_user else None,
+    }
 
 
 @router.get("/infirmier/alertes-prescriptions", tags=["Infirmier - Alertes"])
@@ -5129,10 +5223,24 @@ async def queue_patients_medecin(db: Session = Depends(get_db),
     from sqlalchemy import cast, Date as SADate
     aujourd_hui = datetime.now(timezone.utc).date()
 
-    en_attente = db.query(models.RendezVous).filter(
+    # Filtre strict: seulement les patients de CE médecin
+    q = db.query(models.RendezVous).filter(
         cast(models.RendezVous.date_rdv, SADate) == aujourd_hui,
         models.RendezVous.statut == models.StatutRDVEnum.confirme,
-    ).order_by(models.RendezVous.date_rdv).all()
+    )
+    # Si le médecin est identifié: filtre par email OU confirme_par OU nom
+    role_str = str(current_user.role).split(".")[-1] if "." in str(current_user.role) else str(current_user.role)
+    if role_str == "medecin":
+        from sqlalchemy import or_
+        nom_court = current_user.nom.replace("Dr ", "").replace("Dre ", "").strip()
+        q = q.filter(
+            or_(
+                models.RendezVous.medecin_email == current_user.email,
+                models.RendezVous.confirme_par == current_user.id,
+                models.RendezVous.medecin_nom.ilike(f"%{nom_court}%"),
+            )
+        )
+    en_attente = q.order_by(models.RendezVous.date_rdv).all()
 
     def get_paiement_statut(rdv):
         statut_str = str(rdv.statut).split(".")[-1] if "." in str(rdv.statut) else str(rdv.statut)

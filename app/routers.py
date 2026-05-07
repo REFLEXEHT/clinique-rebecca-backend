@@ -150,9 +150,14 @@ def _creer_mouvement(
         created_by      = created_by,
         notes           = notes,
         date_mouvement  = date_mouvement or datetime.now(timezone.utc),
-        tiers_nom       = tiers_nom,
-        tiers_type      = tiers_type,
     )
+    # Tiers fields: ajout conditionnel (colonne peut ne pas exister encore en prod)
+    if tiers_nom:
+        try:
+            m.tiers_nom  = tiers_nom
+            m.tiers_type = tiers_type
+        except Exception:
+            pass
     db.add(m)
     return m
 
@@ -187,6 +192,25 @@ async def health_check(db: Session = Depends(get_db)):
         }
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+
+
+@router.post("/auth/verify-password", tags=["Auth"])
+async def verify_password(data: dict, db: Session = Depends(get_db),
+                           current_user=Depends(get_current_user)):
+    """
+    Vérifie le mot de passe du caissier connecté — pour débloquer les sections protégées.
+    Ne retourne PAS de token — uniquement confirmation OK/KO.
+    """
+    from passlib.context import CryptContext
+    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    password = data.get("password", "")
+    if not password:
+        raise HTTPException(422, "Mot de passe requis")
+    if not current_user.hashed_password:
+        raise HTTPException(400, "Impossible de vérifier")
+    if not pwd_context.verify(password, current_user.hashed_password):
+        raise HTTPException(401, "Mot de passe incorrect")
+    return {"ok": True, "message": "Mot de passe vérifié"}
 
 
 @router.post("/auth/login", response_model=schemas.Token, tags=["Auth"])

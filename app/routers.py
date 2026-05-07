@@ -1402,10 +1402,7 @@ Format: rapport professionnel structuré, 400-600 mots.""",
     }
 
     prompt_type = type_prompts.get(type_rapport, type_prompts["mensuel"])
-    full_prompt = f"{context}
-
-MISSION:
-{prompt_type}"
+    full_prompt = context + "\n\nMISSION:\n" + prompt_type
 
     # ── Appel Anthropic API ──────────────────────────────────────────────────
     import httpx

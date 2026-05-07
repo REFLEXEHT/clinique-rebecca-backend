@@ -290,7 +290,7 @@ async def delete_service(sid: int, db: Session = Depends(get_db), _=Depends(requ
     if not svc: raise HTTPException(404)
     svc.actif = False; db.commit(); return {"message": "Supprimé"}
 
-@router.get("/specialistes", response_model=List[schemas.SpecialisteOut], tags=["Spécialistes"])
+@router.get("/admin/specialistes", response_model=List[schemas.SpecialisteOut], tags=["Spécialistes"])
 async def list_specialistes(categorie: Optional[str] = None, db: Session = Depends(get_db)):
     q = db.query(models.Specialiste).filter(models.Specialiste.actif == True)
     if categorie and categorie != "tous":
@@ -2409,15 +2409,27 @@ async def enregistrer_paiement(data: dict, request: Request,
     import uuid as uuid_lib2
     recu_num = f"REC-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(uuid_lib2.uuid4())[:6].upper()}"
 
-    mouvement = models.Mouvement(
-        numero_piece=recu_num,
-        description=f"Paiement {service} — Patient {patient.numero}",
-        montant_debit=montant,
-        mode_paiement=mode,
-        reference_paiement=ref,
-        patient_id=patient_id,
-    )
-    db.add(mouvement); db.commit()
+    if montant <= 0:
+        raise HTTPException(422, "Montant invalide")
+    try:
+        mouvement = _creer_mouvement(
+            db=db, journal="VTE",
+            type_mouv=models.TypeMouvementEnum.recette,
+            categorie=service or "Consultation",
+            description=f"Paiement {service} — Patient {patient.numero}",
+            montant=montant,
+            compte_debit="511", compte_credit="701",
+            libelle_debit="Caisse HTG", libelle_credit="Recettes",
+            mode_paiement=mode, reference=ref,
+            created_by=current_user.id,
+        )
+        db.commit(); db.refresh(mouvement)
+        recu_num = mouvement.numero_piece
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Erreur paiement: {str(e)}")
 
     log_audit(db, "PAIEMENT_ENREGISTRE",
               actor_id=current_user.id, actor_role="caissier",
@@ -2522,6 +2534,9 @@ async def enregistrer_depense(data: dict, request: Request,
     montant = float(data.get('montant', 0))
     categorie = data.get('categorie', 'Dépense')
     
+    if montant <= 0:
+        raise HTTPException(422, "Montant invalide — doit être supérieur à 0")
+    
     try:
         mouvement = _creer_mouvement(
             db=db,
@@ -2537,21 +2552,29 @@ async def enregistrer_depense(data: dict, request: Request,
             mode_paiement=data.get('mode', 'especes'),
             created_by=current_user.id,
         )
+        db.commit()
+        db.refresh(mouvement)
     except HTTPException:
         raise
     except Exception as e:
+        db.rollback()
         logger.error(f"Erreur création dépense: {e}")
         raise HTTPException(500, f"Erreur enregistrement dépense: {str(e)}")
     
     log_audit(db, "DEPENSE_ENREGISTREE",
               actor_id=current_user.id, actor_role="caissier",
-              target_id=num, details=f"{data.get('categorie')}: {data.get('montant')} HTG",
+              target_id=mouvement.numero_piece,
+              details=f"{categorie}: {montant} HTG | {data.get('mode','especes')}",
               retention_ans=7)
     
     return {
-        "id": mouvement.id, "numero_piece": num,
-        "categorie": data.get('categorie'), "description": data.get('description'),
-        "montant": montant, "mode": data.get('mode')
+        "id": mouvement.id,
+        "numero_piece": mouvement.numero_piece,
+        "categorie": categorie,
+        "description": data.get('description'),
+        "montant": montant,
+        "mode": data.get('mode', 'especes'),
+        "message": f"Dépense enregistrée — {mouvement.numero_piece}"
     }
 
 
@@ -3875,12 +3898,12 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
                 mode_paiement=mode,
                 created_by=current_user.id,
             )
+            db.flush()  # flush avant le RDV pour avoir l'ID
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Erreur paiement visite: {e}")
-            # Ne pas bloquer l'enregistrement du patient si le paiement échoue
-            mouvement = None
+            mouvement = None  # Ne pas bloquer l'enregistrement du patient
 
     # Créer une entrée dans la queue infirmière
     ticket_id = str(uuid_q.uuid4())[:8].upper()

@@ -112,6 +112,16 @@ def migrate_add_missing_columns():
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS contact_urgence VARCHAR(255)",
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS is_premiere_visite BOOLEAN DEFAULT TRUE",
         "ALTER TABLE specialistes ADD COLUMN IF NOT EXISTS titre VARCHAR(20) DEFAULT \'Dr\'",
+        # Tiers comptable (bénéficiaire/payeur)
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tiers_nom VARCHAR(255)",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tiers_type VARCHAR(50)",
+        "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS tiers_nom VARCHAR(255)",
+        # Décaissements planifiés
+        "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS date_prevue TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS statut VARCHAR(20) DEFAULT \'effectue\'",
+        # Mouvements enrichis
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS date_mouvement TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS reference VARCHAR(100)",
     ]
     # Each migration in its own connection to avoid transaction interference
     for sql in column_migrations:

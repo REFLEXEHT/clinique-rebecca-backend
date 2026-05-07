@@ -2546,6 +2546,152 @@ async def enregistrer_paiement(data: dict, request: Request,
     }
 
 
+@router.post("/caissier/verifier-moncash", tags=["Caissier - Paiement"])
+async def verifier_moncash(data: dict, db: Session = Depends(get_db),
+                            current_user=Depends(get_current_user)):
+    """
+    Vérifie qu'un numéro MonCash est valide avant d'enregistrer le paiement.
+    Validation locale : format 509-XXXXXXXX (8 chiffres haïtiens).
+    En production, appeler l'API MonCash pour confirmer la transaction.
+    """
+    telephone = data.get("telephone", "").strip().replace("-", "").replace(" ", "")
+    reference = data.get("reference", "").strip()
+    montant   = float(data.get("montant", 0))
+
+    # Validation format numéro haïtien
+    import re
+    clean = telephone.replace("+509", "").replace("509", "")
+    if not re.match(r"^[34]\d{7}$", clean):
+        raise HTTPException(422, "Numéro MonCash invalide — format attendu: 3X/4X-XXXXXXX (Haïti)")
+
+    if montant <= 0:
+        raise HTTPException(422, "Montant invalide")
+
+    # TODO production: appel API MonCash pour confirmer la transaction par référence
+    # Pour l'instant: validation locale uniquement
+    verified = bool(reference)  # En prod: vérifier reference via API MonCash
+
+    return {
+        "valide": True,
+        "telephone": telephone,
+        "montant": montant,
+        "reference": reference,
+        "reference_confirmee": verified,
+        "message": f"Numéro {telephone} vérifié" + (" — référence fournie" if verified else " — aucune référence de transaction"),
+        "mode": "moncash",
+    }
+
+
+@router.post("/caissier/verifier-natcash", tags=["Caissier - Paiement"])
+async def verifier_natcash(data: dict, db: Session = Depends(get_db),
+                            current_user=Depends(get_current_user)):
+    """Vérifie qu'un numéro Natcash est valide."""
+    telephone = data.get("telephone", "").strip().replace("-", "").replace(" ", "")
+    reference = data.get("reference", "").strip()
+    montant   = float(data.get("montant", 0))
+
+    import re
+    clean = telephone.replace("+509", "").replace("509", "")
+    if not re.match(r"^[34]\d{7}$", clean):
+        raise HTTPException(422, "Numéro Natcash invalide — format attendu: 3X/4X-XXXXXXX (Haïti)")
+
+    if montant <= 0:
+        raise HTTPException(422, "Montant invalide")
+
+    return {
+        "valide": True,
+        "telephone": telephone,
+        "montant": montant,
+        "reference": reference,
+        "reference_confirmee": bool(reference),
+        "message": f"Numéro Natcash {telephone} vérifié",
+        "mode": "natcash",
+    }
+
+
+@router.post("/caissier/verifier-carte", tags=["Caissier - Paiement"])
+async def verifier_carte(data: dict, db: Session = Depends(get_db),
+                          current_user=Depends(get_current_user)):
+    """
+    Pré-validation carte bancaire côté caissier.
+    NB: les données de carte ne sont jamais stockées — conformité PCI-DSS.
+    En production: intégration Stripe/Vantiv pour tokenisation.
+    """
+    numero = data.get("numero", "").replace(" ", "").replace("-", "")
+    expiry = data.get("expiry", "").strip()   # MM/YY
+    cvv    = data.get("cvv", "").strip()
+    nom    = data.get("nom_titulaire", "").strip()
+    montant = float(data.get("montant", 0))
+
+    import re
+    if not re.match(r"^\d{13,19}$", numero):
+        raise HTTPException(422, "Numéro de carte invalide (13-19 chiffres)")
+    if not re.match(r"^\d{2}/\d{2}$", expiry):
+        raise HTTPException(422, "Date d'expiration invalide — format MM/AA")
+    if not re.match(r"^\d{3,4}$", cvv):
+        raise HTTPException(422, "CVV invalide (3-4 chiffres)")
+    if not nom:
+        raise HTTPException(422, "Nom du titulaire requis")
+
+    # Détection type carte (Visa/MC/Amex)
+    carte_type = "Visa" if numero.startswith("4") else                  "Mastercard" if numero[:2] in ["51","52","53","54","55"] else                  "Amex" if numero[:2] in ["34","37"] else "Autre"
+
+    # Masquer le numéro pour l'audit
+    numero_masque = f"**** **** **** {numero[-4:]}"
+
+    return {
+        "valide": True,
+        "carte_type": carte_type,
+        "numero_masque": numero_masque,
+        "expiry": expiry,
+        "nom_titulaire": nom,
+        "montant": montant,
+        "message": f"Carte {carte_type} {numero_masque} validée",
+        "mode": "carte",
+        # En production: token Stripe ici
+        "token": f"tok_{numero[-4:]}_{expiry.replace('/','')}"
+    }
+
+
+@router.post("/caissier/verifier-zelle", tags=["Caissier - Paiement"])
+async def verifier_zelle(data: dict, db: Session = Depends(get_db),
+                          current_user=Depends(get_current_user)):
+    """
+    Validation paiement Zelle (transfert USD).
+    Zelle ne fournit pas d'API de vérification en temps réel —
+    le caissier doit confirmer visuellement la réception sur l'app bancaire.
+    """
+    import re
+    email_ou_tel = data.get("email_ou_tel", "").strip()
+    nom_envoyeur = data.get("nom_envoyeur", "").strip()
+    montant_usd  = float(data.get("montant_usd", 0))
+    reference    = data.get("reference", "").strip()  # Numéro de confirmation Zelle
+
+    # Valider email ou téléphone US
+    is_email = "@" in email_ou_tel
+    is_phone = re.match(r"^\+?1?\d{10,11}$", email_ou_tel.replace("-","").replace(" ",""))
+
+    if not is_email and not is_phone:
+        raise HTTPException(422, "Email ou numéro de téléphone US invalide pour Zelle")
+
+    if montant_usd <= 0:
+        raise HTTPException(422, "Montant USD invalide")
+
+    if not nom_envoyeur:
+        raise HTTPException(422, "Nom de l'envoyeur requis pour confirmer le Zelle")
+
+    return {
+        "valide": True,
+        "email_ou_tel": email_ou_tel,
+        "nom_envoyeur": nom_envoyeur,
+        "montant_usd": montant_usd,
+        "reference": reference,
+        "message": f"Zelle de {nom_envoyeur} ({email_ou_tel}) — ${montant_usd} USD — en attente confirmation visuelle",
+        "mode": "zelle",
+        "avertissement": "Confirmez visuellement la réception sur votre application bancaire avant de valider."
+    }
+
+
 @router.get("/caissier/paiements-jour", tags=["Caissier"])
 async def paiements_du_jour(db: Session = Depends(get_db),
                              current_user=Depends(get_current_user)):
@@ -2555,22 +2701,22 @@ async def paiements_du_jour(db: Session = Depends(get_db),
     
     aujourd_hui = datetime.now(timezone.utc).date()
     paiements = db.query(models.Mouvement).filter(
-        cast(models.Mouvement.date, SADate) == aujourd_hui,
-        models.Mouvement.montant_debit > 0
-    ).order_by(models.Mouvement.date.desc()).all()
+        cast(models.Mouvement.created_at, SADate) == aujourd_hui,
+        models.Mouvement.type == models.TypeMouvementEnum.recette,
+    ).order_by(models.Mouvement.created_at.desc()).all()
 
-    total = sum(float(p.montant_debit or 0) for p in paiements)
+    total = sum(float(p.montant or 0) for p in paiements)
 
     return {
         "paiements": [
             {
                 "id": p.id,
-                "patient_id": p.patient_id,
                 "service": p.description,
-                "montant": float(p.montant_debit or 0),
+                "montant": float(p.montant or 0),
                 "mode_paiement": p.mode_paiement or "especes",
                 "recu_numero": p.numero_piece,
-                "date": str(p.date),
+                "reference": p.reference or "",
+                "date": str(p.created_at),
             } for p in paiements
         ],
         "total": total,

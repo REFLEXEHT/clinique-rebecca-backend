@@ -134,12 +134,13 @@ COMPTE_PCN: dict[str, str] = {
 def get_compte_tresorerie(mode_paiement: str, devise: str = "HTG") -> str:
     """Retourne le numéro de compte de trésorerie selon le mode et la devise."""
     mode = (mode_paiement or "").lower()
-    if "moncash" in mode:    return "531"
-    if "natcash" in mode:    return "532"
-    if "carte" in mode:      return "521"
+    if "moncash" in mode:                    return "531"
+    if "natcash" in mode:                    return "532"
+    if "zelle" in mode:                      return "522"  # Compte USD (Zelle = transfert USD)
+    if "carte" in mode:                      return "521"
     if "virement" in mode or "banque" in mode:
         return "522" if devise == "USD" else "521"
-    if "usd" in mode:        return "512"
+    if "usd" in mode:                        return "512"
     return "512" if devise == "USD" else "511"
 
 

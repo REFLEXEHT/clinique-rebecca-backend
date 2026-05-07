@@ -97,6 +97,7 @@ def _creer_mouvement(
     est_contrepassation: bool = False,
     mouvement_origine_id: int = None,
     notes: str = None,
+    date_mouvement: "datetime | None" = None,
 ) -> models.Mouvement:
     """
     Crée un mouvement comptable avec partie double.
@@ -144,6 +145,7 @@ def _creer_mouvement(
         mouvement_origine_id = mouvement_origine_id,
         created_by      = created_by,
         notes           = notes,
+        date_mouvement  = date_mouvement or datetime.now(timezone.utc),
     )
     db.add(m)
     return m
@@ -4082,6 +4084,44 @@ async def initiation_rdv_physique(rdv_id: int, data: dict, request: Request,
     }
 
 
+@router.get("/medecin/chercher-patient", tags=["Médecin"])
+async def chercher_patient_medecin(q: str, db: Session = Depends(get_db),
+                                    current_user=Depends(get_current_user)):
+    """
+    Médecin cherche un patient par nom, prénom ou #RB-XXXX.
+    Pas de restriction de paiement — le médecin voit le profil patient.
+    """
+    role_str = str(current_user.role).split(".")[-1] if "." in str(current_user.role) else str(current_user.role)
+    if role_str != "medecin":
+        raise HTTPException(403, "Réservé aux médecins")
+
+    from sqlalchemy import or_
+    q_clean = q.strip()
+
+    patients = db.query(models.Patient).filter(
+        or_(
+            models.Patient.numero.ilike(f"%{q_clean}%"),
+            models.Patient.nom.ilike(f"%{q_clean}%"),
+            models.Patient.prenom.ilike(f"%{q_clean}%"),
+            models.Patient.telephone.ilike(f"%{q_clean}%"),
+        )
+    ).limit(10).all()
+
+    results = []
+    for p in patients:
+        dossier = db.query(models.DossierPatient).filter(
+            models.DossierPatient.patient_id == p.id,
+        ).order_by(models.DossierPatient.date_visite.desc()).first()
+        results.append({
+            "id": p.id, "numero": p.numero, "nom": p.nom, "prenom": p.prenom,
+            "age": p.age, "telephone": p.telephone,
+            "dossier_id": dossier.id if dossier else None,
+            "statut_dossier": str(dossier.statut) if dossier else None,
+            "paiement_effectue": dossier.paiement_effectue if dossier else False,
+        })
+    return {"patients": results, "total": len(results)}
+
+
 @router.get("/medecin/dossier-par-patient/{patient_numero}", tags=["Médecin"])
 async def get_dossier_par_patient_numero(patient_numero: str, request: Request,
                                           db: Session = Depends(get_db),
@@ -4272,7 +4312,9 @@ async def saisir_signes_vitaux(data: dict, request: Request, db: Session = Depen
     dossier = db.query(models.DossierPatient).filter(models.DossierPatient.id == dossier_id).first()
     if not dossier:
         raise HTTPException(404, "Dossier introuvable")
-    if not dossier.paiement_effectue:
+    # Vérifier que le dossier est dans un statut permettant la saisie (caisse ou déjà validé)
+    role_str = str(current_user.role).split(".")[-1] if "." in str(current_user.role) else str(current_user.role)
+    if not dossier.paiement_effectue and role_str != "infirmier":
         raise HTTPException(403, "Paiement requis avant saisie des signes vitaux")
 
     # Détection valeurs critiques
@@ -4465,13 +4507,17 @@ async def get_dossier_medecin(dossier_id: int, request: Request,
     dossier = db.query(models.DossierPatient).filter(models.DossierPatient.id == dossier_id).first()
     if not dossier:
         raise HTTPException(404, "Dossier introuvable")
-    if not dossier.paiement_effectue:
-        log_audit(db, "ACCES_DOSSIER_REFUSE", actor_id=current_user.id,
-                  actor_role=str(current_user.role), target_id=str(dossier_id),
-                  result="echec", details="Paiement non effectué")
-        raise HTTPException(403, "Accès refusé — paiement requis")
-    if dossier.statut == models.StatutDossierEnum.attente_infirmier:
-        raise HTTPException(403, "Accès refusé — signes vitaux non encore saisis")
+    # Médecin avec compte vérifié: accès libre par numéro patient (paiement déjà géré en amont)
+    role_str = str(current_user.role).split(".")[-1] if "." in str(current_user.role) else str(current_user.role)
+    if role_str != "medecin":
+        if not dossier.paiement_effectue:
+            log_audit(db, "ACCES_DOSSIER_REFUSE", actor_id=current_user.id,
+                      actor_role=str(current_user.role), target_id=str(dossier_id),
+                      result="echec", details="Paiement non effectué")
+            raise HTTPException(403, "Accès refusé — paiement requis")
+        if dossier.statut == models.StatutDossierEnum.attente_infirmier:
+            raise HTTPException(403, "Accès refusé — signes vitaux non encore saisis")
+    # Si médecin: accès direct — audit tracé, pas de blocage paiement
 
     log_audit(db, "DOSSIER_CONSULTE", actor_id=current_user.id,
               actor_role=str(current_user.role), target_id=str(dossier_id),

@@ -334,6 +334,9 @@ class Mouvement(Base):
 
     notes           = Column(Text)
 
+    # Date effective du mouvement (peut différer de created_at)
+    date_mouvement  = Column(DateTime(timezone=True), nullable=True)
+
     # Audit trail complet
     created_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
     modified_by     = Column(Integer, ForeignKey("users.id"), nullable=True)

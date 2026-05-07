@@ -848,8 +848,20 @@ async def create_mouvement(data: schemas.MouvementCreate, db: Session = Depends(
     type_mouv = models.TypeMouvementEnum.recette if data.type == "recette" else models.TypeMouvementEnum.depense
     journal   = models.JournalEnum.VTE if data.type == "recette" else models.JournalEnum.ACH
 
+    # Normalisation catégorie → compte PCN (accepte les variantes du frontend)
+    CAT_NORM = {
+        "RH": "RH / Salaires", "Salaires": "RH / Salaires", "Personnel": "RH / Salaires",
+        "Médical": "Consommables médicaux", "Pharmacie": "Pharmacie achats",
+        "Infrastructure": "Infrastructure", "Équipements": "Équipements",
+        "Telecom": "Télécom", "Télécom": "Télécom",
+        "Autre": "Autres charges", "Autre charges": "Autres charges",
+        "Consultations": "Consultations", "Gestes médicaux": "Gestes médicaux",
+        "Honoraires": "Honoraires médecins",
+    }
+    cat_norm = CAT_NORM.get(data.categorie, data.categorie)
+
     compte_tresor  = models.get_compte_tresorerie(data.mode_paiement, data.devise or "HTG")
-    compte_contrep = models.COMPTE_PCN.get(data.categorie, "701" if data.type == "recette" else "628")
+    compte_contrep = models.COMPTE_PCN.get(cat_norm, "701" if data.type == "recette" else "628")
 
     if data.type == "recette":
         compte_d, compte_c = compte_tresor, compte_contrep
@@ -4073,6 +4085,22 @@ async def dernier_patient_enregistre(db: Session = Depends(get_db),
             "created_at": str(dernier.created_at),
         }
     }
+
+
+@router.get("/caissier/prochain-numero", tags=["Caissier - Queue"])
+async def prochain_numero_patient(db: Session = Depends(get_db),
+                                   current_user=Depends(get_current_user)):
+    """Retourne le prochain numero #RB-XXXX qui sera attribue au prochain patient."""
+    from sqlalchemy import func as sqlfunc
+    last_numero = db.query(sqlfunc.max(models.Patient.numero)).scalar()
+    if last_numero and last_numero.startswith("#RB-"):
+        try:
+            last_n = int(last_numero.replace("#RB-", ""))
+        except Exception:
+            last_n = db.query(models.Patient).count()
+    else:
+        last_n = db.query(models.Patient).count()
+    return {"prochain_numero": f"#RB-{(last_n + 1):04d}"}
 
 
 @router.get("/infirmier/queue", tags=["Infirmier - Queue"])

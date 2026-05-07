@@ -68,12 +68,14 @@ def _verif_balance(montant_total: float, montant_medecin: float, montant_cliniqu
 
 
 def _next_numero_piece(journal: str, annee: int, db: Session) -> str:
-    """Génère le prochain numéro de pièce séquentiel : VTE-2025-0001."""
+    """Génère le prochain numéro de pièce séquentiel : VTE-2026-0001."""
+    # Nettoyer la valeur de journal — enlever "JournalEnum." si présent
+    j = str(journal).replace("JournalEnum.", "").replace("<JournalEnum.", "").split(":")[0].split(">")[0].strip()
     count = db.query(func.count(models.Mouvement.id)).filter(
         models.Mouvement.journal == journal,
         models.Mouvement.periode_annee == annee,
     ).scalar() or 0
-    return f"{journal}-{annee}-{str(count + 1).zfill(4)}"
+    return f"{j}-{annee}-{str(count + 1).zfill(4)}"
 
 
 def _creer_mouvement(
@@ -839,8 +841,12 @@ async def create_decaissement(data: schemas.DecaissementCreate, db: Session = De
 async def list_mouvements(
     type: Optional[str] = None, mois: Optional[int] = None,
     annee: Optional[int] = None, journal: Optional[str] = None,
-    db: Session = Depends(get_db), _=Depends(get_current_user)
+    db: Session = Depends(get_db), current_user=Depends(require_admin)   # admin seulement
 ):
+    """
+    Vue globale de TOUS les mouvements — admin uniquement.
+    Aucun filtre par caissier — tous les créateurs confondus.
+    """
     q = db.query(models.Mouvement)
     if type:    q = q.filter(models.Mouvement.type == type)
     if annee:   q = q.filter(models.Mouvement.periode_annee == annee)
@@ -3203,35 +3209,53 @@ async def verifier_zelle(data: dict, db: Session = Depends(get_db),
 
 
 @router.get("/caissier/paiements-jour", tags=["Caissier"])
-async def paiements_du_jour(db: Session = Depends(get_db),
-                             current_user=Depends(get_current_user)):
-    """Liste des paiements du jour avec total"""
+async def paiements_du_jour(
+    periode: str = "jour",   # "jour" ou "mois"
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    """
+    Recettes/paiements encaissés par ce caissier uniquement.
+    - periode=jour  : du jour (défaut)
+    - periode=mois  : du mois en cours
+    """
     from sqlalchemy import cast, Date as SADate
-    from datetime import datetime, timezone
-    
-    aujourd_hui = datetime.now(timezone.utc).date()
-    paiements = db.query(models.Mouvement).filter(
-        cast(models.Mouvement.created_at, SADate) == aujourd_hui,
-        models.Mouvement.type == models.TypeMouvementEnum.recette,
-    ).order_by(models.Mouvement.created_at.desc()).all()
+    now = datetime.now(timezone.utc)
+    today = now.date()
 
+    q = db.query(models.Mouvement).filter(
+        models.Mouvement.type == models.TypeMouvementEnum.recette,
+        models.Mouvement.created_by == current_user.id,   # ← seulement ses recettes
+    )
+
+    if periode == "mois":
+        q = q.filter(
+            models.Mouvement.periode_mois  == now.month,
+            models.Mouvement.periode_annee == now.year,
+        )
+    else:
+        q = q.filter(cast(models.Mouvement.created_at, SADate) == today)
+
+    paiements = q.order_by(models.Mouvement.created_at.desc()).all()
     total = sum(float(p.montant or 0) for p in paiements)
 
     return {
         "paiements": [
             {
-                "id": p.id,
-                "service": p.description,
-                "montant": float(p.montant or 0),
-                "mode_paiement": p.mode_paiement or "especes",
-                "recu_numero": p.numero_piece,
-                "reference": p.reference or "",
-                "date": str(p.created_at),
+                "id":           p.id,
+                "service":      p.description,
+                "montant":      float(p.montant or 0),
+                "mode_paiement":p.mode_paiement or "especes",
+                "recu_numero":  p.numero_piece,
+                "reference":    p.reference or "",
+                "tiers_nom":    p.tiers_nom or "",
+                "date":         str(p.date_mouvement or p.created_at),
             } for p in paiements
         ],
         "total": total,
         "nb_transactions": len(paiements),
-        "date": str(aujourd_hui),
+        "date": str(today),
+        "periode": periode,
     }
 
 
@@ -3357,26 +3381,54 @@ async def enregistrer_depense(data: dict, request: Request,
 
 
 @router.get("/caissier/depenses-jour", tags=["Caissier"])
-async def depenses_du_jour(db: Session = Depends(get_db),
-                            current_user=Depends(get_current_user)):
-    """Dépenses/décaissements du jour"""
+async def depenses_du_jour(
+    periode: str = "jour",   # "jour" ou "mois"
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    """
+    Dépenses du caissier connecté uniquement.
+    - periode=jour  : dépenses du jour (défaut)
+    - periode=mois  : dépenses du mois en cours
+    Le caissier ne voit QUE ses propres écritures.
+    """
     from sqlalchemy import cast, Date as SADate
-    aujourd_hui = datetime.now(timezone.utc).date()
-    
-    depenses = db.query(models.Mouvement).filter(
-        cast(models.Mouvement.created_at, SADate) == aujourd_hui,
+    now = datetime.now(timezone.utc)
+    today = now.date()
+
+    q = db.query(models.Mouvement).filter(
         models.Mouvement.type == models.TypeMouvementEnum.depense,
-    ).order_by(models.Mouvement.created_at.desc()).all()
-    
+        models.Mouvement.created_by == current_user.id,   # ← seulement ses dépenses
+    )
+
+    if periode == "mois":
+        q = q.filter(
+            models.Mouvement.periode_mois  == now.month,
+            models.Mouvement.periode_annee == now.year,
+        )
+    else:
+        q = q.filter(cast(models.Mouvement.created_at, SADate) == today)
+
+    depenses = q.order_by(models.Mouvement.created_at.desc()).all()
     total = sum(float(d.montant or 0) for d in depenses)
-    
+
     return {
         "depenses": [
-            {"id":d.id, "description":d.description, "montant":float(d.montant or 0),
-             "mode":d.mode_paiement or 'especes', "categorie": (d.description or '').split(']')[0].replace('[','')}
+            {
+                "id":          d.id,
+                "description": d.description,
+                "montant":     float(d.montant or 0),
+                "mode":        d.mode_paiement or "especes",
+                "categorie":   d.categorie or (d.description or "").split("]")[0].replace("[",""),
+                "tiers_nom":   d.tiers_nom or "",
+                "date":        str(d.date_mouvement or d.created_at),
+                "numero":      d.numero_piece or "",
+            }
             for d in depenses
         ],
-        "total": total
+        "total": total,
+        "nb_transactions": len(depenses),
+        "periode": periode,
     }
 
 
@@ -5069,7 +5121,8 @@ async def dernier_patient_enregistre(db: Session = Depends(get_db),
 
 @router.get("/caissier/prochain-numero", tags=["Caissier - Queue"])
 async def prochain_numero_patient(db: Session = Depends(get_db),
-                                   current_user=Depends(get_current_user)):
+                                   current_user=Depends(get_current_user),
+                                   _noop: str = ""):  # accessible dès le chargement
     """Retourne le prochain numero #RB-XXXX qui sera attribue au prochain patient."""
     from sqlalchemy import func as sqlfunc
     last_numero = db.query(sqlfunc.max(models.Patient.numero)).scalar()

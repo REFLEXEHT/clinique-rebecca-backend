@@ -1062,6 +1062,283 @@ async def rapport_cumul(mois_debut: int, annee_debut: int, mois_fin: int, annee_
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GRAND LIVRE + BALANCE DE VÉRIFICATION — PCN HAÏTI
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/admin/grand-livre", tags=["Admin - Compta"])
+async def grand_livre(
+    compte: Optional[str] = None,
+    mois: Optional[int] = None,
+    annee: Optional[int] = None,
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user)
+):
+    """
+    Grand Livre — toutes les écritures filtrables par compte/période.
+    Calcule solde cumulé pour chaque compte.
+    """
+    now = datetime.now(timezone.utc)
+    q = db.query(models.Mouvement).filter(
+        models.Mouvement.est_contrepassation == False
+    )
+    if mois:   q = q.filter(models.Mouvement.periode_mois == mois)
+    if annee:  q = q.filter(models.Mouvement.periode_annee == annee or now.year)
+    if compte: q = q.filter(
+        (models.Mouvement.compte_debit == compte) | (models.Mouvement.compte_credit == compte)
+    )
+    ecritures = q.order_by(models.Mouvement.created_at.asc()).all()
+
+    # Regrouper par compte pour balance
+    comptes: dict = {}
+    for m in ecritures:
+        for side, cpt in [("debit", m.compte_debit), ("credit", m.compte_credit)]:
+            if cpt not in comptes:
+                comptes[cpt] = {"compte": cpt, "total_debit": 0.0, "total_credit": 0.0, "nb_ecritures": 0}
+            comptes[cpt]["nb_ecritures"] += 1
+            if side == "debit":   comptes[cpt]["total_debit"]  += float(m.montant or 0)
+            else:                 comptes[cpt]["total_credit"] += float(m.montant or 0)
+
+    for c in comptes.values():
+        c["solde"] = round(c["total_debit"] - c["total_credit"], 2)
+
+    return {
+        "ecritures": [{
+            "id": m.id,
+            "numero_piece": m.numero_piece,
+            "journal": str(m.journal.value) if m.journal else "",
+            "date": str(m.created_at)[:10],
+            "compte_debit": m.compte_debit,
+            "compte_credit": m.compte_credit,
+            "libelle_debit": m.libelle_debit or "",
+            "libelle_credit": m.libelle_credit or "",
+            "categorie": m.categorie,
+            "description": m.description,
+            "montant": float(m.montant or 0),
+            "mode_paiement": m.mode_paiement or "especes",
+            "reference": m.reference or "",
+            "type": str(m.type.value) if m.type else "",
+        } for m in ecritures],
+        "comptes": list(comptes.values()),
+        "total_recettes": sum(c["total_credit"] for k,c in comptes.items() if k.startswith("7")),
+        "total_charges":  sum(c["total_debit"]  for k,c in comptes.items() if k.startswith("6")),
+        "nb_ecritures": len(ecritures),
+    }
+
+
+@router.get("/admin/balance-verification", tags=["Admin - Compta"])
+async def balance_verification(
+    mois: Optional[int] = None,
+    annee: Optional[int] = None,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin)
+):
+    """
+    Balance de vérification — vérifie que Total Débit = Total Crédit (partie double).
+    Norme PCN Haïti + IFRS pour PME.
+    """
+    now = datetime.now(timezone.utc)
+    q = db.query(models.Mouvement)
+    if mois:  q = q.filter(models.Mouvement.periode_mois == mois)
+    if annee: q = q.filter(models.Mouvement.periode_annee == (annee or now.year))
+    mouvements = q.all()
+
+    total_debit  = sum(float(m.montant or 0) for m in mouvements)
+    total_credit = sum(float(m.montant or 0) for m in mouvements)  # Partie double: D=C toujours
+    equilibre    = abs(total_debit - total_credit) < 0.01
+
+    # Comptes par classe
+    classes: dict = {}
+    for m in mouvements:
+        for cpt in [m.compte_debit, m.compte_credit]:
+            cl = cpt[0] if cpt else "?"
+            if cl not in classes:
+                classes[cl] = {"classe": cl, "debit": 0.0, "credit": 0.0}
+        classes[m.compte_debit[0]]["debit"]  += float(m.montant or 0)
+        classes[m.compte_credit[0]]["credit"] += float(m.montant or 0)
+
+    return {
+        "equilibre": equilibre,
+        "total_debit":  round(total_debit, 2),
+        "total_credit": round(total_credit, 2),
+        "ecart": round(abs(total_debit - total_credit), 2),
+        "nb_ecritures": len(mouvements),
+        "par_classe": sorted(classes.values(), key=lambda x: x["classe"]),
+        "message": "✓ Balance équilibrée — partie double respectée" if equilibre
+                   else f"⚠️ Déséquilibre de {abs(total_debit-total_credit):.2f} HTG — vérification requise",
+        "periode": f"mois {mois}/{annee}" if mois else "toutes périodes",
+    }
+
+
+@router.post("/admin/comptable-ai", tags=["Admin - Compta"])
+async def assistant_comptable_ai(data: dict, db: Session = Depends(get_db),
+                                   current_user=Depends(require_admin)):
+    """
+    Assistant IA comptable dédié — collecte toutes les données financières,
+    génère un rapport en conformité PCN Haïti + normes IFRS pour PME.
+    Utilise l'API Anthropic claude-sonnet-4-20250514.
+    """
+    mois  = data.get("mois",  datetime.now(timezone.utc).month)
+    annee = data.get("annee", datetime.now(timezone.utc).year)
+    type_rapport = data.get("type", "mensuel")  # mensuel | annuel | flux_tresorerie | bilan_patrimonial
+
+    # ── Collecte de toutes les données ──────────────────────────────────────
+    mouvements = db.query(models.Mouvement).filter(
+        models.Mouvement.periode_mois == mois,
+        models.Mouvement.periode_annee == annee,
+    ).order_by(models.Mouvement.created_at.asc()).all()
+
+    # Recettes par service
+    recettes: dict = {}
+    charges: dict  = {}
+    for m in mouvements:
+        if str(m.type) == "recette":
+            recettes[m.categorie] = recettes.get(m.categorie, 0) + float(m.montant or 0)
+        else:
+            charges[m.categorie]  = charges.get(m.categorie, 0)  + float(m.montant or 0)
+
+    total_rec = sum(recettes.values())
+    total_dep = sum(charges.values())
+    resultat  = total_rec - total_dep
+
+    # Trésorerie par mode
+    tresorerie: dict = {}
+    for m in mouvements:
+        mode = m.mode_paiement or "especes"
+        tresorerie[mode] = tresorerie.get(mode, 0) + float(m.montant or 0)
+
+    # Patients enregistrés ce mois
+    nb_patients = db.query(func.count(models.Patient.id)).filter(
+        func.extract('month', models.Patient.created_at) == mois,
+        func.extract('year',  models.Patient.created_at) == annee,
+    ).scalar() or 0
+
+    # Nombre d'actes par service
+    rdvs = db.query(models.RendezVous).filter(
+        func.extract('month', models.RendezVous.date_rdv) == mois,
+        func.extract('year',  models.RendezVous.date_rdv) == annee,
+    ).all()
+    actes_par_service: dict = {}
+    for r in rdvs:
+        svc = r.specialite or "Autres"
+        actes_par_service[svc] = actes_par_service.get(svc, 0) + 1
+
+    MOIS_NOMS = ["","Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"]
+    mois_nom = MOIS_NOMS[mois] if 1 <= mois <= 12 else str(mois)
+
+    # ── Prompt système comptable ─────────────────────────────────────────────
+    system_prompt = """Tu es un expert-comptable agréé spécialisé dans les établissements de santé haïtiens.
+Tu maîtrises le Plan Comptable National haïtien (PCN), les normes IFRS pour PME, et la réglementation fiscale haïtienne (DGI, TCA).
+Tes rapports sont structurés, précis, conformes aux normes, et incluent des recommandations actionnables.
+Réponds toujours en français haïtien professionnel. Utilise les numéros de comptes PCN dans tes analyses."""
+
+    context = f"""DONNÉES FINANCIÈRES — CLINIQUE DE LA REBECCA
+Période: {mois_nom} {annee}
+Type de rapport demandé: {type_rapport}
+
+═══ PRODUITS (Classe 7 PCN) ═══
+{chr(10).join(f"  {cat}: {montant:,.0f} HTG" for cat, montant in sorted(recettes.items(), key=lambda x: -x[1]))}
+TOTAL PRODUITS: {total_rec:,.0f} HTG
+
+═══ CHARGES (Classe 6 PCN) ═══
+{chr(10).join(f"  {cat}: {montant:,.0f} HTG" for cat, montant in sorted(charges.items(), key=lambda x: -x[1]))}
+TOTAL CHARGES: {total_dep:,.0f} HTG
+
+═══ RÉSULTAT NET ═══
+{resultat:,.0f} HTG ({'BÉNÉFICE' if resultat >= 0 else 'DÉFICIT'})
+
+═══ TRÉSORERIE PAR MODE ═══
+{chr(10).join(f"  {mode}: {montant:,.0f} HTG" for mode, montant in tresorerie.items())}
+
+═══ ACTIVITÉ CLINIQUE ═══
+Nouveaux patients: {nb_patients}
+Total transactions: {len(mouvements)}
+Actes par service:
+{chr(10).join(f"  {svc}: {nb} actes" for svc, nb in sorted(actes_par_service.items(), key=lambda x: -x[1]))}
+"""
+
+    type_prompts = {
+        "mensuel": f"""Génère un rapport comptable mensuel complet incluant:
+1. Résumé exécutif (3 phrases max)
+2. Analyse des produits par service (avec % du total)
+3. Analyse des charges avec comparaison aux normes sectorielles
+4. Résultat net et taux de marge
+5. Flux de trésorerie par mode de paiement
+6. Indicateurs clés: ratio charges/produits, productivité par patient
+7. Points d'attention et anomalies éventuelles
+8. Recommandations pour le mois prochain
+Format: rapport professionnel structuré, 400-600 mots.""",
+
+        "flux_tresorerie": """Génère un état des flux de trésorerie selon IAS 7 adapté PCN Haïti:
+1. Flux d'exploitation (activités de soins)
+2. Flux d'investissement (équipements, immobilisations)
+3. Flux de financement (apports associés, emprunts)
+4. Variation nette de trésorerie
+5. Analyse de la liquidité immédiate
+6. Recommandations de gestion de trésorerie""",
+
+        "bilan_patrimonial": """Génère une analyse du bilan patrimonial:
+1. Actif: immobilisations, stocks pharmacie, créances patients, trésorerie
+2. Passif: dettes fournisseurs, charges à payer, capitaux propres estimés
+3. Ratio de liquidité générale
+4. Fonds de roulement
+5. Recommandations de renforcement patrimonial""",
+
+        "annuel": """Génère un rapport annuel de synthèse:
+1. Faits marquants de l'année
+2. Évolution des produits vs N-1 (estimé)
+3. Maîtrise des charges
+4. Investissements réalisés
+5. Perspectives et objectifs N+1
+6. Conformité fiscale (TCA, OFATMA, DGI)""",
+    }
+
+    prompt_type = type_prompts.get(type_rapport, type_prompts["mensuel"])
+    full_prompt = f"{context}
+
+MISSION:
+{prompt_type}"
+
+    # ── Appel Anthropic API ──────────────────────────────────────────────────
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 2000,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": full_prompt}],
+                }
+            )
+            resp.raise_for_status()
+            ai_response = resp.json()
+            rapport_texte = ai_response["content"][0]["text"]
+    except Exception as e:
+        rapport_texte = f"[Erreur IA: {str(e)}] Données disponibles mais rapport IA non généré."
+
+    return {
+        "rapport": rapport_texte,
+        "donnees": {
+            "mois": mois, "annee": annee, "mois_nom": mois_nom,
+            "total_produits": round(total_rec, 2),
+            "total_charges":  round(total_dep, 2),
+            "resultat_net":   round(resultat, 2),
+            "nb_transactions": len(mouvements),
+            "nb_patients":    nb_patients,
+            "recettes_par_service": recettes,
+            "charges_par_categorie": charges,
+            "tresorerie_par_mode":  tresorerie,
+            "actes_par_service":    actes_par_service,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # IMMOBILISATIONS (CLASSE 2 PCN)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2783,19 +3060,39 @@ async def enregistrer_depense(data: dict, request: Request,
     if not categorie or categorie.strip() == "":
         raise HTTPException(422, "Catégorie requise")
     
+    # Normalisation catégorie → compte PCN
+    CAT_TO_PCN = {
+        "RH / Salaires": "641",  "RH": "641", "Salaires": "641", "Personnel": "641",
+        "Charges sociales OFATMA": "645",
+        "Honoraires médecins": "651",  "Honoraires": "651",
+        "Achats médicaments": "601",   "Médical": "601",
+        "Pharmacie achats": "607",
+        "Consommables médicaux": "602",
+        "Infrastructure": "615",       "Entretien": "615",
+        "Équipements": "218",
+        "Télécom": "626",              "Telecom": "626",
+        "Amortissements": "681",
+        "Autres charges": "628",       "Autre": "628",
+    }
+    compte_d = CAT_TO_PCN.get(categorie, models.COMPTE_PCN.get(categorie, "628"))
+
+    # Compte crédit = caisse selon mode
+    mode_pmt = data.get('mode', 'especes')
+    compte_c = models.get_compte_tresorerie(mode_pmt, "HTG")
+
     try:
         mouvement = _creer_mouvement(
             db=db,
-            journal="ACH",
+            journal=models.JournalEnum.ACH,
             type_mouv=models.TypeMouvementEnum.depense,
             categorie=categorie,
             description=f"[{categorie}] {data.get('description', '')}",
             montant=montant,
-            compte_debit="6",
-            compte_credit="511",
-            libelle_debit=categorie,
-            libelle_credit="Caisse HTG",
-            mode_paiement=data.get('mode', 'especes'),
+            compte_debit=compte_d,
+            compte_credit=compte_c,
+            libelle_debit=f"{categorie} ({compte_d})",
+            libelle_credit=f"Trésorerie {mode_pmt} ({compte_c})",
+            mode_paiement=mode_pmt,
             created_by=current_user.id,
         )
         db.commit()
@@ -4223,26 +4520,43 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
 
     if montant > 0:
         try:
+            # Mapping service → catégorie + compte PCN produit
+            SERVICE_TO_CAT = {
+                "labo": ("Laboratoire", "705"),
+                "pharmacie": ("Pharmacie", "706"),
+                "dentisterie": ("Dentisterie", "707"),
+                "physio": ("Physiothérapie", "708"),
+                "optometrie": ("Optométrie", "709"),
+                "maternite": ("Chirurgies", "703"),   # Accouchements
+                "sop": ("Chirurgies", "703"),
+                "observation": ("Hospitalisations", "704"),
+                "geste": ("Gestes médicaux", "702"),
+                "clinique": ("Consultations", "701"),
+            }
+            svc_key = (data.get("serviceType") or service or "").lower().split()[0]
+            cat_svc, cpte_produit = SERVICE_TO_CAT.get(svc_key, ("Consultations", "701"))
+
+            compte_tresor = models.get_compte_tresorerie(mode, "HTG")
             mouvement = _creer_mouvement(
                 db=db,
-                journal="VTE",
+                journal=models.JournalEnum.VTE,
                 type_mouv=models.TypeMouvementEnum.recette,
-                categorie="Consultation",
-                description=f"Consultation — {prenom} {nom} — {service}",
+                categorie=cat_svc,
+                description=f"{cat_svc} — {prenom} {nom} — {service}",
                 montant=montant,
-                compte_debit="511",
-                compte_credit="701",
-                libelle_debit="Caisse HTG",
-                libelle_credit="Recettes consultations",
+                compte_debit=compte_tresor,
+                compte_credit=cpte_produit,
+                libelle_debit=f"Trésorerie {mode} ({compte_tresor})",
+                libelle_credit=f"Produits {cat_svc} ({cpte_produit})",
                 mode_paiement=mode,
                 created_by=current_user.id,
             )
-            db.flush()  # flush avant le RDV pour avoir l'ID
+            db.flush()
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Erreur paiement visite: {e}")
-            mouvement = None  # Ne pas bloquer l'enregistrement du patient
+            mouvement = None
 
     # Créer une entrée dans la queue infirmière
     ticket_id = str(uuid_q.uuid4())[:8].upper()

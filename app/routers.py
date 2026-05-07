@@ -98,6 +98,8 @@ def _creer_mouvement(
     mouvement_origine_id: int = None,
     notes: str = None,
     date_mouvement: "datetime | None" = None,
+    tiers_nom:  str = None,
+    tiers_type: str = None,
 ) -> models.Mouvement:
     """
     Crée un mouvement comptable avec partie double.
@@ -146,6 +148,8 @@ def _creer_mouvement(
         created_by      = created_by,
         notes           = notes,
         date_mouvement  = date_mouvement or datetime.now(timezone.utc),
+        tiers_nom       = tiers_nom,
+        tiers_type      = tiers_type,
     )
     db.add(m)
     return m
@@ -869,6 +873,8 @@ async def create_mouvement(data: schemas.MouvementCreate, db: Session = Depends(
 
     compte_tresor  = models.get_compte_tresorerie(data.mode_paiement, data.devise or "HTG")
     compte_contrep = models.COMPTE_PCN.get(cat_norm, "701" if data.type == "recette" else "628")
+    tiers_n = data.tiers_nom  or None
+    tiers_t = data.tiers_type or ("fournisseur" if data.type == "depense" else "autre")
 
     if data.type == "recette":
         compte_d, compte_c = compte_tresor, compte_contrep
@@ -885,6 +891,8 @@ async def create_mouvement(data: schemas.MouvementCreate, db: Session = Depends(
         mode_paiement=data.mode_paiement, devise=devise,
         montant_usd=data.montant_usd, taux_usd_htg=data.taux_usd_htg,
         reference=data.reference, notes=data.notes,
+        tiers_nom=getattr(data, 'tiers_nom', None),
+        tiers_type=getattr(data, 'tiers_type', None) or ("fournisseur" if type_mouv.value == "depense" else "autre"),
         created_by=current_user.id,
     )
     db.commit(); db.refresh(m)
@@ -1936,6 +1944,9 @@ def migrate_db(db: Session = Depends(get_db)):
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS est_contrepassation BOOLEAN DEFAULT FALSE",
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS mouvement_origine_id INTEGER",
         "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS date_prevue TIMESTAMPTZ",
+        "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS tiers_nom VARCHAR(255)",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tiers_nom VARCHAR(255)",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tiers_type VARCHAR(50)",
         "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS statut VARCHAR(20) DEFAULT 'effectue'",
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS date_mouvement TIMESTAMPTZ",
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS reference VARCHAR(100)",
@@ -3312,6 +3323,8 @@ async def enregistrer_depense(data: dict, request: Request,
             montant=montant,
             compte_debit=compte_d,
             compte_credit=compte_c,
+            tiers_nom=data.get("tiers_nom") or data.get("beneficiaire"),
+            tiers_type=data.get("tiers_type", "fournisseur"),
             libelle_debit=f"{categorie} ({compte_d})",
             libelle_credit=f"Trésorerie {mode_pmt} ({compte_c})",
             mode_paiement=mode_pmt,

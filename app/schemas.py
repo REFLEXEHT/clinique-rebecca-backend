@@ -308,6 +308,7 @@ class DecaissementCreate(BaseModel):
     taux_usd_htg: Optional[float] = None
     date_prevue: Optional[datetime] = None   # Si planifié pour une date future
     statut: Optional[str] = "effectue"       # effectue | planifie
+    tiers_nom: Optional[str] = None          # Bénéficiaire final (si différent du médecin)
 
 
 class DecaissementOut(BaseModel):
@@ -319,6 +320,7 @@ class DecaissementOut(BaseModel):
     date_decaissement: Optional[datetime] = None
     date_prevue: Optional[datetime] = None
     statut: Optional[str] = "effectue"
+    tiers_nom: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -339,6 +341,9 @@ class MouvementCreate(BaseModel):
     libelle_credit: Optional[str] = None
     reference: Optional[str] = None
     notes: Optional[str] = None
+    # Tiers comptable — OBLIGATOIRE pour traçabilité PCN
+    tiers_nom:  Optional[str] = None  # Qui a reçu (dépense) ou versé (recette) le montant
+    tiers_type: Optional[str] = None  # fournisseur | medecin | patient | autre
 
 
 class MouvementOut(BaseModel):
@@ -359,6 +364,8 @@ class MouvementOut(BaseModel):
     date_mouvement: Optional[datetime] = None
     created_at: datetime
     reference: Optional[str] = None
+    tiers_nom:  Optional[str] = None
+    tiers_type: Optional[str] = None
 
     class Config:
         from_attributes = True

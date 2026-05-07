@@ -306,6 +306,8 @@ class DecaissementCreate(BaseModel):
     mode_paiement: str = "especes"
     devise: Optional[str] = "HTG"
     taux_usd_htg: Optional[float] = None
+    date_prevue: Optional[datetime] = None   # Si planifié pour une date future
+    statut: Optional[str] = "effectue"       # effectue | planifie
 
 
 class DecaissementOut(BaseModel):
@@ -314,7 +316,9 @@ class DecaissementOut(BaseModel):
     montant: float
     motif: Optional[str]
     mode_paiement: str
-    date_decaissement: datetime
+    date_decaissement: Optional[datetime] = None
+    date_prevue: Optional[datetime] = None
+    statut: Optional[str] = "effectue"
 
     class Config:
         from_attributes = True
@@ -352,7 +356,9 @@ class MouvementOut(BaseModel):
     taux_usd_htg: Optional[float]
     est_contrepassation: bool = False
     notes: Optional[str]
+    date_mouvement: Optional[datetime] = None
     created_at: datetime
+    reference: Optional[str] = None
 
     class Config:
         from_attributes = True

@@ -429,6 +429,8 @@ class Decaissement(Base):
     mouvement_468_id  = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
     mouvement_511_id  = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
     date_decaissement = Column(DateTime(timezone=True), server_default=func.now())
+    date_prevue       = Column(DateTime(timezone=True), nullable=True)   # Si paiement planifié futur
+    statut            = Column(String(20), default="effectue")            # effectue | planifie
     created_by        = Column(Integer, ForeignKey("users.id"), nullable=True)
     medecin           = relationship("ProfilMedecin", back_populates="decaissements")
 

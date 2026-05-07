@@ -809,6 +809,9 @@ async def create_decaissement(data: schemas.DecaissementCreate, db: Session = De
         models.ActeFacturable.statut_decaissement == "en_attente",
     ).update({"statut_decaissement": "decaisse"})
 
+    statut_dec = data.statut or "effectue"
+    date_prevue = data.date_prevue if statut_dec == "planifie" else None
+
     dec = models.Decaissement(
         medecin_id=data.medecin_id, medecin_nom=nom,
         montant=data.montant, motif=data.motif,
@@ -816,6 +819,8 @@ async def create_decaissement(data: schemas.DecaissementCreate, db: Session = De
         taux_usd_htg=data.taux_usd_htg,
         mouvement_468_id=mouv_468.id,
         mouvement_511_id=mouv_511.id,
+        statut=statut_dec,
+        date_prevue=date_prevue,
         created_by=current_user.id,
     )
     db.add(dec); db.commit(); db.refresh(dec)
@@ -1930,6 +1935,10 @@ def migrate_db(db: Session = Depends(get_db)):
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS periode_verrou BOOLEAN DEFAULT FALSE",
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS est_contrepassation BOOLEAN DEFAULT FALSE",
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS mouvement_origine_id INTEGER",
+        "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS date_prevue TIMESTAMPTZ",
+        "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS statut VARCHAR(20) DEFAULT 'effectue'",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS date_mouvement TIMESTAMPTZ",
+        "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS reference VARCHAR(100)",
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tca_applicable BOOLEAN DEFAULT FALSE",
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tca_montant FLOAT DEFAULT 0",
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tca_compte VARCHAR(10) DEFAULT '441'",

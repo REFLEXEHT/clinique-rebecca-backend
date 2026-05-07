@@ -1181,79 +1181,166 @@ async def assistant_comptable_ai(data: dict, db: Session = Depends(get_db),
     annee = data.get("annee", datetime.now(timezone.utc).year)
     type_rapport = data.get("type", "mensuel")  # mensuel | annuel | flux_tresorerie | bilan_patrimonial
 
-    # ── Collecte de toutes les données ──────────────────────────────────────
+    # ── Collecte exhaustive de toutes les données financières ───────────────
     mouvements = db.query(models.Mouvement).filter(
         models.Mouvement.periode_mois == mois,
         models.Mouvement.periode_annee == annee,
     ).order_by(models.Mouvement.created_at.asc()).all()
 
-    # Recettes par service
+    # Recettes et charges par catégorie (journal comptable)
     recettes: dict = {}
     charges: dict  = {}
+    tresorerie_entrees: dict = {}
+    tresorerie_sorties: dict = {}
+
     for m in mouvements:
+        montant_m = float(m.montant or 0)
+        mode = m.mode_paiement or "especes"
         if str(m.type) == "recette":
-            recettes[m.categorie] = recettes.get(m.categorie, 0) + float(m.montant or 0)
+            recettes[m.categorie] = recettes.get(m.categorie, 0) + montant_m
+            tresorerie_entrees[mode] = tresorerie_entrees.get(mode, 0) + montant_m
         else:
-            charges[m.categorie]  = charges.get(m.categorie, 0)  + float(m.montant or 0)
+            charges[m.categorie] = charges.get(m.categorie, 0) + montant_m
+            tresorerie_sorties[mode] = tresorerie_sorties.get(mode, 0) + montant_m
 
     total_rec = sum(recettes.values())
     total_dep = sum(charges.values())
-    resultat  = total_rec - total_dep
+    resultat  = round(total_rec - total_dep, 2)
 
-    # Trésorerie par mode
+    # Trésorerie consolidée par mode
     tresorerie: dict = {}
+    for mode, val in tresorerie_entrees.items():
+        tresorerie[mode] = tresorerie.get(mode, 0) + val
+    for mode, val in tresorerie_sorties.items():
+        tresorerie[mode] = tresorerie.get(mode, 0) - val
+
+    # Trésorerie par compte PCN
+    treso_pcn = {"511 Caisse HTG": 0, "512 Caisse USD": 0, "521 Banque HTG": 0,
+                 "522 Banque USD": 0, "531 MonCash": 0, "532 NatCash": 0}
     for m in mouvements:
-        mode = m.mode_paiement or "especes"
-        tresorerie[mode] = tresorerie.get(mode, 0) + float(m.montant or 0)
+        montant_m = float(m.montant or 0)
+        signe = 1 if str(m.type) == "recette" else -1
+        compte = m.compte_debit if str(m.type) == "recette" else m.compte_credit
+        for k in treso_pcn:
+            if compte and k.split()[0] == compte:
+                treso_pcn[k] = treso_pcn.get(k, 0) + signe * montant_m
 
     # Patients enregistrés ce mois
     nb_patients = db.query(func.count(models.Patient.id)).filter(
-        func.extract('month', models.Patient.created_at) == mois,
-        func.extract('year',  models.Patient.created_at) == annee,
+        func.extract("month", models.Patient.created_at) == mois,
+        func.extract("year",  models.Patient.created_at) == annee,
     ).scalar() or 0
 
-    # Nombre d'actes par service
-    rdvs = db.query(models.RendezVous).filter(
-        func.extract('month', models.RendezVous.date_rdv) == mois,
-        func.extract('year',  models.RendezVous.date_rdv) == annee,
+    # Recettes depuis les visites caisse (enregistrer-visite) — complément
+    from sqlalchemy import cast, Integer as SAInt
+    visites_mois = db.query(models.RendezVous).filter(
+        func.extract("month", models.RendezVous.created_at) == mois,
+        func.extract("year",  models.RendezVous.created_at) == annee,
+        models.RendezVous.statut.in_(["paiement_effectue", "confirme", "consulte"]),
+    ).all()
+
+    # Recettes par spécialité/service depuis les RDV
+    recettes_rdv: dict = {}
+    for r in visites_mois:
+        svc = r.specialite or "Clinique Ext."
+        recettes_rdv[svc] = recettes_rdv.get(svc, 0) + 1
+
+    # Actes par service (tous RDV du mois)
+    rdvs_all = db.query(models.RendezVous).filter(
+        func.extract("month", models.RendezVous.date_rdv) == mois,
+        func.extract("year",  models.RendezVous.date_rdv) == annee,
     ).all()
     actes_par_service: dict = {}
-    for r in rdvs:
+    for r in rdvs_all:
         svc = r.specialite or "Autres"
         actes_par_service[svc] = actes_par_service.get(svc, 0) + 1
+
+    # Soldes par compte PCN (classe 5 Trésorerie)
+    # Cumul depuis le début sur tous les mouvements (pas seulement ce mois)
+    soldes_cumulatifs: dict = {}
+    tous_mvts = db.query(models.Mouvement).filter(
+        models.Mouvement.periode_annee == annee,
+        models.Mouvement.periode_mois <= mois,
+    ).all()
+    for m in tous_mvts:
+        d = m.compte_debit or ""
+        c = m.compte_credit or ""
+        v = float(m.montant or 0)
+        soldes_cumulatifs[d] = soldes_cumulatifs.get(d, 0) + v
+        soldes_cumulatifs[c] = soldes_cumulatifs.get(c, 0) - v
 
     MOIS_NOMS = ["","Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"]
     mois_nom = MOIS_NOMS[mois] if 1 <= mois <= 12 else str(mois)
 
-    # ── Prompt système comptable ─────────────────────────────────────────────
-    system_prompt = """Tu es un expert-comptable agréé spécialisé dans les établissements de santé haïtiens.
-Tu maîtrises le Plan Comptable National haïtien (PCN), les normes IFRS pour PME, et la réglementation fiscale haïtienne (DGI, TCA).
-Tes rapports sont structurés, précis, conformes aux normes, et incluent des recommandations actionnables.
-Réponds toujours en français haïtien professionnel. Utilise les numéros de comptes PCN dans tes analyses."""
+    # ── Validation PCN: vérification équilibre Débit = Crédit ────────────────
+    total_debits  = sum(float(m.montant or 0) for m in mouvements)
+    total_credits = sum(float(m.montant or 0) for m in mouvements)  # Partie double: toujours égaux
+    anomalies = []
+    for m in mouvements:
+        if not m.compte_debit or not m.compte_credit:
+            anomalies.append(f"Mouvement #{m.id} sans comptes PCN complets")
+        if (m.montant or 0) <= 0:
+            anomalies.append(f"Mouvement #{m.id} montant invalide: {m.montant}")
 
-    context = f"""DONNÉES FINANCIÈRES — CLINIQUE DE LA REBECCA
-Période: {mois_nom} {annee}
-Type de rapport demandé: {type_rapport}
+    # ── Prompt système comptable enrichi ─────────────────────────────────────
+    system_prompt = """Tu es un expert-comptable agréé CPA spécialisé dans les établissements de santé haïtiens.
+Tu maîtrises parfaitement:
+- Le Plan Comptable National haïtien (PCN) avec ses classes 1-7
+- Les normes IFRS pour PME (International Financial Reporting Standards)
+- La réglementation fiscale haïtienne: TCA 10%, CFPB, OFATMA, ONACA
+- Les ratios de performance des cliniques en Haïti et dans la Caraïbe
+- Le principe de la partie double et la conformité des écritures
 
-═══ PRODUITS (Classe 7 PCN) ═══
-{chr(10).join(f"  {cat}: {montant:,.0f} HTG" for cat, montant in sorted(recettes.items(), key=lambda x: -x[1]))}
-TOTAL PRODUITS: {total_rec:,.0f} HTG
+Tes rapports incluent systématiquement:
+- Les numéros de comptes PCN (ex: 701, 641, 511)
+- Les ratios de performance (marge nette, ratio charges/produits)
+- Les anomalies comptables détectées
+- Les recommandations actionnables et prioritaires
+- La conformité fiscale haïtienne
 
-═══ CHARGES (Classe 6 PCN) ═══
-{chr(10).join(f"  {cat}: {montant:,.0f} HTG" for cat, montant in sorted(charges.items(), key=lambda x: -x[1]))}
-TOTAL CHARGES: {total_dep:,.0f} HTG
+Réponds en français professionnel. Structure tes rapports clairement."""
 
-═══ RÉSULTAT NET ═══
-{resultat:,.0f} HTG ({'BÉNÉFICE' if resultat >= 0 else 'DÉFICIT'})
+    context = f"""═══════════════════════════════════════════════════
+DONNÉES FINANCIÈRES — CLINIQUE DE LA REBECCA
+Période: {mois_nom} {annee} | Type: {type_rapport.upper()}
+═══════════════════════════════════════════════════
 
-═══ TRÉSORERIE PAR MODE ═══
-{chr(10).join(f"  {mode}: {montant:,.0f} HTG" for mode, montant in tresorerie.items())}
+PRODUITS (Classe 7 PCN) — TOTAL: {total_rec:,.0f} HTG
+{"=" * 40}
+{chr(10).join(f"  [{models.COMPTE_PCN.get(cat,'7XX')}] {cat}: {montant:,.2f} HTG ({montant/total_rec*100:.1f}%)" if total_rec > 0 else f"  {cat}: {montant:,.2f} HTG" for cat, montant in sorted(recettes.items(), key=lambda x: -x[1]))}
 
-═══ ACTIVITÉ CLINIQUE ═══
-Nouveaux patients: {nb_patients}
-Total transactions: {len(mouvements)}
-Actes par service:
-{chr(10).join(f"  {svc}: {nb} actes" for svc, nb in sorted(actes_par_service.items(), key=lambda x: -x[1]))}
+CHARGES (Classe 6 PCN) — TOTAL: {total_dep:,.0f} HTG
+{"=" * 40}
+{chr(10).join(f"  [{models.COMPTE_PCN.get(cat,'6XX')}] {cat}: {montant:,.2f} HTG" for cat, montant in sorted(charges.items(), key=lambda x: -x[1]))}
+
+RÉSULTAT NET: {resultat:,.0f} HTG ({'✅ BÉNÉFICE' if resultat >= 0 else '❌ DÉFICIT'})
+Ratio marge nette: {(resultat/total_rec*100):.1f}% ({"normal" if resultat/total_rec > 0.15 if total_rec > 0 else False else "à surveiller"})
+Ratio charges/produits: {(total_dep/total_rec*100):.1f}% ({("sain" if total_dep/total_rec < 0.85 else "élevé") if total_rec > 0 else "N/A"})
+
+TRÉSORERIE PAR MODE DE PAIEMENT
+{"=" * 40}
+Entrées:
+{chr(10).join(f"  {mode}: +{val:,.0f} HTG" for mode, val in tresorerie_entrees.items())}
+Sorties:
+{chr(10).join(f"  {mode}: -{val:,.0f} HTG" for mode, val in tresorerie_sorties.items())}
+Soldes nets par compte PCN:
+{chr(10).join(f"  {compte}: {solde:,.0f} HTG" for compte, solde in treso_pcn.items() if abs(solde) > 0)}
+
+ACTIVITÉ CLINIQUE
+{"=" * 40}
+Nouveaux patients enregistrés: {nb_patients}
+Total mouvements comptables: {len(mouvements)}
+Consultations payées ce mois: {len(visites_mois)}
+Actes par spécialité:
+{chr(10).join((f"  {svc}: {nb} actes ({nb/len(rdvs_all)*100:.1f}%)" if rdvs_all else f"  {svc}: {nb} actes") for svc, nb in sorted(actes_par_service.items(), key=lambda x: -x[1])[:10])}
+
+ANOMALIES COMPTABLES DÉTECTÉES ({len(anomalies)})
+{"=" * 40}
+{chr(10).join(f"  ⚠️ {a}" for a in anomalies[:10]) if anomalies else "  ✅ Aucune anomalie détectée"}
+
+ÉCRITURES RÉCENTES (5 dernières)
+{"=" * 40}
+{chr(10).join(f"  {m.numero_piece} | D:{m.compte_debit} C:{m.compte_credit} | {m.montant:,.0f} HTG | {m.description[:40]}" for m in mouvements[-5:])}
 """
 
     type_prompts = {
@@ -1323,18 +1410,113 @@ MISSION:
 
     return {
         "rapport": rapport_texte,
+        "anomalies": anomalies,
         "donnees": {
             "mois": mois, "annee": annee, "mois_nom": mois_nom,
             "total_produits": round(total_rec, 2),
             "total_charges":  round(total_dep, 2),
             "resultat_net":   round(resultat, 2),
+            "ratio_marge": round(resultat / total_rec * 100, 1) if total_rec > 0 else 0,
+            "ratio_charges": round(total_dep / total_rec * 100, 1) if total_rec > 0 else 0,
             "nb_transactions": len(mouvements),
             "nb_patients":    nb_patients,
+            "nb_consultations_payees": len(visites_mois),
             "recettes_par_service": recettes,
             "charges_par_categorie": charges,
             "tresorerie_par_mode":  tresorerie,
+            "tresorerie_entrees":   tresorerie_entrees,
+            "tresorerie_sorties":   tresorerie_sorties,
+            "treso_pcn":            treso_pcn,
             "actes_par_service":    actes_par_service,
+            "anomalies_count":      len(anomalies),
         },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMPRESSIONS — REÇUS, RAPPORTS, DOCUMENTS OFFICIELS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/caissier/recu/{mouvement_id}", tags=["Impressions"])
+async def get_recu_paiement(mouvement_id: int, db: Session = Depends(get_db),
+                             current_user=Depends(get_current_user)):
+    """Retourne les données complètes d'un reçu de paiement pour impression."""
+    m = db.query(models.Mouvement).filter(models.Mouvement.id == mouvement_id).first()
+    if not m:
+        raise HTTPException(404, "Mouvement introuvable")
+    return {
+        "numero_piece": m.numero_piece,
+        "date": str(m.created_at),
+        "description": m.description,
+        "categorie": m.categorie,
+        "montant": float(m.montant or 0),
+        "devise": str(m.devise.value if m.devise else "HTG"),
+        "montant_usd": m.montant_usd,
+        "taux_usd_htg": m.taux_usd_htg,
+        "mode_paiement": m.mode_paiement or "especes",
+        "reference": m.reference or "",
+        "compte_debit": m.compte_debit,
+        "compte_credit": m.compte_credit,
+        "libelle_debit": m.libelle_debit,
+        "libelle_credit": m.libelle_credit,
+        "journal": str(m.journal.value if m.journal else "VTE"),
+        "type": str(m.type.value if m.type else "recette"),
+        "notes": m.notes or "",
+    }
+
+
+@router.get("/admin/rapport-impression/{mois}/{annee}", tags=["Impressions"])
+async def get_rapport_impression(mois: int, annee: int,
+                                  db: Session = Depends(get_db),
+                                  current_user=Depends(require_admin)):
+    """Rapport comptable mensuel complet pour impression (sans IA — données brutes)."""
+    mouvements = db.query(models.Mouvement).filter(
+        models.Mouvement.periode_mois == mois,
+        models.Mouvement.periode_annee == annee,
+    ).order_by(models.Mouvement.created_at.asc()).all()
+
+    recettes: dict = {}
+    charges:  dict = {}
+    for m in mouvements:
+        montant_m = float(m.montant or 0)
+        if str(m.type) == "recette":
+            recettes[m.categorie] = recettes.get(m.categorie, 0) + montant_m
+        else:
+            charges[m.categorie]  = charges.get(m.categorie, 0)  + montant_m
+
+    total_rec = sum(recettes.values())
+    total_dep = sum(charges.values())
+    resultat  = round(total_rec - total_dep, 2)
+
+    MOIS_NOMS = ["","Janvier","Février","Mars","Avril","Mai","Juin","Juillet",
+                 "Août","Septembre","Octobre","Novembre","Décembre"]
+
+    return {
+        "mois_nom": MOIS_NOMS[mois] if 1 <= mois <= 12 else str(mois),
+        "mois": mois, "annee": annee,
+        "total_produits": round(total_rec, 2),
+        "total_charges": round(total_dep, 2),
+        "resultat_net": resultat,
+        "ratio_marge": round(resultat / total_rec * 100, 1) if total_rec > 0 else 0,
+        "recettes_par_service": dict(sorted(recettes.items(), key=lambda x: -x[1])),
+        "charges_par_categorie": dict(sorted(charges.items(), key=lambda x: -x[1])),
+        "nb_mouvements": len(mouvements),
+        "mouvements": [
+            {
+                "id": m.id,
+                "numero_piece": m.numero_piece,
+                "date": str(m.created_at)[:16],
+                "journal": str(m.journal.value if m.journal else ""),
+                "type": str(m.type.value if m.type else ""),
+                "categorie": m.categorie,
+                "description": m.description,
+                "montant": float(m.montant or 0),
+                "compte_debit": m.compte_debit,
+                "compte_credit": m.compte_credit,
+                "mode_paiement": m.mode_paiement or "",
+                "reference": m.reference or "",
+            } for m in mouvements
+        ],
     }
 
 

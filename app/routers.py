@@ -3399,6 +3399,7 @@ async def depenses_du_jour(
     q = db.query(models.Mouvement).filter(
         models.Mouvement.type == models.TypeMouvementEnum.depense,
         models.Mouvement.created_by == current_user.id,   # ← seulement ses dépenses
+        models.Mouvement.journal != models.JournalEnum.OD, # ← exclure écritures internes (honoraires)
     )
 
     if periode == "mois":
@@ -5039,7 +5040,10 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
                     created_by=current_user.id,
                 )
                 # Mettre à jour solde C/C 468 du médecin
-                tarif_med.solde_compte_468 = round((getattr(tarif_med, "solde_compte_468", 0) or 0) + montant_medecin, 2)
+                try:
+                    tarif_med.solde_compte_468 = round((getattr(tarif_med, "solde_compte_468", 0) or 0) + montant_medecin, 2)
+                except Exception:
+                    pass  # colonne pas encore migrée
                 db.flush()
 
         except HTTPException:

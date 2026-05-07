@@ -116,6 +116,7 @@ def migrate_add_missing_columns():
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tiers_nom VARCHAR(255)",
         "ALTER TABLE mouvements ADD COLUMN IF NOT EXISTS tiers_type VARCHAR(50)",
         "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS tiers_nom VARCHAR(255)",
+        "ALTER TABLE tarifs_medecins ADD COLUMN IF NOT EXISTS solde_compte_468 FLOAT DEFAULT 0",
         # Décaissements planifiés
         "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS date_prevue TIMESTAMP WITH TIME ZONE",
         "ALTER TABLE decaissements ADD COLUMN IF NOT EXISTS statut VARCHAR(20) DEFAULT \'effectue\'",

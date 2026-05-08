@@ -4940,13 +4940,21 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
         if not patient:
             from sqlalchemy import text as _t
             try:
+                # MAX sur la partie numérique — évite les doublons
                 _r = db.execute(_t(
-                    "SELECT numero FROM patients WHERE numero LIKE '#RB-%' "
-                    "ORDER BY LENGTH(numero) DESC, numero DESC LIMIT 1"
+                    "SELECT COALESCE(MAX(CAST(SUBSTRING(numero FROM 5) AS INTEGER)), 0) "
+                    "FROM patients WHERE numero ~ '^#RB-[0-9]+$'"
                 )).fetchone()
-                last_n = int(_r[0].replace("#RB-", "")) if _r and _r[0] else 0
+                last_n = int(_r[0]) if _r and _r[0] else 0
             except Exception:
-                last_n = db.query(models.Patient).count()
+                try:
+                    _r2 = db.execute(_t(
+                        "SELECT numero FROM patients WHERE numero LIKE '#RB-%' "
+                        "ORDER BY LENGTH(numero) DESC, numero DESC LIMIT 1"
+                    )).fetchone()
+                    last_n = int(_r2[0].replace("#RB-", "")) if _r2 and _r2[0] else 0
+                except Exception:
+                    last_n = db.query(models.Patient).count()
 
             patient = models.Patient(
                 nom=nom, prenom=prenom,
@@ -4965,9 +4973,11 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
             try: patient.contact_urgence = data.get("contact_urgence", "")
             except Exception: pass
             db.add(patient)
-            db.flush()
+            db.commit()   # Commit patient immédiatement — isolé du reste
+            db.refresh(patient)
         else:
             patient.is_premiere_visite = False
+            db.commit()   # Commit la mise à jour is_premiere_visite
 
         service = data.get("service", "Consultation")
         montant = float(data.get("montant", 0) or 0)
@@ -5070,7 +5080,8 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
         return {
             "patient": {
                 "id": patient.id, "numero": patient.numero,
-                "nom": f"{prenom} {nom}", "telephone": patient.telephone,
+                "nom": patient.nom, "prenom": patient.prenom or prenom,
+                "telephone": patient.telephone,
                 "is_premiere_visite": getattr(patient, "is_premiere_visite", True),
             },
             "ticket": ticket_id,

@@ -5220,6 +5220,59 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
     }
 
 
+
+@router.get("/caissier/debug-test", tags=["Caissier - Queue"])
+async def debug_test_enregistrement(db: Session = Depends(get_db),
+                                     current_user=Depends(get_current_user)):
+    """Endpoint de debug — teste la création patient sans commit."""
+    import traceback
+    results = {}
+    
+    # Test 1: raw SQL for numero
+    try:
+        from sqlalchemy import text as _t
+        r = db.execute(_t("SELECT numero FROM patients WHERE numero LIKE '#RB-%' ORDER BY LENGTH(numero) DESC, numero DESC LIMIT 1")).fetchone()
+        results["test_sql_numero"] = f"OK: {r[0] if r else 'none'}"
+    except Exception as e:
+        results["test_sql_numero"] = f"FAIL: {e}"
+    
+    # Test 2: Patient model columns
+    try:
+        cols = [c.key for c in models.Patient.__table__.columns]
+        results["patient_columns"] = cols
+    except Exception as e:
+        results["patient_columns"] = f"FAIL: {e}"
+    
+    # Test 3: StatutRDVEnum
+    try:
+        results["statut_enum"] = [e.value for e in models.StatutRDVEnum]
+    except Exception as e:
+        results["statut_enum"] = f"FAIL: {e}"
+    
+    # Test 4: RendezVous columns
+    try:
+        rdv_cols = [c.key for c in models.RendezVous.__table__.columns]
+        results["rdv_columns"] = rdv_cols
+    except Exception as e:
+        results["rdv_columns"] = f"FAIL: {e}"
+    
+    # Test 5: TarifMedecin model
+    try:
+        tm_cols = [c.key for c in models.TarifMedecin.__table__.columns]
+        results["tarifmedecin_columns"] = tm_cols
+    except Exception as e:
+        results["tarifmedecin_columns"] = f"FAIL: {e}"
+
+    # Test 6: get_compte_tresorerie function
+    try:
+        r6 = models.get_compte_tresorerie("especes", "HTG")
+        results["test_compte_tresorerie"] = f"OK: {r6}"
+    except Exception as e:
+        results["test_compte_tresorerie"] = f"FAIL: {e}"
+
+    return results
+
+
 @router.get("/caissier/dernier-patient", tags=["Caissier - Queue"])
 async def dernier_patient_enregistre(db: Session = Depends(get_db),
                                       current_user=Depends(get_current_user)):

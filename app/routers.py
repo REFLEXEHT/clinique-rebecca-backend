@@ -5222,8 +5222,7 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
 
 
 @router.get("/caissier/debug-test", tags=["Caissier - Queue"])
-async def debug_test_enregistrement(db: Session = Depends(get_db),
-                                     current_user=Depends(get_current_user)):
+async def debug_test_enregistrement(db: Session = Depends(get_db)):
     """Endpoint de debug — teste la création patient sans commit."""
     import traceback
     results = {}

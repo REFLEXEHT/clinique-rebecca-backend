@@ -5170,19 +5170,31 @@ async def dernier_patient_enregistre(db: Session = Depends(get_db),
 
 @router.get("/caissier/prochain-numero", tags=["Caissier - Queue"])
 async def prochain_numero_patient(db: Session = Depends(get_db),
-                                   current_user=Depends(get_current_user),
-                                   _noop: str = ""):  # accessible dès le chargement
-    """Retourne le prochain numero #RB-XXXX qui sera attribue au prochain patient."""
-    from sqlalchemy import func as sqlfunc
-    last_numero = db.query(sqlfunc.max(models.Patient.numero)).scalar()
-    if last_numero and last_numero.startswith("#RB-"):
-        try:
-            last_n = int(last_numero.replace("#RB-", ""))
-        except Exception:
+                                   current_user=Depends(get_current_user)):
+    """Retourne le prochain numero #RB-XXXX — endpoint simple et robuste."""
+    try:
+        # Chercher le numéro le plus élevé parmi les #RB-XXXX existants
+        from sqlalchemy import text as sa_text
+        result = db.execute(sa_text(
+            "SELECT numero FROM patients WHERE numero LIKE '#RB-%' "
+            "ORDER BY LENGTH(numero) DESC, numero DESC LIMIT 1"
+        )).fetchone()
+        if result and result[0]:
+            try:
+                last_n = int(result[0].replace("#RB-", ""))
+            except Exception:
+                last_n = db.query(models.Patient).count()
+        else:
             last_n = db.query(models.Patient).count()
-    else:
-        last_n = db.query(models.Patient).count()
-    return {"prochain_numero": f"#RB-{(last_n + 1):04d}"}
+        return {"prochain_numero": f"#RB-{(last_n + 1):04d}"}
+    except Exception as e:
+        logger.error(f"prochain-numero error: {e}")
+        # Fallback: simple count
+        try:
+            n = db.query(models.Patient).count()
+            return {"prochain_numero": f"#RB-{(n + 1):04d}"}
+        except Exception:
+            return {"prochain_numero": "#RB-0001"}
 
 
 @router.get("/infirmier/queue", tags=["Infirmier - Queue"])

@@ -5070,9 +5070,10 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
                 # Mettre à jour solde C/C 468 du médecin
                 try:
                     tarif_med.solde_compte_468 = round((getattr(tarif_med, "solde_compte_468", 0) or 0) + montant_medecin, 2)
+                    db.flush()
                 except Exception:
-                    pass  # colonne pas encore migrée
-                db.flush()
+                    db.rollback()  # annuler si la colonne n'existe pas en prod
+                    db.flush()
 
         except HTTPException:
             raise

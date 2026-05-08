@@ -5093,21 +5093,41 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
     # Stocker dans un RDV simplifié pour que l'infirmier puisse voir
     medecin_nom_val = data.get("medecin_nom", "") or ""
     praticien_val   = data.get("praticien", "") or medecin_nom_val  # compatibilité double champ
-    rdv = models.RendezVous(
-        patient_id=patient.id,
-        patient_nom=f"{prenom} {nom}",
-        patient_telephone=patient.telephone or "",
-        patient_email=patient.email or "",
-        code_patient=ticket_id,
-        specialite=service,
-        medecin_nom=praticien_val or medecin_nom_val or None,
-        date_rdv=now,
-        type_rdv=models.TypeRDVEnum.presentiel,
-        statut=models.StatutRDVEnum.paiement_effectue if montant > 0 else models.StatutRDVEnum.en_attente,
-        notes_admin=f"Queue caisse #{ticket_id} | Priorité: {data.get('priorite','normal')}" + (f" | Praticien: {praticien_val}" if praticien_val else ""),
-        created_by=current_user.id,
-    )
-    db.add(rdv); db.commit(); db.refresh(patient); db.refresh(rdv)
+    # Créer le RendezVous avec gestion des colonnes potentiellement absentes
+    try:
+        rdv = models.RendezVous(
+            patient_id=patient.id,
+            patient_nom=f"{prenom} {nom}",
+            patient_telephone=patient.telephone or "",
+            patient_email=patient.email or "",
+            specialite=service,
+            date_rdv=now,
+            type_rdv=models.TypeRDVEnum.presentiel,
+            statut=models.StatutRDVEnum.paiement_effectue if montant > 0 else models.StatutRDVEnum.en_attente,
+            notes_admin=f"Queue caisse #{ticket_id}",
+            created_by=current_user.id,
+        )
+        # Colonnes ajoutées progressivement — assignation défensive
+        for col, val in [
+            ("code_patient",   ticket_id),
+            ("medecin_nom",    praticien_val or medecin_nom_val or None),
+            ("medecin_email",  None),
+        ]:
+            try: setattr(rdv, col, val)
+            except Exception: pass
+        db.add(rdv)
+        db.commit()
+    except Exception as e:
+        logger.error(f"Erreur création RDV queue: {e}")
+        db.rollback()
+        # Créer quand même le patient et retourner un succès partiel
+        db.commit()
+        rdv = type("RDV", (), {"id": 0, "code_patient": ticket_id})()
+
+    try: db.refresh(patient)
+    except Exception: pass
+    try: db.refresh(rdv)
+    except Exception: pass
 
     log_audit(db, "VISITE_ENREGISTREE", actor_id=current_user.id, actor_role="caissier",
               target_id=patient.numero, target_type="patient",

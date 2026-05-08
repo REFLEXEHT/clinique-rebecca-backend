@@ -4936,15 +4936,18 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
     ).first() if data.get("telephone") else None
 
     if not patient:
-        # Générer un numéro séquentiel basé sur le MAX existant (évite les collisions)
-        from sqlalchemy import func as sqlfunc
-        last_numero = db.query(sqlfunc.max(models.Patient.numero)).scalar()
-        if last_numero and last_numero.startswith("#RB-"):
-            try:
-                last_n = int(last_numero.replace("#RB-", ""))
-            except:
+        # Générer un numéro séquentiel — raw SQL pour éviter erreurs MAX() sur VARCHAR
+        from sqlalchemy import text as _sa_text
+        try:
+            _res = db.execute(_sa_text(
+                "SELECT numero FROM patients WHERE numero LIKE '#RB-%' "
+                "ORDER BY LENGTH(numero) DESC, numero DESC LIMIT 1"
+            )).fetchone()
+            if _res and _res[0]:
+                last_n = int(_res[0].replace("#RB-", ""))
+            else:
                 last_n = db.query(models.Patient).count()
-        else:
+        except Exception:
             last_n = db.query(models.Patient).count()
         new_numero = f"#RB-{(last_n + 1):04d}"
 

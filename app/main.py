@@ -160,6 +160,7 @@ async def lifespan(app: FastAPI):
     yield
     stop_scheduler()
 
+# FORCE_REDEPLOY_2026-05-08
 app = FastAPI(title="Clinique de la Rebecca API", version="1.0.0", lifespan=lifespan, docs_url="/docs", redoc_url=None)
 
 app.add_middleware(

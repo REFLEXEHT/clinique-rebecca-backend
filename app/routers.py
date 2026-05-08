@@ -4958,7 +4958,9 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
                 service=data.get("service", "clinique"),
                 created_by=current_user.id,
             )
-            try: patient.age = data.get("age")
+            try:
+                _age = data.get("age")
+                patient.age = int(_age) if _age and str(_age).strip() else None
             except Exception: pass
             try: patient.contact_urgence = data.get("contact_urgence", "")
             except Exception: pass

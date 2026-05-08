@@ -5197,6 +5197,77 @@ async def prochain_numero_patient(db: Session = Depends(get_db),
             return {"prochain_numero": "#RB-0001"}
 
 
+
+def _patient_a_paye(patient_id: int, db: Session) -> bool:
+    """Vérifie si le patient a au moins un RDV avec paiement effectué aujourd'hui."""
+    from sqlalchemy import cast, Date as SADate
+    today = datetime.now(timezone.utc).date()
+    rdv = db.query(models.RendezVous).filter(
+        models.RendezVous.patient_id == patient_id,
+        models.RendezVous.statut == models.StatutRDVEnum.paiement_effectue,
+        cast(models.RendezVous.created_at, SADate) == today,
+    ).first()
+    return rdv is not None
+
+
+
+@router.get("/labo/stats-jour", tags=["Labo"])
+async def labo_stats_jour(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """Statistiques du laboratoire pour la journée."""
+    from sqlalchemy import cast, Date as SADate, func as sqlfunc
+    today = datetime.now(timezone.utc).date()
+    
+    examens_jour = db.query(models.ResultatLabo).filter(
+        cast(models.ResultatLabo.created_at, SADate) == today
+    ).count()
+    
+    critiques_jour = db.query(models.ResultatLabo).filter(
+        cast(models.ResultatLabo.created_at, SADate) == today,
+        models.ResultatLabo.valeur_critique == True
+    ).count()
+    
+    patients_jour = db.query(sqlfunc.count(sqlfunc.distinct(models.ResultatLabo.patient_id))).filter(
+        cast(models.ResultatLabo.created_at, SADate) == today
+    ).scalar() or 0
+    
+    return {
+        "examens_jour": examens_jour,
+        "examens_critique": critiques_jour,
+        "patients_jour": patients_jour,
+        "date": str(today),
+    }
+
+
+@router.get("/labo/stats-semaine", tags=["Labo"])
+async def labo_stats_semaine(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """Statistiques du laboratoire pour la semaine en cours."""
+    from sqlalchemy import func as sqlfunc
+    now = datetime.now(timezone.utc)
+    debut_semaine = now - timedelta(days=now.weekday())
+    debut_semaine = debut_semaine.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    examens_sem = db.query(models.ResultatLabo).filter(
+        models.ResultatLabo.created_at >= debut_semaine
+    ).count()
+    
+    critiques_sem = db.query(models.ResultatLabo).filter(
+        models.ResultatLabo.created_at >= debut_semaine,
+        models.ResultatLabo.valeur_critique == True
+    ).count()
+    
+    patients_sem = db.query(sqlfunc.count(sqlfunc.distinct(models.ResultatLabo.patient_id))).filter(
+        models.ResultatLabo.created_at >= debut_semaine
+    ).scalar() or 0
+    
+    taux_critique = round(critiques_sem / examens_sem * 100, 1) if examens_sem > 0 else 0
+    
+    return {
+        "examens_semaine": examens_sem,
+        "patients_semaine": patients_sem,
+        "critiques_semaine": critiques_sem,
+        "taux_critique": taux_critique,
+    }
+
 @router.get("/infirmier/queue", tags=["Infirmier - Queue"])
 async def queue_infirmier(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     """File d'attente de l'infirmier — patients en attente de signes vitaux"""

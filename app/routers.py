@@ -1,3 +1,4 @@
+import os
 """
 routers.py — Clinique de la Rebecca
 Conformité PCN Haïti + IFRS for SMEs
@@ -1457,9 +1458,10 @@ Format: rapport professionnel structuré, 400-600 mots.""",
                 headers={
                     "Content-Type": "application/json",
                     "anthropic-version": "2023-06-01",
+                    "x-api-key": os.environ.get("ANTHROPIC_API_KEY", ""),
                 },
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": "claude-sonnet-4-6",
                     "max_tokens": 2000,
                     "system": system_prompt,
                     "messages": [{"role": "user", "content": full_prompt}],

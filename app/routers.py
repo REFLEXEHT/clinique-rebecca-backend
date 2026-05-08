@@ -4920,352 +4920,170 @@ def migrate_db_v2(db: Session = Depends(get_db)):
 async def enregistrer_visite_avec_paiement(data: dict, request: Request,
                                              db: Session = Depends(get_db),
                                              current_user=Depends(get_current_user)):
-    """
-    Caissier enregistre un nouveau patient OU un retour, choisit le service,
-    encaisse le paiement, et envoie le patient dans la queue infirmière.
-    """
-    import uuid as uuid_q
-    nom    = data.get("nom", "").upper().strip()
-    prenom = data.get("prenom", "").strip()
-    if not nom or not prenom:
-        raise HTTPException(422, "Nom et prénom requis")
+    """Enregistrement patient simplifié et robuste."""
+    import uuid as uuid_q, traceback as _tb
 
-    # Créer ou retrouver patient
-    patient = db.query(models.Patient).filter(
-        models.Patient.telephone == data.get("telephone", "")
-    ).first() if data.get("telephone") else None
+    try:
+        nom    = (data.get("nom") or "").upper().strip()
+        prenom = (data.get("prenom") or "").strip()
+        if not nom or not prenom:
+            raise HTTPException(422, "Nom et prénom requis")
 
-    if not patient:
-        # Générer un numéro séquentiel — raw SQL pour éviter erreurs MAX() sur VARCHAR
-        from sqlalchemy import text as _sa_text
-        try:
-            _res = db.execute(_sa_text(
-                "SELECT numero FROM patients WHERE numero LIKE '#RB-%' "
-                "ORDER BY LENGTH(numero) DESC, numero DESC LIMIT 1"
-            )).fetchone()
-            if _res and _res[0]:
-                last_n = int(_res[0].replace("#RB-", ""))
-            else:
+        # ── 1. Créer ou retrouver patient ────────────────────────────────
+        patient = None
+        tel = data.get("telephone", "")
+        if tel:
+            patient = db.query(models.Patient).filter(
+                models.Patient.telephone == tel
+            ).first()
+
+        if not patient:
+            from sqlalchemy import text as _t
+            try:
+                _r = db.execute(_t(
+                    "SELECT numero FROM patients WHERE numero LIKE '#RB-%' "
+                    "ORDER BY LENGTH(numero) DESC, numero DESC LIMIT 1"
+                )).fetchone()
+                last_n = int(_r[0].replace("#RB-", "")) if _r and _r[0] else 0
+            except Exception:
                 last_n = db.query(models.Patient).count()
-        except Exception:
-            last_n = db.query(models.Patient).count()
-        new_numero = f"#RB-{(last_n + 1):04d}"
 
-        patient = models.Patient(
-            nom=nom, prenom=prenom,
-            age=data.get("age"),
-            telephone=data.get("telephone", ""),
-            email=data.get("email", ""),
-            adresse=data.get("adresse", ""),
-            contact_urgence=data.get("contact_urgence", ""),
-            numero=new_numero,
-            is_premiere_visite=True,
-            service=data.get("service", "clinique"),
-            created_by=current_user.id,
-        )
-        db.add(patient); db.flush()
-    else:
-        patient.is_premiere_visite = False
-
-    # Enregistrer le paiement
-    service = data.get("service", "Consultation")
-    montant = float(data.get("montant", 0))
-    mode    = data.get("mode_paiement", "especes")
-    now     = datetime.now(timezone.utc)
-
-    if montant > 0:
-        try:
-            # Mapping service → catégorie + compte PCN produit
-            SERVICE_TO_CAT = {
-                "labo":        ("Laboratoire",     "705"),
-                "pharmacie":   ("Pharmacie",       "706"),
-                "dentisterie": ("Dentisterie",     "707"),
-                "physio":      ("Physiothérapie",  "708"),
-                "optometrie":  ("Optométrie",      "709"),
-                "maternite":   ("Chirurgies",      "703"),
-                "sop":         ("Chirurgies",      "703"),
-                "observation": ("Hospitalisations","704"),
-                "geste":       ("Gestes médicaux", "702"),
-                "clinique":    ("Consultations",   "701"),
-            }
-            svc_key = (data.get("serviceType") or service or "").lower().split()[0]
-            cat_svc, cpte_produit = SERVICE_TO_CAT.get(svc_key, ("Consultations", "701"))
-            compte_tresor = models.get_compte_tresorerie(mode, "HTG")
-
-            # ── Répartition par type de praticien ───────────────────────
-            praticien_nom = (data.get("praticien") or data.get("medecin_nom") or "").strip()
-            tarif_med = None
-            if praticien_nom:
-                nom_court = praticien_nom.replace("Dr ", "").replace("Dre ", "").strip()
-                tarif_med = db.query(models.TarifMedecin).filter(
-                    models.TarifMedecin.actif == True,
-                    models.TarifMedecin.medecin_nom.ilike(f"%{nom_court}%"),
-                ).first()
-
-            type_med = str(tarif_med.type_medecin.value) if tarif_med and tarif_med.type_medecin else None
-
-            # Règles de répartition par défaut (configurables dans ReglePartage)
-            DEFAUTS_PCT = {
-                "investisseur":            {"consultation": 70, "geste": 80, "chirurgie": 65, "default": 70},
-                "affilie":                 {"consultation": 60, "geste": 70, "chirurgie": 55, "default": 60},
-                "exploitant":              {"consultation":  0, "geste":  0, "chirurgie":  0, "default":  0},
-                "investisseur_exploitant": {"consultation":  0, "geste":  0, "chirurgie":  0, "default":  0},
-            }
-
-            if type_med in ("exploitant", "investisseur_exploitant"):
-                # Exploitant: recette TOTALE va à la clinique — le praticien paie un loyer mensuel séparé
-                montant_clinique = montant
-                montant_medecin  = 0
-                pct_medecin      = 0
-            elif type_med in ("investisseur", "affilie"):
-                # Chercher règle personnalisée dans ReglePartage
-                type_acte_map = {"clinique":"consultation","geste":"geste","sop":"chirurgie","maternite":"chirurgie"}
-                type_acte = type_acte_map.get(svc_key, "consultation")
-                regle = db.query(models.ReglePartage).filter(
-                    models.ReglePartage.type_medecin == models.TypeMedecinEnum(type_med),
-                    models.ReglePartage.type_acte == type_acte,
-                ).first()
-                pct_medecin = regle.pct_medecin if regle else DEFAUTS_PCT[type_med].get(type_acte, DEFAUTS_PCT[type_med]["default"])
-                montant_medecin  = round(montant * pct_medecin / 100, 2)
-                montant_clinique = round(montant - montant_medecin, 2)
-            else:
-                # Pas de praticien identifié: recette 100% clinique
-                montant_clinique = montant
-                montant_medecin  = 0
-                pct_medecin      = 0
-
-            # ── Écriture 1: Recette clinique (511/521 → 701..709) ────────
-            mouvement = _creer_mouvement(
-                db=db,
-                journal=models.JournalEnum.VTE,
-                type_mouv=models.TypeMouvementEnum.recette,
-                categorie=cat_svc,
-                description=f"{cat_svc} — {prenom} {nom}" + (f" — {praticien_nom}" if praticien_nom else ""),
-                montant=montant_clinique if montant_medecin > 0 else montant,
-                compte_debit=compte_tresor,
-                compte_credit=cpte_produit,
-                libelle_debit=f"Trésorerie {mode} ({compte_tresor})",
-                libelle_credit=f"Produits {cat_svc} ({cpte_produit})",
-                mode_paiement=mode,
+            patient = models.Patient(
+                nom=nom, prenom=prenom,
+                telephone=tel,
+                email=data.get("email", ""),
+                adresse=data.get("adresse", ""),
+                numero=f"#RB-{(last_n + 1):04d}",
+                is_premiere_visite=True,
+                service=data.get("service", "clinique"),
                 created_by=current_user.id,
             )
+            try: patient.age = data.get("age")
+            except Exception: pass
+            try: patient.contact_urgence = data.get("contact_urgence", "")
+            except Exception: pass
+            db.add(patient)
             db.flush()
+        else:
+            patient.is_premiere_visite = False
 
-            # ── Écriture 2: Honoraires praticien (651 → 468) ─────────────
-            if montant_medecin > 0 and tarif_med:
-                _creer_mouvement(
+        service = data.get("service", "Consultation")
+        montant = float(data.get("montant", 0) or 0)
+        mode    = data.get("mode_paiement", "especes")
+        now     = datetime.now(timezone.utc)
+
+        # ── 2. Écriture comptable (optionnelle — ne bloque pas si erreur) ─
+        mouvement = None
+        if montant > 0:
+            try:
+                praticien_nom = (data.get("praticien") or data.get("medecin_nom") or "").strip()
+                compte_tresor = models.get_compte_tresorerie(mode, "HTG")
+                mouvement = _creer_mouvement(
                     db=db,
-                    journal=models.JournalEnum.OD,
-                    type_mouv=models.TypeMouvementEnum.depense,
-                    categorie="Honoraires médecins",
-                    description=f"Honoraires {praticien_nom} — {prenom} {nom} — {cat_svc} ({pct_medecin:.0f}%)",
-                    montant=montant_medecin,
-                    compte_debit="651",
-                    compte_credit="468",
-                    libelle_debit=f"Honoraires médecins (651)",
-                    libelle_credit=f"C/C {praticien_nom} (468)",
-                    mode_paiement="virement_interne",
+                    journal=models.JournalEnum.VTE,
+                    type_mouv=models.TypeMouvementEnum.recette,
+                    categorie="Consultations",
+                    description=f"{service} — {prenom} {nom}",
+                    montant=montant,
+                    compte_debit=compte_tresor,
+                    compte_credit="701",
+                    libelle_debit=f"Trésorerie {mode}",
+                    libelle_credit=f"Recettes {service}",
+                    mode_paiement=mode,
                     created_by=current_user.id,
                 )
-                # Mettre à jour solde C/C 468 — ignoré si colonne absente
                 db.flush()
+            except Exception as _ce:
+                logger.error(f"Compta optionnelle échouée: {_ce}")
+                try: db.rollback()
+                except Exception: pass
 
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Erreur paiement visite: {e}")
-            mouvement = None
+        # ── 3. Ticket & RDV ──────────────────────────────────────────────
+        ticket_id = str(uuid_q.uuid4())[:8].upper()
+        praticien_val = (data.get("praticien") or data.get("medecin_nom") or "").strip()
 
-    # Créer une entrée dans la queue infirmière
-    ticket_id = str(uuid_q.uuid4())[:8].upper()
-    queue_entry = {
-        "ticket": ticket_id,
-        "patient_id": patient.id,
-        "patient_numero": patient.numero,
-        "patient_nom": f"{prenom} {nom}",
-        "patient_telephone": patient.telephone,
-        "service": service,
-        "priorite": data.get("priorite", "normal"),  # urgent, normal
-        "created_at": now.isoformat(),
-        "statut": "en_attente_infirmier",
-    }
-    # Stocker dans un RDV simplifié pour que l'infirmier puisse voir
-    medecin_nom_val = data.get("medecin_nom", "") or ""
-    praticien_val   = data.get("praticien", "") or medecin_nom_val  # compatibilité double champ
-    # Créer le RendezVous avec gestion des colonnes potentiellement absentes
-    try:
-        rdv = models.RendezVous(
-            patient_id=patient.id,
-            patient_nom=f"{prenom} {nom}",
-            patient_telephone=patient.telephone or "",
-            patient_email=patient.email or "",
-            specialite=service,
-            date_rdv=now,
-            type_rdv=models.TypeRDVEnum.presentiel,
-            statut=models.StatutRDVEnum.paiement_effectue if montant > 0 else models.StatutRDVEnum.en_attente,
-            notes_admin=f"Queue caisse #{ticket_id}",
-            created_by=current_user.id,
-        )
-        # Colonnes ajoutées progressivement — assignation défensive
-        for col, val in [
-            ("code_patient",   ticket_id),
-            ("medecin_nom",    praticien_val or medecin_nom_val or None),
-            ("medecin_email",  None),
-        ]:
-            try: setattr(rdv, col, val)
-            except Exception: pass
-        db.add(rdv)
-        db.commit()
-    except Exception as e:
-        import traceback
-        logger.error(f"Erreur création RDV queue: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        db.rollback()
-        # Créer quand même le patient et retourner un succès partiel
         try:
+            rdv = models.RendezVous(
+                patient_id=patient.id,
+                patient_nom=f"{prenom} {nom}",
+                patient_telephone=patient.telephone or "",
+                patient_email=patient.email or "",
+                specialite=service,
+                date_rdv=now,
+                type_rdv=models.TypeRDVEnum.presentiel,
+                statut=models.StatutRDVEnum.paiement_effectue if montant > 0 else models.StatutRDVEnum.en_attente,
+                notes_admin=f"Queue caisse #{ticket_id}",
+                created_by=current_user.id,
+            )
+            for _col, _val in [("code_patient", ticket_id), ("medecin_nom", praticien_val or None), ("medecin_email", None)]:
+                try: setattr(rdv, _col, _val)
+                except Exception: pass
+            db.add(rdv)
             db.commit()
-        except Exception:
-            pass
-        rdv = type("RDV", (), {"id": 0, "code_patient": ticket_id})()
+        except Exception as _re:
+            logger.error(f"RDV creation failed: {_re} | {_tb.format_exc()}")
+            try: db.rollback()
+            except Exception: pass
+            try: db.commit()
+            except Exception: pass
+            rdv = type("RDV", (), {"id": 0})()
 
-    try: db.refresh(patient)
-    except Exception: pass
-    try: db.refresh(rdv)
-    except Exception: pass
+        try: db.refresh(patient)
+        except Exception: pass
 
-    # ── Génération automatique de la feuille selon le service ───────────
-    svc_lower = (service or "").lower()
-    praticien_final = praticien_val or medecin_nom_val or ""
+        # ── 4. Feuille automatique ───────────────────────────────────────
+        svc_lower = service.lower()
+        if any(k in svc_lower for k in ["labo", "laboratoire"]):
+            type_feuille, service_dest = "labo", "labo"
+        elif any(k in svc_lower for k in ["dent"]):
+            type_feuille, service_dest = "specialise", "dentisterie"
+        elif any(k in svc_lower for k in ["physio"]):
+            type_feuille, service_dest = "specialise", "physio"
+        elif any(k in svc_lower for k in ["optom", "opht"]):
+            type_feuille, service_dest = "specialise", "optometrie"
+        else:
+            type_feuille, service_dest = "consultation", "infirmier"
 
-    SERVICES_CLINIQUE    = ["clinique", "médecine", "medecine", "interne", "externe",
-                            "neurologie", "pédiatrie", "pediatrie", "cardiologie",
-                            "gynécologie", "gynecologie", "dermatologie", "psychiatrie",
-                            "psychologie", "endocrinologie", "gastro", "pneumo",
-                            "rhumatologie", "urologie", "chirurgie", "ortho"]
-    SERVICES_LABO        = ["labo", "laboratoire", "analyse", "biologie", "hématologie",
-                            "hematologie", "biochimie"]
-    SERVICES_SPECIALISES = {
-        "dentisterie": "Dentisterie",
-        "dent":        "Dentisterie",
-        "physio":      "Physiothérapie",
-        "kine":        "Kinésithérapie",
-        "optometrie":  "Optométrie",
-        "optom":       "Optométrie",
-        "opht":        "Ophtalmologie",
-        "maternite":   "Maternité",
-        "sop":         "Salle d'opération",
-        "observation": "Observation",
-    }
+        feuille_data = {
+            "type": type_feuille, "service_dest": service_dest,
+            "ticket": ticket_id, "patient_id": patient.id,
+            "patient_numero": patient.numero, "patient_nom": f"{prenom} {nom}",
+            "patient_age": getattr(patient, "age", None),
+            "patient_tel": patient.telephone or "",
+            "service": service, "service_label": service,
+            "praticien": praticien_val,
+            "date_visite": now.isoformat(),
+            "montant_paye": montant, "mode_paiement": mode,
+            "paiement_complet": montant > 0,
+            "rdv_id": getattr(rdv, "id", 0),
+            "is_premiere_visite": getattr(patient, "is_premiere_visite", True),
+        }
 
-    type_feuille = "consultation"  # défaut
-    service_dest = "medecin"
-    svc_label    = service
+        try:
+            log_audit(db, "VISITE_ENREGISTREE", actor_id=current_user.id,
+                      actor_role="caissier", target_id=patient.numero,
+                      target_type="patient", details=f"{service}|{montant}HTG|#{ticket_id}")
+        except Exception: pass
 
-    if any(k in svc_lower for k in SERVICES_LABO):
-        type_feuille = "labo"
-        service_dest = "labo"
-    elif any(k in svc_lower for k in SERVICES_CLINIQUE) or svc_lower == "clinique":
-        type_feuille = "consultation"
-        service_dest = "infirmier"  # passe d'abord par infirmier
-    else:
-        for k, label in SERVICES_SPECIALISES.items():
-            if k in svc_lower:
-                type_feuille = "specialise"
-                service_dest = k
-                svc_label    = label
-                break
+        return {
+            "patient": {
+                "id": patient.id, "numero": patient.numero,
+                "nom": f"{prenom} {nom}", "telephone": patient.telephone,
+                "is_premiere_visite": getattr(patient, "is_premiere_visite", True),
+            },
+            "ticket": ticket_id,
+            "rdv_id": getattr(rdv, "id", 0),
+            "service": service, "montant": montant,
+            "mode_paiement": mode, "medecin_nom": praticien_val,
+            "feuille": feuille_data,
+            "message": f"Patient {patient.numero} — ticket #{ticket_id}",
+        }
 
-    feuille_data = {
-        "type":            type_feuille,
-        "service_dest":    service_dest,
-        "ticket":          ticket_id,
-        "patient_id":      patient.id,
-        "patient_numero":  patient.numero,
-        "patient_nom":     f"{prenom} {nom}",
-        "patient_age":     patient.age,
-        "patient_tel":     patient.telephone or "",
-        "service":         service,
-        "service_label":   svc_label,
-        "praticien":       praticien_final,
-        "date_visite":     now.isoformat(),
-        "montant_paye":    montant,
-        "mode_paiement":   mode,
-        "paiement_complet": montant > 0,
-        "rdv_id":          rdv.id if hasattr(rdv, "id") else 0,
-        "is_premiere_visite": patient.is_premiere_visite,
-    }
-
-    log_audit(db, "VISITE_ENREGISTREE", actor_id=current_user.id, actor_role="caissier",
-              target_id=patient.numero, target_type="patient",
-              details=f"{service} | {montant} HTG | ticket #{ticket_id} | feuille={type_feuille}")
-
-    return {
-        "patient": {
-            "id": patient.id, "numero": patient.numero,
-            "nom": f"{prenom} {nom}", "telephone": patient.telephone,
-            "is_premiere_visite": patient.is_premiere_visite,
-        },
-        "ticket":       ticket_id,
-        "rdv_id":       rdv.id if hasattr(rdv, "id") else 0,
-        "service":      service,
-        "montant":      montant,
-        "mode_paiement": mode,
-        "medecin_nom":  praticien_final,
-        "feuille":      feuille_data,
-        "message": f"Patient {patient.numero} — ticket #{ticket_id} | feuille {type_feuille} générée",
-    }
-
-
-
-@router.get("/caissier/debug-test", tags=["Caissier - Queue"])
-async def debug_test_enregistrement(db: Session = Depends(get_db)):
-    """Endpoint de debug — teste la création patient sans commit."""
-    import traceback
-    results = {}
-    
-    # Test 1: raw SQL for numero
-    try:
-        from sqlalchemy import text as _t
-        r = db.execute(_t("SELECT numero FROM patients WHERE numero LIKE '#RB-%' ORDER BY LENGTH(numero) DESC, numero DESC LIMIT 1")).fetchone()
-        results["test_sql_numero"] = f"OK: {r[0] if r else 'none'}"
-    except Exception as e:
-        results["test_sql_numero"] = f"FAIL: {e}"
-    
-    # Test 2: Patient model columns
-    try:
-        cols = [c.key for c in models.Patient.__table__.columns]
-        results["patient_columns"] = cols
-    except Exception as e:
-        results["patient_columns"] = f"FAIL: {e}"
-    
-    # Test 3: StatutRDVEnum
-    try:
-        results["statut_enum"] = [e.value for e in models.StatutRDVEnum]
-    except Exception as e:
-        results["statut_enum"] = f"FAIL: {e}"
-    
-    # Test 4: RendezVous columns
-    try:
-        rdv_cols = [c.key for c in models.RendezVous.__table__.columns]
-        results["rdv_columns"] = rdv_cols
-    except Exception as e:
-        results["rdv_columns"] = f"FAIL: {e}"
-    
-    # Test 5: TarifMedecin model
-    try:
-        tm_cols = [c.key for c in models.TarifMedecin.__table__.columns]
-        results["tarifmedecin_columns"] = tm_cols
-    except Exception as e:
-        results["tarifmedecin_columns"] = f"FAIL: {e}"
-
-    # Test 6: get_compte_tresorerie function
-    try:
-        r6 = models.get_compte_tresorerie("especes", "HTG")
-        results["test_compte_tresorerie"] = f"OK: {r6}"
-    except Exception as e:
-        results["test_compte_tresorerie"] = f"FAIL: {e}"
-
-    return results
+    except HTTPException:
+        raise
+    except Exception as _e:
+        logger.error(f"enregistrer-visite CRASH: {_e} | " + _tb.format_exc())
+        raise HTTPException(500, f"Erreur: {str(_e)[:300]}")
 
 
 @router.get("/caissier/dernier-patient", tags=["Caissier - Queue"])

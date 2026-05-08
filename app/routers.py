@@ -5118,10 +5118,15 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
         db.add(rdv)
         db.commit()
     except Exception as e:
+        import traceback
         logger.error(f"Erreur création RDV queue: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         db.rollback()
         # Créer quand même le patient et retourner un succès partiel
-        db.commit()
+        try:
+            db.commit()
+        except Exception:
+            pass
         rdv = type("RDV", (), {"id": 0, "code_patient": ticket_id})()
 
     try: db.refresh(patient)

@@ -5129,9 +5129,71 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
     try: db.refresh(rdv)
     except Exception: pass
 
+    # ── Génération automatique de la feuille selon le service ───────────
+    svc_lower = (service or "").lower()
+    praticien_final = praticien_val or medecin_nom_val or ""
+
+    SERVICES_CLINIQUE    = ["clinique", "médecine", "medecine", "interne", "externe",
+                            "neurologie", "pédiatrie", "pediatrie", "cardiologie",
+                            "gynécologie", "gynecologie", "dermatologie", "psychiatrie",
+                            "psychologie", "endocrinologie", "gastro", "pneumo",
+                            "rhumatologie", "urologie", "chirurgie", "ortho"]
+    SERVICES_LABO        = ["labo", "laboratoire", "analyse", "biologie", "hématologie",
+                            "hematologie", "biochimie"]
+    SERVICES_SPECIALISES = {
+        "dentisterie": "Dentisterie",
+        "dent":        "Dentisterie",
+        "physio":      "Physiothérapie",
+        "kine":        "Kinésithérapie",
+        "optometrie":  "Optométrie",
+        "optom":       "Optométrie",
+        "opht":        "Ophtalmologie",
+        "maternite":   "Maternité",
+        "sop":         "Salle d'opération",
+        "observation": "Observation",
+    }
+
+    type_feuille = "consultation"  # défaut
+    service_dest = "medecin"
+    svc_label    = service
+
+    if any(k in svc_lower for k in SERVICES_LABO):
+        type_feuille = "labo"
+        service_dest = "labo"
+    elif any(k in svc_lower for k in SERVICES_CLINIQUE) or svc_lower == "clinique":
+        type_feuille = "consultation"
+        service_dest = "infirmier"  # passe d'abord par infirmier
+    else:
+        for k, label in SERVICES_SPECIALISES.items():
+            if k in svc_lower:
+                type_feuille = "specialise"
+                service_dest = k
+                svc_label    = label
+                break
+
+    feuille_data = {
+        "type":            type_feuille,
+        "service_dest":    service_dest,
+        "ticket":          ticket_id,
+        "patient_id":      patient.id,
+        "patient_numero":  patient.numero,
+        "patient_nom":     f"{prenom} {nom}",
+        "patient_age":     patient.age,
+        "patient_tel":     patient.telephone or "",
+        "service":         service,
+        "service_label":   svc_label,
+        "praticien":       praticien_final,
+        "date_visite":     now.isoformat(),
+        "montant_paye":    montant,
+        "mode_paiement":   mode,
+        "paiement_complet": montant > 0,
+        "rdv_id":          rdv.id if hasattr(rdv, "id") else 0,
+        "is_premiere_visite": patient.is_premiere_visite,
+    }
+
     log_audit(db, "VISITE_ENREGISTREE", actor_id=current_user.id, actor_role="caissier",
               target_id=patient.numero, target_type="patient",
-              details=f"{service} | {montant} HTG | ticket #{ticket_id}")
+              details=f"{service} | {montant} HTG | ticket #{ticket_id} | feuille={type_feuille}")
 
     return {
         "patient": {
@@ -5139,13 +5201,14 @@ async def enregistrer_visite_avec_paiement(data: dict, request: Request,
             "nom": f"{prenom} {nom}", "telephone": patient.telephone,
             "is_premiere_visite": patient.is_premiere_visite,
         },
-        "ticket": ticket_id,
-        "rdv_id": rdv.id,
-        "service": service,
-        "montant": montant,
+        "ticket":       ticket_id,
+        "rdv_id":       rdv.id if hasattr(rdv, "id") else 0,
+        "service":      service,
+        "montant":      montant,
         "mode_paiement": mode,
-        "medecin_nom": praticien_val or medecin_nom_val or "",
-        "message": f"Patient {patient.numero} enregistré — ticket #{ticket_id} envoyé à l'infirmière",
+        "medecin_nom":  praticien_final,
+        "feuille":      feuille_data,
+        "message": f"Patient {patient.numero} — ticket #{ticket_id} | feuille {type_feuille} générée",
     }
 
 

@@ -5376,6 +5376,95 @@ async def labo_stats_semaine(db: Session = Depends(get_db), current_user=Depends
         "taux_critique": taux_critique,
     }
 
+
+@router.post("/admin/reset-password/{user_id}", tags=["Admin"])
+async def admin_reset_password(user_id: int, data: dict,
+                                db: Session = Depends(get_db),
+                                current_user=Depends(get_current_user)):
+    """Admin réinitialise le mot de passe d'un utilisateur."""
+    if str(current_user.role) not in ("admin", "StatutRDVEnum.admin"):
+        raise HTTPException(403, "Réservé aux administrateurs")
+
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+
+    new_pwd = data.get("nouveau_mot_de_passe", "").strip()
+    if not new_pwd:
+        # Generate a temporary password
+        import secrets, string
+        chars = string.ascii_letters + string.digits
+        new_pwd = ''.join(secrets.choice(chars) for _ in range(10))
+
+    user.hashed_password = get_password_hash(new_pwd)
+    try: user.must_change_password = True  # Force change on next login
+    except Exception: pass
+    db.commit()
+
+    return {
+        "message": f"Mot de passe réinitialisé pour {user.nom}",
+        "temp_password": new_pwd,
+        "must_change_password": True,
+    }
+
+
+@router.post("/auth/forgot-password", tags=["Auth"])
+async def forgot_password(data: dict, db: Session = Depends(get_db)):
+    """Patient/staff: demande de réinitialisation par email."""
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(422, "Email requis")
+
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if not user:
+        # Don't reveal if email exists
+        return {"message": "Si cet email existe, un lien de réinitialisation a été envoyé"}
+
+    # Generate temp password
+    import secrets, string
+    chars = string.ascii_letters + string.digits
+    temp_pwd = ''.join(secrets.choice(chars) for _ in range(10))
+    user.hashed_password = get_password_hash(temp_pwd)
+    try: user.must_change_password = True
+    except Exception: pass
+    db.commit()
+
+    # Send email with temp password
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg_body = f"""Bonjour {user.nom},
+
+Votre mot de passe temporaire pour Clinique de la Rebecca:
+
+    {temp_pwd}
+
+Connectez-vous sur: https://clinique-rebecca-frontend.vercel.app/login
+
+Vous devrez changer ce mot de passe à votre prochaine connexion.
+
+Cordialement,
+Clinique de la Rebecca
+(509) 4858-5757
+"""
+        msg = MIMEText(msg_body, 'plain', 'utf-8')
+        msg['Subject'] = 'Réinitialisation de votre mot de passe — Clinique de la Rebecca'
+        msg['From'] = 'noreply@cliniquerebecca.ht'
+        msg['To'] = email
+
+        import os
+        smtp_host = os.getenv('SMTP_HOST', '')
+        smtp_user = os.getenv('SMTP_USER', '')
+        smtp_pass = os.getenv('SMTP_PASS', '')
+        if smtp_host and smtp_user and smtp_pass:
+            with smtplib.SMTP_SSL(smtp_host, 465) as s:
+                s.login(smtp_user, smtp_pass)
+                s.send_message(msg)
+    except Exception as _e:
+        logger.error(f"Email reset failed: {_e}")
+
+    return {"message": "Si cet email existe, un lien de réinitialisation a été envoyé"}
+
 @router.get("/infirmier/queue", tags=["Infirmier - Queue"])
 async def queue_infirmier(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     """File d'attente de l'infirmier — patients en attente de signes vitaux"""

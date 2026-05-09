@@ -29,13 +29,16 @@ import enum
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RoleEnum(str, enum.Enum):
-    admin     = "admin"
-    medecin   = "medecin"
-    patient   = "patient"
-    caissier  = "caissier"
-    labo      = "labo"
-    pharmacie = "pharmacie"
-    infirmier = "infirmier"
+    admin      = "admin"
+    medecin    = "medecin"
+    patient    = "patient"
+    caissier   = "caissier"
+    labo       = "labo"
+    pharmacie  = "pharmacie"
+    infirmier  = "infirmier"
+    dentiste   = "dentiste"
+    physio     = "physio"
+    optometrie = "optometrie"
 
 
 class StatutRDVEnum(str, enum.Enum):
@@ -162,7 +165,8 @@ class User(Base):
     is_active       = Column(Boolean, default=True)
     signature_image = Column(Text, nullable=True)  # base64 PNG — médecin uniquement
     photo_profil    = Column(Text, nullable=True)  # base64 JPEG — photo de profil
-    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    must_change_password = Column(Boolean, default=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -343,7 +347,8 @@ class Mouvement(Base):
     created_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
     modified_by     = Column(Integer, ForeignKey("users.id"), nullable=True)
     modified_at     = Column(DateTime(timezone=True), onupdate=func.now())
-    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    must_change_password = Column(Boolean, default=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -691,7 +696,8 @@ class GesteMedical(Base):
     prix_fixe       = Column(Boolean, default=False)
     actif           = Column(Boolean, default=True)
     ordre           = Column(Integer, default=0)
-    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    must_change_password = Column(Boolean, default=False)
     updated_at      = Column(DateTime(timezone=True), onupdate=func.now())
 
 
@@ -767,7 +773,8 @@ class DemandeAccesDossier(Base):
     duree_acces_h   = Column(Integer, default=24)
     acces_expire_at = Column(DateTime(timezone=True), nullable=True)
     # Timestamps
-    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    must_change_password = Column(Boolean, default=False)
     decided_at      = Column(DateTime(timezone=True), nullable=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -874,7 +881,8 @@ class DossierPatient(Base):
     date_visite     = Column(DateTime(timezone=True), server_default=func.now())
     date_fin_consultation = Column(DateTime(timezone=True), nullable=True)
     created_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
-    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    must_change_password = Column(Boolean, default=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -903,7 +911,8 @@ class SignesVitaux(Base):
     alerte_message      = Column(Text, nullable=True)
     # Audit
     saisi_par       = Column(Integer, ForeignKey("users.id"), nullable=False)
-    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    must_change_password = Column(Boolean, default=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -976,7 +985,8 @@ class Hospitalisation(Base):
     mouvement_id    = Column(Integer, ForeignKey("mouvements.id"), nullable=True)
     statut          = Column(String(20), default="actif")  # actif, sorti
     created_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
-    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    must_change_password = Column(Boolean, default=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -995,7 +1005,8 @@ class AvisPatient(Base):
     commentaire     = Column(Text, nullable=True)
     sentiment_ia    = Column(String(20), nullable=True) # positif, neutre, negatif
     anonyme         = Column(Boolean, default=False)
-    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    must_change_password = Column(Boolean, default=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1011,4 +1022,5 @@ class LienVideoRdv(Base):
     lien_video      = Column(String(500), nullable=False)
     expire_at       = Column(DateTime(timezone=True), nullable=False)  # +2h à partir connexion
     utilise         = Column(Boolean, default=False)
-    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    must_change_password = Column(Boolean, default=False)

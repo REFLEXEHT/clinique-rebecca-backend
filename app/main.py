@@ -84,6 +84,7 @@ def migrate_add_missing_columns():
     # ── 2. Ajouter colonnes manquantes ───────────────────────────────────────
     column_migrations = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_updated_at TIMESTAMP WITH TIME ZONE",
         "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS confirme_par INTEGER",
         "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS confirme_par_role VARCHAR(50)",
@@ -134,6 +135,7 @@ def migrate_add_missing_columns():
         "ALTER TABLE rendez_vous ADD COLUMN IF NOT EXISTS mouvement_id INTEGER",
         # Autres colonnes critiques
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE",
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS service VARCHAR(100)",
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS sexe VARCHAR(10)",
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS groupe_sanguin VARCHAR(10)",

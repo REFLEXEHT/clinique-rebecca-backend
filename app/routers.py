@@ -231,65 +231,92 @@ async def login(data: schemas.UserLogin, db: Session = Depends(get_db)):
 @router.post("/auth/register", tags=["Auth"])
 async def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
     """
-    Inscription publique — patients uniquement.
-    Règles :
-    - Patients : email personnel obligatoire (pas @cliniquerebecca.ht)
-    - Personnel (médecin, admin, caissier, labo, infirmier, pharmacie) :
-      email @cliniquerebecca.ht obligatoire — compte créé par l'admin uniquement
+    Inscription — patients (email personnel) ou personnel clinique (@cliniquerebecca.ht).
+    Les comptes personnel sont créés par l'admin avec must_change_password=True.
     """
     email_lower = data.email.lower()
-    is_staff_role = data.role not in [models.RoleEnum.patient]
+
+    STAFF_ROLES = ["medecin","admin","caissier","labo","infirmier","pharmacie",
+                   "dentiste","physio","optometrie"]
+    is_staff_role = str(data.role) in STAFF_ROLES or (
+        hasattr(data.role, 'value') and data.role.value in STAFF_ROLES
+    )
     is_clinic_email = email_lower.endswith("@cliniquerebecca.ht")
 
-    # Personnel ne peut pas s'inscrire en self-service
-    if is_staff_role:
-        raise HTTPException(403, "L'inscription en libre-service est réservée aux patients. Le personnel doit contacter l'administrateur.")
+    # Règle email
+    if is_staff_role and not is_clinic_email:
+        raise HTTPException(400,
+            f"Le personnel utilise prenom.nom@cliniquerebecca.ht")
+    if not is_staff_role and is_clinic_email:
+        raise HTTPException(400,
+            "Les patients utilisent leur email personnel, pas @cliniquerebecca.ht")
 
-    # Patients ne peuvent pas utiliser l'email clinique
-    if is_clinic_email:
-        raise HTTPException(400, "Les comptes patients doivent utiliser un email personnel. Les emails @cliniquerebecca.ht sont réservés au personnel.")
-
-    if db.query(models.User).filter(models.User.email == data.email).first():
+    # Unicité
+    if db.query(models.User).filter(models.User.email == email_lower).first():
         raise HTTPException(400, "Email déjà utilisé")
-    is_active = data.role == models.RoleEnum.patient
+
+    hashed = get_password_hash(data.password)
     user = models.User(
-        email=data.email, nom=data.nom,
-        hashed_password=get_password_hash(data.password),
-        role=data.role, telephone=data.telephone,
-        specialite=data.specialite, type_medecin=data.type_medecin,
-        is_active=is_active,
+        email=email_lower,
+        hashed_password=hashed,
+        nom=data.nom,
+        role=data.role,
+        is_active=True,
     )
-    db.add(user); db.commit(); db.refresh(user)
-    if data.role == models.RoleEnum.medecin and data.type_medecin:
-        profil = models.ProfilMedecin(
-            user_id=user.id, nom=user.nom,
-            specialite=data.specialite, type_medecin=data.type_medecin,
-        )
-        db.add(profil); db.commit()
-    if is_active:
-        # Auto-créer le dossier Patient lié au compte User
+    # Champs optionnels
+    for col, val in [
+        ("prenom", getattr(data, "prenom", None)),
+        ("specialite", getattr(data, "specialite", None)),
+        ("telephone", getattr(data, "telephone", None)),
+    ]:
         try:
-            count = db.query(models.Patient).count()
-            numero = f"#RB-{str(count + 1).zfill(4)}"
-            patient = models.Patient(
-                user_id=user.id,
-                numero=numero,
-                nom=data.nom,
-                email=data.email,
-                telephone=data.telephone,
-            )
-            db.add(patient)
-            db.commit()
-        except Exception as e:
-            # Ne pas bloquer la création du compte si le dossier patient échoue
-            logger.warning(f"Patient record creation failed for user {user.id}: {e}")
-            db.rollback()
+            if val: setattr(user, col, val)
+        except Exception: pass
 
-        token = create_access_token({"sub": str(user.id)})
-        return {"access_token": token, "token_type": "bearer",
-                "user": {"id": user.id, "nom": user.nom, "email": user.email, "role": user.role}}
-    return {"message": "Compte créé — en attente de validation", "role": data.role}
+    # Staff créé par admin → doit changer son mot de passe au premier login
+    if is_staff_role:
+        try: user.must_change_password = True
+        except Exception: pass
 
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {"message": "Compte créé", "id": user.id, "role": str(user.role)}
+
+@router.post("/auth/change-password", tags=["Auth"])
+async def change_password(data: dict, db: Session = Depends(get_db),
+                           current_user=Depends(get_current_user)):
+    """Changer son mot de passe (obligatoire au premier login pour le personnel)."""
+    old_pwd = data.get("ancien_mot_de_passe", "")
+    new_pwd = data.get("nouveau_mot_de_passe", "")
+
+    if not new_pwd or len(new_pwd) < 6:
+        raise HTTPException(422, "Le nouveau mot de passe doit faire au moins 6 caractères")
+
+    # Vérifier l'ancien mot de passe (sauf si must_change_password — premier login)
+    must_change = getattr(current_user, 'must_change_password', False)
+    if not must_change:
+        if not old_pwd or not verify_password(old_pwd, current_user.hashed_password):
+            raise HTTPException(400, "Ancien mot de passe incorrect")
+
+    current_user.hashed_password = get_password_hash(new_pwd)
+    try: current_user.must_change_password = False
+    except Exception: pass
+    db.commit()
+    return {"message": "Mot de passe changé avec succès"}
+
+
+@router.get("/auth/me/profile", tags=["Auth"])
+async def get_my_profile(current_user=Depends(get_current_user)):
+    """Retourne le profil complet + must_change_password."""
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "nom": current_user.nom,
+        "role": str(current_user.role),
+        "must_change_password": getattr(current_user, 'must_change_password', False),
+        "is_active": current_user.is_active,
+    }
 
 @router.get("/auth/me", tags=["Auth"])
 async def me(current_user: models.User = Depends(get_current_user)):

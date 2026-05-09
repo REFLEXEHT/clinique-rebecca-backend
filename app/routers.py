@@ -221,10 +221,18 @@ async def login(data: schemas.UserLogin, db: Session = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(403, "Compte inactif — en attente de validation")
     token = create_access_token({"sub": str(user.id)})
+    # Normalize role to string safely
+    role_str = str(user.role).split(".")[-1] if user.role else "patient"
     return {
         "access_token": token, "token_type": "bearer",
-        "user": {"id": user.id, "nom": user.nom, "email": user.email,
-                 "role": user.role, "specialite": user.specialite},
+        "user": {
+            "id": user.id,
+            "nom": user.nom,
+            "email": user.email,
+            "role": role_str,
+            "specialite": getattr(user, "specialite", None) or "",
+            "must_change_password": getattr(user, "must_change_password", False),
+        },
     }
 
 
@@ -237,10 +245,9 @@ async def register(data: schemas.UserCreate, db: Session = Depends(get_db)):
     email_lower = data.email.lower()
 
     STAFF_ROLES = ["medecin","admin","caissier","labo","infirmier","pharmacie",
-                   "dentiste","physio","optometrie"]
-    is_staff_role = str(data.role) in STAFF_ROLES or (
-        hasattr(data.role, 'value') and data.role.value in STAFF_ROLES
-    )
+                   "dentiste","physio","optometrie","dentisterie","ophtalmologie"]
+    role_val = str(data.role).split(".")[-1] if data.role else "patient"
+    is_staff_role = role_val in STAFF_ROLES
     is_clinic_email = email_lower.endswith("@cliniquerebecca.ht")
 
     # Règle email
@@ -5397,26 +5404,40 @@ async def changer_role_utilisateur(user_id: int, data: dict,
         raise HTTPException(422, f"Rôle invalide. Valides: {', '.join(VALID_ROLES)}")
 
     old_role = str(user.role).split(".")[-1]
+
+    # Always use raw SQL to bypass Enum validation — ensures any role string is stored
+    from sqlalchemy import text as _t
     try:
-        user.role = new_role
-    except Exception:
-        # If Enum validation fails, set raw string
-        from sqlalchemy import text as _t
         db.execute(_t("UPDATE users SET role = :role WHERE id = :uid"),
                    {"role": new_role, "uid": user_id})
+    except Exception as _e:
+        raise HTTPException(500, f"Erreur mise à jour rôle: {str(_e)}")
 
-    user.must_change_password = True  # Sécurité: forcer changement mdp après modif rôle
+    try:
+        db.execute(_t("UPDATE users SET must_change_password = true WHERE id = :uid"),
+                   {"uid": user_id})
+    except Exception:
+        pass
+
     db.commit()
 
-    log_audit(db, "ROLE_CHANGE", actor_id=current_user.id, actor_role="admin",
-              target_id=str(user_id), target_type="user",
-              details=f"{user.nom}: {old_role} → {new_role}")
+    # Reload user to confirm
+    db.refresh(user)
+
+    try:
+        log_audit(db, "ROLE_CHANGE", actor_id=current_user.id, actor_role="admin",
+                  target_id=str(user_id), target_type="user",
+                  details=f"{user.nom}: {old_role} → {new_role}")
+    except Exception:
+        pass
 
     return {
         "message": f"Rôle de {user.nom} changé: {old_role} → {new_role}",
         "user_id": user_id,
         "ancien_role": old_role,
         "nouveau_role": new_role,
+        "email": user.email,
+        "note": "L'utilisateur doit changer son mot de passe à la prochaine connexion",
     }
 
 @router.post("/admin/reset-password/{user_id}", tags=["Admin"])

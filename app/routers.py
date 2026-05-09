@@ -477,15 +477,56 @@ async def update_horaire(jour: str, data: schemas.HoraireUpdate, db: Session = D
 
 @router.post("/rendez-vous", response_model=schemas.RendezVousOut, status_code=201, tags=["RDV"])
 async def create_rdv(data: schemas.RendezVousCreate, db: Session = Depends(get_db)):
+    # ── Validation: date_rdv doit être dans le futur ──────────────────────
+    rdv_date = data.date_rdv
+    if rdv_date and rdv_date.tzinfo is None:
+        rdv_date = rdv_date.replace(tzinfo=timezone.utc)
+    if rdv_date and rdv_date <= datetime.now(timezone.utc):
+        raise HTTPException(422, "La date du rendez-vous doit être ultérieure à maintenant")
+
     rdv = models.RendezVous(**data.model_dump())
+    rdv.statut = models.StatutRDVEnum.en_attente
     db.add(rdv); db.commit(); db.refresh(rdv)
-    medecins_emails = [rdv.medecin_email] if rdv.medecin_email else [
-        u.email for u in db.query(models.User).filter(
-            models.User.role == models.RoleEnum.medecin,
-            models.User.specialite.ilike(f"%{rdv.specialite}%"),
-            models.User.is_active == True,
-        ).all() if u.email
-    ]
+
+    # ── Notifier: caissiers + médecins + praticiens du service ───────────
+    svc = (rdv.specialite or "").lower()
+    # Déterminer les rôles à notifier selon le service
+    if any(k in svc for k in ["dent"]):
+        roles_cibles = ["dentiste", "caissier", "admin"]
+    elif any(k in svc for k in ["physio", "kine"]):
+        roles_cibles = ["physio", "caissier", "admin"]
+    elif any(k in svc for k in ["optom", "opht"]):
+        roles_cibles = ["optometrie", "caissier", "admin"]
+    elif any(k in svc for k in ["labo", "analyse"]):
+        roles_cibles = ["labo", "caissier", "admin"]
+    elif any(k in svc for k in ["pharm"]):
+        roles_cibles = ["pharmacie", "caissier", "admin"]
+    else:
+        roles_cibles = ["medecin", "caissier", "admin"]
+
+    staff_emails = []
+    for role_cible in roles_cibles:
+        staff_emails += [
+            u.email for u in db.query(models.User).filter(
+                models.User.role == role_cible,
+                models.User.is_active == True,
+            ).all() if u.email
+        ]
+
+    # Aussi les médecins avec la bonne spécialité
+    if "medecin" in roles_cibles:
+        medecin_spec = [
+            u.email for u in db.query(models.User).filter(
+                models.User.role == models.RoleEnum.medecin,
+                models.User.is_active == True,
+            ).all()
+            if u.email and (not getattr(u, 'specialite', None) or
+                           (rdv.specialite or "").lower() in (getattr(u, 'specialite', '') or "").lower())
+        ]
+        staff_emails += medecin_spec
+
+    staff_emails = list(set(filter(None, staff_emails)))
+
     rdv_data = {
         "patient_nom": rdv.patient_nom, "patient_telephone": rdv.patient_telephone,
         "patient_email": rdv.patient_email, "specialite": rdv.specialite,
@@ -493,9 +534,12 @@ async def create_rdv(data: schemas.RendezVousCreate, db: Session = Depends(get_d
         "motif": rdv.motif, "mode_paiement": rdv.mode_paiement,
         "reference_paiement": rdv.reference_paiement,
         "medecin_nom": rdv.medecin_nom or "",
-        "medecins_emails": medecins_emails,
+        "medecins_emails": staff_emails,
     }
-    asyncio.create_task(notify_rdv_confirmed(rdv_data))
+    try:
+        asyncio.create_task(notify_rdv_confirmed(rdv_data))
+    except Exception:
+        pass
     return rdv
 
 @router.get("/admin/rendez-vous", response_model=List[schemas.RendezVousOut], tags=["Admin"])
@@ -5322,8 +5366,10 @@ async def queue_infirmier(db: Session = Depends(get_db), current_user=Depends(ge
             FROM rendez_vous r
             LEFT JOIN patients p ON p.id = r.patient_id
             WHERE (r.date_rdv::date = :today OR r.created_at::date = :today)
-              AND r.statut IN ('paiement_effectue','en_attente',
-                               'StatutRDVEnum.paiement_effectue','StatutRDVEnum.en_attente')
+              AND (
+                r.statut ILIKE '%paiement_effectue%'
+                OR r.statut ILIKE '%en_attente%'
+              )
             ORDER BY r.created_at DESC
             LIMIT 100
         """), {"today": str(aujourd_hui)}).fetchall()
@@ -6058,10 +6104,13 @@ async def confirmer_rdv(rdv_id: int, data: dict,
 
     if action == "confirmer":
         rdv.statut = models.StatutRDVEnum.paiement_requis
-        rdv.notes_admin = (rdv.notes_admin or "") + f" | Confirmé par {current_user.nom}"
-        try: rdv.confirme_par = current_user.nom
+        nom_user = getattr(current_user, 'nom', '') or getattr(current_user, 'email', 'staff')
+        rdv.notes_admin = (rdv.notes_admin or "") + f" | Confirmé par {nom_user}"
+        try: rdv.confirme_par = current_user.id  # INTEGER — store user ID
         except Exception: pass
-        try: rdv.confirme_par_role = current_user.role
+        try: rdv.confirme_par_role = str(current_user.role)
+        except Exception: pass
+        try: rdv.confirme_par_nom = nom_user  # VARCHAR — store readable name
         except Exception: pass
         msg = "RDV confirmé — patient doit payer pour finaliser"
 
@@ -6237,7 +6286,7 @@ async def debug_queue(db: Session = Depends(get_db)):
 
     try:
         raw = db.execute(_t(
-            "SELECT id, patient_nom, statut, date_rdv::date, created_at::date "
+            "SELECT id, patient_nom, statut, date_rdv, created_at "
             "FROM rendez_vous ORDER BY created_at DESC LIMIT 15"
         )).fetchall()
         raw_data = [{"id":r[0],"nom":r[1],"statut":r[2],"date_rdv":str(r[3]),"created_at":str(r[4])} for r in raw]

@@ -5971,4 +5971,30 @@ async def supprimer_photo_profil(db: Session = Depends(get_db),
     """Médecin supprime sa photo de profil."""
     current_user.photo_profil = None
     db.commit()
-    return {"message": "Photo supprimée"}
+    return {"message": "Photo supprimée"}@router.get("/infirmier/debug-queue", tags=["Infirmier - Queue"])
+async def debug_queue(db: Session = Depends(get_db)):
+    """Debug: voir tous les RDV en DB sans filtre."""
+    from sqlalchemy import text as _t
+    today = datetime.now(timezone.utc).date()
+
+    try:
+        raw = db.execute(_t(
+            "SELECT id, patient_nom, statut, date_rdv::date, created_at::date "
+            "FROM rendez_vous ORDER BY created_at DESC LIMIT 15"
+        )).fetchall()
+        raw_data = [{"id":r[0],"nom":r[1],"statut":r[2],"date_rdv":str(r[3]),"created_at":str(r[4])} for r in raw]
+    except Exception as e:
+        raw_data = [{"error": str(e)}]
+
+    total_p = db.query(models.Patient).count()
+    total_r = db.query(models.RendezVous).count()
+
+    return {
+        "today_utc": str(today),
+        "total_patients": total_p,
+        "total_rdv": total_r,
+        "rdv_last_15": raw_data,
+    }
+
+
+

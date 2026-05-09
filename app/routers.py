@@ -5224,13 +5224,19 @@ async def queue_infirmier(db: Session = Depends(get_db), current_user=Depends(ge
     aujourd_hui = datetime.now(timezone.utc).date()
     from sqlalchemy import cast, Date as SADate
 
+    # Chercher les RDV d'aujourd'hui — via created_at ET date_rdv pour couvrir les deux cas
     en_attente = db.query(models.RendezVous).filter(
-        cast(models.RendezVous.date_rdv, SADate) == aujourd_hui,
+        models.or_(
+            cast(models.RendezVous.date_rdv, SADate) == aujourd_hui,
+            cast(models.RendezVous.created_at, SADate) == aujourd_hui,
+        ),
         models.RendezVous.statut.in_([
             models.StatutRDVEnum.paiement_effectue.value,
             models.StatutRDVEnum.en_attente.value,
+            "paiement_effectue",
+            "en_attente",
         ])
-    ).order_by(models.RendezVous.date_rdv).all()
+    ).order_by(models.RendezVous.created_at.desc()).all()
 
     # Enrichit chaque patient avec son statut de paiement
     def get_paiement_statut(rdv):
@@ -5252,10 +5258,12 @@ async def queue_infirmier(db: Session = Depends(get_db), current_user=Depends(ge
         "total": len(en_attente),
         "patients": [{
             "rdv_id": r.id,
-            "ticket": r.code_patient,
+            "ticket": getattr(r, "code_patient", None) or str(r.id),
             "patient_nom": r.patient_nom,
             "patient_telephone": r.patient_telephone,
             "patient_id": r.patient_id,
+            "patient_numero": (db.query(models.Patient.numero).filter(models.Patient.id==r.patient_id).scalar() if r.patient_id else None),
+            "paiement_effectue": str(r.statut) in ("paiement_effectue", "StatutRDVEnum.paiement_effectue"),
             "service": r.specialite,
             "statut": str(r.statut),
             "heure": str(r.date_rdv),

@@ -6394,6 +6394,173 @@ async def signaler_presence_patient(rdv_id: int, data: dict,
         "deja_paye": statut_actuel == "paiement_effectue",
     }
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# ESPACE PRATICIEN — Stats, Historique, Profil
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.get("/praticien/stats-semaine", tags=["Praticien"])
+async def praticien_stats_semaine(db: Session = Depends(get_db),
+                                   current_user=Depends(get_current_user)):
+    """Statistiques de la semaine pour le praticien connecté."""
+    from sqlalchemy import text as _t
+    now   = datetime.now(timezone.utc)
+    debut = now - timedelta(days=now.weekday())
+    debut = debut.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    role_str = str(current_user.role).split('.')[-1]
+    nom      = current_user.nom or ''
+
+    # Patients vus cette semaine (dossiers créés par ce praticien)
+    try:
+        rows = db.execute(_t("""
+            SELECT COUNT(*) FROM dossiers_patients
+            WHERE created_at >= :debut
+              AND (praticien_nom ILIKE :nom OR created_by = :uid)
+        """), {"debut": debut, "nom": f"%{nom}%", "uid": current_user.id}).scalar() or 0
+    except Exception:
+        rows = 0
+
+    # RDV/Consultations cette semaine
+    try:
+        rdv_sem = db.execute(_t("""
+            SELECT COUNT(*) FROM rendez_vous
+            WHERE created_at >= :debut
+              AND statut IN ('paiement_effectue','confirme','termine')
+              AND (medecin_nom ILIKE :nom OR specialite ILIKE :svc)
+        """), {"debut": debut, "nom": f"%{nom}%",
+               "svc": f"%{role_str}%"}).scalar() or 0
+    except Exception:
+        rdv_sem = 0
+
+    # Total patients historique
+    try:
+        total = db.execute(_t("""
+            SELECT COUNT(DISTINCT patient_id) FROM dossiers_patients
+            WHERE praticien_nom ILIKE :nom OR created_by = :uid
+        """), {"nom": f"%{nom}%", "uid": current_user.id}).scalar() or 0
+    except Exception:
+        total = 0
+
+    return {
+        "patients_semaine": int(rows),
+        "rdv_semaine":      int(rdv_sem),
+        "patients_total":   int(total),
+        "debut_semaine":    debut.isoformat(),
+    }
+
+
+@router.get("/praticien/historique-patients", tags=["Praticien"])
+async def praticien_historique(
+    mois: int = 3,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    """Historique des patients vus par ce praticien (3 à 6 mois)."""
+    from sqlalchemy import text as _t
+    mois = max(1, min(mois, 6))
+    debut = datetime.now(timezone.utc) - timedelta(days=mois * 30)
+    nom   = current_user.nom or ''
+
+    try:
+        rows = db.execute(_t("""
+            SELECT d.id, d.patient_id, p.nom, p.prenom, p.numero, p.telephone,
+                   d.service, d.created_at, d.notes,
+                   d.donnees::text as donnees_text
+            FROM dossiers_patients d
+            LEFT JOIN patients p ON p.id = d.patient_id
+            WHERE d.created_at >= :debut
+              AND (d.praticien_nom ILIKE :nom OR d.created_by = :uid)
+            ORDER BY d.created_at DESC
+            LIMIT 100
+        """), {"debut": debut, "nom": f"%{nom}%", "uid": current_user.id}).fetchall()
+    except Exception as _e:
+        logger.error(f"historique-patients error: {_e}")
+        return {"patients": [], "mois": mois}
+
+    return {"patients": [{
+        "dossier_id":  r[0],
+        "patient_id":  r[1],
+        "nom":         r[2] or "",
+        "prenom":      r[3] or "",
+        "numero":      r[4] or "",
+        "telephone":   r[5] or "",
+        "service":     r[6] or "",
+        "date_visite": str(r[7]),
+        "notes":       r[8] or "",
+    } for r in rows], "mois": mois}
+
+
+@router.get("/praticien/dossier-patient/{patient_id}", tags=["Praticien"])
+async def praticien_dossier_patient(
+    patient_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    """Récupère le dossier complet d'un patient pour le praticien."""
+    from sqlalchemy import text as _t
+
+    patient = db.query(models.Patient).filter(models.Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(404, "Patient introuvable")
+
+    # Dossiers de ce patient
+    try:
+        dossiers = db.execute(_t("""
+            SELECT id, service, created_at, notes, donnees::text, praticien_nom
+            FROM dossiers_patients WHERE patient_id = :pid
+            ORDER BY created_at DESC LIMIT 20
+        """), {"pid": patient_id}).fetchall()
+    except Exception:
+        dossiers = []
+
+    # RDV de ce patient
+    try:
+        rdvs = db.execute(_t("""
+            SELECT id, specialite, statut, date_rdv, medecin_nom
+            FROM rendez_vous WHERE patient_id = :pid
+            ORDER BY date_rdv DESC LIMIT 10
+        """), {"pid": patient_id}).fetchall()
+    except Exception:
+        rdvs = []
+
+    return {
+        "patient": {
+            "id": patient.id, "numero": patient.numero,
+            "nom": patient.nom, "prenom": patient.prenom,
+            "telephone": patient.telephone or "",
+            "age": patient.age, "sexe": getattr(patient, "sexe", None),
+            "allergies": getattr(patient, "allergies", None),
+            "antecedents": getattr(patient, "antecedents", None),
+        },
+        "dossiers": [{
+            "id": d[0], "service": d[1], "date": str(d[2]),
+            "notes": d[3] or "", "praticien": d[5] or ""
+        } for d in dossiers],
+        "rdvs": [{
+            "id": r[0], "service": r[1], "statut": str(r[2]),
+            "date_rdv": str(r[3]), "medecin": r[4] or ""
+        } for r in rdvs],
+    }
+
+
+@router.post("/praticien/profil", tags=["Praticien"])
+async def update_praticien_profil(data: dict,
+                                   db: Session = Depends(get_db),
+                                   current_user=Depends(get_current_user)):
+    """Mettre à jour la bio et la photo du praticien."""
+    try:
+        if "bio" in data:
+            try: current_user.bio = data["bio"]
+            except Exception: pass
+        if "photo" in data:
+            try: current_user.photo_profil = data["photo"]
+            except Exception: pass
+        db.commit()
+    except Exception as _e:
+        logger.error(f"profil update error: {_e}")
+    return {"message": "Profil mis à jour"}
+
 @router.get("/infirmier/debug-queue", tags=["Infirmier - Queue"])
 async def debug_queue(db: Session = Depends(get_db)):
     """Debug: voir tous les RDV en DB sans filtre."""

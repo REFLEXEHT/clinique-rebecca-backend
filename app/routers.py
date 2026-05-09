@@ -604,10 +604,97 @@ async def list_patients(search: Optional[str] = None, db: Session = Depends(get_
     return q.order_by(models.Patient.created_at.desc()).limit(100).all()
 
 @router.post("/patients", status_code=201, tags=["Patients"])
-async def create_patient(data: schemas.PatientCreate, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    count = db.query(models.Patient).count()
-    patient = models.Patient(numero=f"#RB-{str(count+1).zfill(4)}", **data.model_dump(), created_by=current_user.id)
-    db.add(patient); db.commit(); db.refresh(patient); return patient
+async def create_patient(data: dict, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """Créer un patient et l'envoyer dans la queue infirmier."""
+    import uuid as _uuid
+    from sqlalchemy import text as _t
+
+    # Générer ID robuste
+    try:
+        _r = db.execute(_t(
+            "SELECT COALESCE(MAX(CAST(SUBSTRING(numero FROM 5) AS INTEGER)), 0) "
+            "FROM patients WHERE numero ~ '^#RB-[0-9]+$'"
+        )).fetchone()
+        last_n = int(_r[0]) if _r and _r[0] else 0
+    except Exception:
+        last_n = db.query(models.Patient).count()
+
+    numero = f"#RB-{(last_n + 1):04d}"
+
+    patient = models.Patient(
+        numero=numero,
+        nom=(data.get("nom") or "").upper().strip(),
+        prenom=(data.get("prenom") or "").strip(),
+        telephone=data.get("telephone", ""),
+        email=data.get("email", ""),
+        adresse=data.get("adresse", ""),
+        is_premiere_visite=True,
+        created_by=current_user.id,
+    )
+    for col, val in [
+        ("sexe", data.get("sexe")),
+        ("groupe_sanguin", data.get("groupe_sanguin")),
+        ("allergies", data.get("allergies")),
+        ("antecedents", data.get("antecedents")),
+        ("notes", data.get("notes")),
+        ("contact_urgence", data.get("contact_urgence")),
+        ("service", data.get("service", "Consultation")),
+        ("date_naissance", data.get("date_naissance") or None),
+    ]:
+        try:
+            if val is not None:
+                setattr(patient, col, val)
+        except Exception:
+            pass
+    try:
+        _age = data.get("age")
+        if _age and str(_age).strip():
+            patient.age = int(_age)
+    except Exception:
+        pass
+
+    db.add(patient)
+    db.commit()
+    db.refresh(patient)
+
+    # Créer un RDV dans la queue infirmier
+    service = data.get("service", "Consultation")
+    montant = float(data.get("montant", 0) or 0)
+    praticien = (data.get("praticien") or data.get("medecin_nom") or "").strip()
+    now = datetime.now(timezone.utc)
+    ticket_id = str(_uuid.uuid4())[:8].upper()
+
+    try:
+        rdv = models.RendezVous(
+            patient_id=patient.id,
+            patient_nom=f"{patient.prenom} {patient.nom}".strip(),
+            patient_telephone=patient.telephone or "",
+            patient_email=patient.email or "",
+            specialite=service,
+            date_rdv=now,
+            type_rdv=models.TypeRDVEnum.presentiel,
+            statut=models.StatutRDVEnum.paiement_effectue if montant > 0 else models.StatutRDVEnum.en_attente,
+            notes_admin=f"Queue caisse #{ticket_id} | {data.get('priorite','normal')}",
+            created_by=current_user.id,
+        )
+        for _col, _val in [("code_patient", ticket_id), ("medecin_nom", praticien or None)]:
+            try: setattr(rdv, _col, _val)
+            except Exception: pass
+        db.add(rdv)
+        db.commit()
+    except Exception as _e:
+        logger.error(f"RDV queue failed: {_e}")
+
+    return {
+        "id": patient.id,
+        "numero": patient.numero,
+        "code": patient.numero,
+        "nom": patient.nom,
+        "prenom": patient.prenom,
+        "ticket": ticket_id,
+        "service": service,
+        "message": f"Patient {patient.numero} créé et envoyé à la queue infirmier",
+    }
 
 @router.get("/patients/search", tags=["Patients"])
 async def search_patients(q: str = "", db: Session = Depends(get_db), _=Depends(get_current_user)):

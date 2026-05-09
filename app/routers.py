@@ -6149,6 +6149,86 @@ async def rdv_a_venir(db: Session = Depends(get_db),
         "patient_numero": r[8] or "",
     } for r in rows]}
 
+
+@router.post("/rdv/{rdv_id}/payer-distance", tags=["RDV"])
+async def payer_rdv_distance(rdv_id: int, data: dict,
+                              db: Session = Depends(get_db),
+                              current_user=Depends(get_current_user)):
+    """Patient paie à distance (MonCash, Zelle, etc.) après confirmation du RDV.
+    
+    Le dossier passe en statut 'paiement_effectue' mais reste dans la queue 'à venir'
+    jusqu'au jour J où la caisse signale la présence physique du patient.
+    """
+    rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
+    if not rdv:
+        raise HTTPException(404, "RDV introuvable")
+    
+    if str(rdv.statut) not in ("paiement_requis", "en_attente", 
+                                "StatutRDVEnum.paiement_requis", "StatutRDVEnum.en_attente"):
+        raise HTTPException(400, "Ce RDV n'est pas en attente de paiement")
+
+    # Marquer payé — mais garder la date_rdv originale (pas aujourd'hui)
+    # Le RDV reste dans "à venir" jusqu'au jour J
+    rdv.statut = models.StatutRDVEnum.paiement_effectue
+    try: rdv.mode_paiement = data.get("mode_paiement", "moncash")
+    except Exception: pass
+    try: rdv.reference_paiement = data.get("reference", "")
+    except Exception: pass
+    rdv.notes_admin = (rdv.notes_admin or "") +         f" | Paiement distance: {data.get('mode_paiement','moncash')} ref:{data.get('reference','')}"
+
+    db.commit()
+    return {
+        "message": "Paiement enregistré — dossier en queue 'à venir' jusqu'au jour J",
+        "rdv_id": rdv_id,
+        "date_rdv": str(rdv.date_rdv),
+        "statut": "paiement_effectue",
+    }
+
+
+@router.post("/rdv/{rdv_id}/signaler-presence", tags=["RDV"])
+async def signaler_presence_patient(rdv_id: int, data: dict,
+                                     db: Session = Depends(get_db),
+                                     current_user=Depends(get_current_user)):
+    """Caisse: patient arrivé physiquement pour son RDV (déjà payé ou paye maintenant).
+    
+    - Si déjà payé (à distance): bascule date_rdv à NOW → queue signes vitaux du jour
+    - Si pas encore payé: encaisse + bascule date_rdv → queue signes vitaux du jour
+    """
+    import uuid as _u
+    rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
+    if not rdv:
+        raise HTTPException(404, "RDV introuvable")
+
+    statut_actuel = str(rdv.statut).split(".")[-1]
+    
+    # Si pas encore payé, encaisser maintenant
+    if statut_actuel in ("en_attente", "paiement_requis"):
+        rdv.statut = models.StatutRDVEnum.paiement_effectue
+        try: rdv.mode_paiement = data.get("mode_paiement", "especes")
+        except Exception: pass
+        try: rdv.reference_paiement = data.get("reference", "")
+        except Exception: pass
+        note_paiement = f"Paiement caisse: {data.get('mode_paiement','especes')}"
+    else:
+        note_paiement = "Déjà payé à distance"
+
+    # Assigner ticket et mettre date_rdv = maintenant → apparaît dans queue du jour
+    ticket = str(_u.uuid4())[:8].upper()
+    try: rdv.code_patient = ticket
+    except Exception: pass
+    rdv.date_rdv = datetime.now(timezone.utc)  # ← clé: passe dans queue du jour
+    rdv.notes_admin = (rdv.notes_admin or "") + f" | Présence signalée | {note_paiement}"
+
+    db.commit()
+    return {
+        "message": "Patient dans la queue signes vitaux",
+        "rdv_id": rdv_id,
+        "ticket": ticket,
+        "patient_nom": rdv.patient_nom,
+        "service": rdv.specialite,
+        "deja_paye": statut_actuel == "paiement_effectue",
+    }
+
 @router.get("/infirmier/debug-queue", tags=["Infirmier - Queue"])
 async def debug_queue(db: Session = Depends(get_db)):
     """Debug: voir tous les RDV en DB sans filtre."""

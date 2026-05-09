@@ -5377,6 +5377,48 @@ async def labo_stats_semaine(db: Session = Depends(get_db), current_user=Depends
     }
 
 
+
+@router.patch("/admin/utilisateurs/{user_id}/role", tags=["Admin"])
+async def changer_role_utilisateur(user_id: int, data: dict,
+                                    db: Session = Depends(get_db),
+                                    current_user=Depends(get_current_user)):
+    """Admin change le rôle d'un utilisateur (correction d'erreur)."""
+    if str(current_user.role).split(".")[-1] != "admin":
+        raise HTTPException(403, "Réservé aux administrateurs")
+
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+
+    new_role = (data.get("role") or "").strip()
+    VALID_ROLES = ["admin","medecin","caissier","labo","infirmier","pharmacie",
+                   "dentiste","physio","optometrie","patient"]
+    if new_role not in VALID_ROLES:
+        raise HTTPException(422, f"Rôle invalide. Valides: {', '.join(VALID_ROLES)}")
+
+    old_role = str(user.role).split(".")[-1]
+    try:
+        user.role = new_role
+    except Exception:
+        # If Enum validation fails, set raw string
+        from sqlalchemy import text as _t
+        db.execute(_t("UPDATE users SET role = :role WHERE id = :uid"),
+                   {"role": new_role, "uid": user_id})
+
+    user.must_change_password = True  # Sécurité: forcer changement mdp après modif rôle
+    db.commit()
+
+    log_audit(db, "ROLE_CHANGE", actor_id=current_user.id, actor_role="admin",
+              target_id=str(user_id), target_type="user",
+              details=f"{user.nom}: {old_role} → {new_role}")
+
+    return {
+        "message": f"Rôle de {user.nom} changé: {old_role} → {new_role}",
+        "user_id": user_id,
+        "ancien_role": old_role,
+        "nouveau_role": new_role,
+    }
+
 @router.post("/admin/reset-password/{user_id}", tags=["Admin"])
 async def admin_reset_password(user_id: int, data: dict,
                                 db: Session = Depends(get_db),

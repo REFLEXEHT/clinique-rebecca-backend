@@ -5308,22 +5308,58 @@ async def labo_stats_semaine(db: Session = Depends(get_db), current_user=Depends
 @router.get("/infirmier/queue", tags=["Infirmier - Queue"])
 async def queue_infirmier(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     """File d'attente de l'infirmier — patients en attente de signes vitaux"""
+    from sqlalchemy import text as _qt
     aujourd_hui = datetime.now(timezone.utc).date()
-    from sqlalchemy import cast, Date as SADate
 
-    # Chercher les RDV d'aujourd'hui — via created_at ET date_rdv pour couvrir les deux cas
-    en_attente = db.query(models.RendezVous).filter(
-        models.or_(
-            cast(models.RendezVous.date_rdv, SADate) == aujourd_hui,
-            cast(models.RendezVous.created_at, SADate) == aujourd_hui,
-        ),
-        models.RendezVous.statut.in_([
-            models.StatutRDVEnum.paiement_effectue.value,
-            models.StatutRDVEnum.en_attente.value,
-            "paiement_effectue",
-            "en_attente",
-        ])
-    ).order_by(models.RendezVous.created_at.desc()).all()
+    # Raw SQL pour éviter tout problème Enum ORM
+    try:
+        rows = db.execute(_qt("""
+            SELECT r.id, r.patient_nom, r.patient_telephone, r.patient_id,
+                   r.specialite, r.statut, r.date_rdv, r.created_at,
+                   r.notes_admin, r.medecin_nom, r.medecin_email,
+                   COALESCE(r.code_patient, r.id::text) as ticket,
+                   p.numero as patient_numero
+            FROM rendez_vous r
+            LEFT JOIN patients p ON p.id = r.patient_id
+            WHERE (r.date_rdv::date = :today OR r.created_at::date = :today)
+              AND r.statut IN ('paiement_effectue','en_attente',
+                               'StatutRDVEnum.paiement_effectue','StatutRDVEnum.en_attente')
+            ORDER BY r.created_at DESC
+            LIMIT 100
+        """), {"today": str(aujourd_hui)}).fetchall()
+    except Exception as _e:
+        logger.error(f"Queue infirmier SQL error: {_e}")
+        rows = []
+
+    patients_list = []
+    for r in rows:
+        statut_str = str(r[5]).split(".")[-1] if "." in str(r[5]) else str(r[5])
+        # Statut paiement
+        if statut_str in ("paiement_effectue", "confirme"):
+            pstat = {"statut_paiement":"paye","couleur":"#16a34a","libelle":"Payé"}
+        else:
+            pstat = {"statut_paiement":"en_attente","couleur":"#d97706","libelle":"En attente"}
+
+        patients_list.append({
+            "rdv_id": r[0],
+            "patient_nom": r[1],
+            "patient_telephone": r[2],
+            "patient_id": r[3],
+            "service": r[4],
+            "statut": statut_str,
+            "heure": str(r[6]),
+            "created_at": str(r[7]),
+            "notes": r[8],
+            "medecin_nom": r[9] or "",
+            "medecin_email": r[10] or "",
+            "ticket": str(r[11]),
+            "patient_numero": r[12] or "",
+            "paiement_effectue": statut_str == "paiement_effectue",
+            "priorite": "urgent" if "urgent" in (r[8] or "").lower() else "normal",
+            **pstat,
+        })
+
+    en_attente = patients_list
 
     # Enrichit chaque patient avec son statut de paiement
     def get_paiement_statut(rdv):
@@ -5971,7 +6007,149 @@ async def supprimer_photo_profil(db: Session = Depends(get_db),
     """Médecin supprime sa photo de profil."""
     current_user.photo_profil = None
     db.commit()
-    return {"message": "Photo supprimée"}@router.get("/infirmier/debug-queue", tags=["Infirmier - Queue"])
+    return {"message": "Photo supprimée"}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SYSTÈME RDV COMPLET — Demandes, Confirmation, Paiement, Queue
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/rdv/demandes", tags=["RDV"])
+async def liste_demandes_rdv(db: Session = Depends(get_db),
+                              current_user=Depends(get_current_user)):
+    """Caisse/Admin: liste toutes les demandes RDV en attente de confirmation."""
+    from sqlalchemy import text as _t
+    try:
+        rows = db.execute(_t("""
+            SELECT r.id, r.patient_nom, r.patient_telephone, r.patient_id,
+                   r.specialite, r.statut, r.date_rdv, r.created_at,
+                   r.notes_admin, r.medecin_nom, r.motif,
+                   COALESCE(r.code_patient, r.id::text) as ticket,
+                   p.numero as patient_numero, p.email as patient_email
+            FROM rendez_vous r
+            LEFT JOIN patients p ON p.id = r.patient_id
+            WHERE r.statut IN ('en_attente','paiement_requis','propose_autre_moment')
+            ORDER BY r.created_at DESC
+            LIMIT 100
+        """)).fetchall()
+    except Exception as _e:
+        logger.error(f"RDV demandes error: {_e}")
+        return {"demandes": []}
+
+    return {"demandes": [{
+        "id": r[0], "patient_nom": r[1], "patient_telephone": r[2],
+        "patient_id": r[3], "service": r[4], "statut": str(r[5]),
+        "date_rdv_demandee": str(r[6]), "created_at": str(r[7]),
+        "notes": r[8], "medecin_nom": r[9] or "", "motif": r[10] or "",
+        "ticket": str(r[11]), "patient_numero": r[12] or "",
+        "patient_email": r[13] or "",
+    } for r in rows]}
+
+
+@router.post("/rdv/{rdv_id}/confirmer", tags=["RDV"])
+async def confirmer_rdv(rdv_id: int, data: dict,
+                         db: Session = Depends(get_db),
+                         current_user=Depends(get_current_user)):
+    """Caisse/Admin confirme le RDV ou propose une autre date."""
+    rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
+    if not rdv:
+        raise HTTPException(404, "RDV introuvable")
+
+    action = data.get("action", "confirmer")  # confirmer | proposer_autre_date
+
+    if action == "confirmer":
+        rdv.statut = models.StatutRDVEnum.paiement_requis
+        rdv.notes_admin = (rdv.notes_admin or "") + f" | Confirmé par {current_user.nom}"
+        try: rdv.confirme_par = current_user.nom
+        except Exception: pass
+        try: rdv.confirme_par_role = current_user.role
+        except Exception: pass
+        msg = "RDV confirmé — patient doit payer pour finaliser"
+
+    elif action == "proposer_autre_date":
+        nouvelle_date = data.get("nouvelle_date")
+        if not nouvelle_date:
+            raise HTTPException(422, "nouvelle_date requise")
+        rdv.statut = models.StatutRDVEnum.propose_autre_moment
+        try: rdv.autre_moment_propose = nouvelle_date
+        except Exception: pass
+        try:
+            rdv.autre_moment_message = data.get("message", f"Nous proposons le {nouvelle_date}")
+        except Exception: pass
+        msg = f"Autre date proposée: {nouvelle_date}"
+
+    elif action == "annuler":
+        rdv.statut = models.StatutRDVEnum.annule
+        msg = "RDV annulé"
+
+    db.commit()
+    return {"message": msg, "rdv_id": rdv_id, "nouveau_statut": str(rdv.statut)}
+
+
+@router.post("/rdv/{rdv_id}/payer-et-envoyer", tags=["RDV"])
+async def payer_rdv_et_envoyer_queue(rdv_id: int, data: dict,
+                                      db: Session = Depends(get_db),
+                                      current_user=Depends(get_current_user)):
+    """Caisse: patient arrivé, paye, et est envoyé dans la queue infirmier."""
+    rdv = db.query(models.RendezVous).filter(models.RendezVous.id == rdv_id).first()
+    if not rdv:
+        raise HTTPException(404, "RDV introuvable")
+
+    # Marquer comme payé
+    rdv.statut = models.StatutRDVEnum.paiement_effectue
+    try: rdv.mode_paiement = data.get("mode_paiement", "especes")
+    except Exception: pass
+    try: rdv.reference_paiement = data.get("reference", "")
+    except Exception: pass
+
+    # Assigner un ticket si pas encore fait
+    import uuid as _u
+    ticket = data.get("ticket") or str(_u.uuid4())[:8].upper()
+    try: rdv.code_patient = ticket
+    except Exception: pass
+
+    # Mettre à jour date_rdv à maintenant pour qu'il apparaisse dans la queue du jour
+    rdv.date_rdv = datetime.now(timezone.utc)
+    rdv.notes_admin = (rdv.notes_admin or "") + f" | Présence signalée caisse | Mode: {data.get('mode_paiement','especes')}"
+
+    db.commit()
+    return {
+        "message": "Patient envoyé dans la queue infirmier",
+        "rdv_id": rdv_id,
+        "ticket": ticket,
+        "patient_nom": rdv.patient_nom,
+    }
+
+
+@router.get("/rdv/a-venir", tags=["RDV"])
+async def rdv_a_venir(db: Session = Depends(get_db),
+                       current_user=Depends(get_current_user)):
+    """Infirmier: RDV confirmés à venir (pas encore aujourd'hui)."""
+    from sqlalchemy import text as _t
+    today = datetime.now(timezone.utc).date()
+    try:
+        rows = db.execute(_t("""
+            SELECT r.id, r.patient_nom, r.patient_telephone,
+                   r.specialite, r.statut, r.date_rdv, r.medecin_nom,
+                   COALESCE(r.code_patient, r.id::text) as ticket,
+                   p.numero as patient_numero
+            FROM rendez_vous r
+            LEFT JOIN patients p ON p.id = r.patient_id
+            WHERE r.statut IN ('paiement_requis','confirme','propose_autre_moment')
+              AND r.date_rdv::date > :today
+            ORDER BY r.date_rdv ASC
+            LIMIT 50
+        """), {"today": str(today)}).fetchall()
+    except Exception as _e:
+        return {"rdvs": [], "error": str(_e)}
+
+    return {"rdvs": [{
+        "id": r[0], "patient_nom": r[1], "patient_telephone": r[2],
+        "service": r[3], "statut": str(r[4]), "date_rdv": str(r[5]),
+        "medecin_nom": r[6] or "", "ticket": str(r[7]),
+        "patient_numero": r[8] or "",
+    } for r in rows]}
+
+@router.get("/infirmier/debug-queue", tags=["Infirmier - Queue"])
 async def debug_queue(db: Session = Depends(get_db)):
     """Debug: voir tous les RDV en DB sans filtre."""
     from sqlalchemy import text as _t

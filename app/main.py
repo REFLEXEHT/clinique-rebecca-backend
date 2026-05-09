@@ -85,6 +85,7 @@ def migrate_add_missing_columns():
     column_migrations = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE users ALTER COLUMN role TYPE VARCHAR(50) USING role::VARCHAR(50)",
         "ALTER TABLE dossiers_patients ADD COLUMN IF NOT EXISTS praticien_nom VARCHAR(255)",
         "ALTER TABLE dossiers_patients ADD COLUMN IF NOT EXISTS praticien_role VARCHAR(50)",
         "ALTER TABLE dossiers_patients ADD COLUMN IF NOT EXISTS service VARCHAR(100)",
@@ -142,6 +143,7 @@ def migrate_add_missing_columns():
         # Autres colonnes critiques
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_image TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE users ALTER COLUMN role TYPE VARCHAR(50) USING role::VARCHAR(50)",
         "ALTER TABLE dossiers_patients ADD COLUMN IF NOT EXISTS praticien_nom VARCHAR(255)",
         "ALTER TABLE dossiers_patients ADD COLUMN IF NOT EXISTS praticien_role VARCHAR(50)",
         "ALTER TABLE dossiers_patients ADD COLUMN IF NOT EXISTS service VARCHAR(100)",

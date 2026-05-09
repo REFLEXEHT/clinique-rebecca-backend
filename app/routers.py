@@ -551,7 +551,7 @@ async def create_rdv(data: schemas.RendezVousCreate, db: Session = Depends(get_d
     if "medecin" in roles_cibles:
         medecin_spec = [
             u.email for u in db.query(models.User).filter(
-                models.User.role == models.RoleEnum.medecin,
+                models.User.role == "medecin",
                 models.User.is_active == True,
             ).all()
             if u.email and (not getattr(u, 'specialite', None) or
@@ -2090,7 +2090,7 @@ async def setup_admin_init(db: Session = Depends(get_db)):
 
     user = db.query(models.User).filter(models.User.email == admin_email).first()
     if user:
-        user.role       = models.RoleEnum.admin
+        user.role       = "admin"
         user.is_active  = True
         user.hashed_password = get_password_hash(admin_pwd)
         db.commit()
@@ -2099,7 +2099,7 @@ async def setup_admin_init(db: Session = Depends(get_db)):
         user = models.User(
             email=admin_email, nom="Administrateur",
             hashed_password=get_password_hash(admin_pwd),
-            role=models.RoleEnum.admin, is_active=True,
+            role="admin", is_active=True,
         )
         db.add(user); db.commit()
         return {"message": f"Admin created: {admin_email}", "role": "admin", "email": admin_email}
@@ -2833,7 +2833,7 @@ async def imprimer_resultats_labo_infirmier(patient_numero: str, request: Reques
 async def mon_dossier_complet(db: Session = Depends(get_db),
                                current_user=Depends(get_current_user)):
     """Dossier patient: visites, RDV, prescriptions, résultats labo"""
-    if current_user.role != models.RoleEnum.patient:
+    if current_user.role != "patient":
         raise HTTPException(403, "Accès réservé aux patients")
 
     # Cherche par user_id (nouveaux comptes) OU par email (anciens comptes)
@@ -2925,7 +2925,7 @@ async def mon_dossier_complet(db: Session = Depends(get_db),
 async def soumettre_avis(data: dict, db: Session = Depends(get_db),
                           current_user=Depends(get_current_user)):
     """Patient soumet une note et un avis post-consultation"""
-    if current_user.role != models.RoleEnum.patient:
+    if current_user.role != "patient":
         raise HTTPException(403, "Réservé aux patients")
 
     note = data.get("note", 0)
@@ -3048,7 +3048,7 @@ async def dashboard_analytics(db: Session = Depends(get_db),
     # Comptes en attente
     comptes_attente = db.query(func.count(models.User.id)).filter(
         models.User.is_active == False,
-        models.User.role != models.RoleEnum.patient
+        models.User.role != "patient"
     ).scalar() or 0
 
     # Taux occupation par service
@@ -5019,7 +5019,7 @@ async def comptes_en_attente(db: Session = Depends(get_db), _=Depends(require_ad
     """Liste tous les comptes internes en attente de validation."""
     return db.query(models.User).filter(
         models.User.is_active == False,
-        models.User.role != models.RoleEnum.patient,
+        models.User.role != "patient",
     ).order_by(models.User.created_at.desc()).all()
 
 @router.put("/admin/users/{uid}/suspendre", tags=["Admin - Users"])
@@ -5655,12 +5655,12 @@ async def enregistrer_signes_vitaux(rdv_id: int, data: dict,
     if medecin_email_rdv:
         medecin_user = db.query(models.User).filter(
             models.User.email == medecin_email_rdv,
-            models.User.role  == models.RoleEnum.medecin,
+            models.User.role  == "medecin",
         ).first()
     if not medecin_user and medecin_nom_rdv:
         nom_court = medecin_nom_rdv.replace("Dr ","").replace("Dre ","").strip()
         medecin_user = db.query(models.User).filter(
-            models.User.role == models.RoleEnum.medecin,
+            models.User.role == "medecin",
             models.User.nom.ilike(f"%{nom_court}%"),
         ).first()
 

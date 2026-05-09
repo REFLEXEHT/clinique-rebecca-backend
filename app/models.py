@@ -158,7 +158,7 @@ class User(Base):
     email           = Column(String(255), unique=True, index=True, nullable=False)
     nom             = Column(String(255), nullable=False)
     hashed_password = Column(String(255), nullable=False)
-    role            = Column(Enum(RoleEnum, native_enum=False), default=RoleEnum.patient)
+    role            = Column(String(50), default="patient")  # VARCHAR — supporte tous les rôles
     telephone       = Column(String(50))
     specialite      = Column(String(255))
     type_medecin    = Column(Enum(TypeMedecinEnum, native_enum=False), nullable=True)
